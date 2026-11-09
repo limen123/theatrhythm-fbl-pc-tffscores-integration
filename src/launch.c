@@ -429,6 +429,9 @@ int launch_from_paths_ini(int *argc, char ***argv) {
     set_env("THEATRHYTHM_CONFIG_DEFAULT", config_default);
     /* Before anything asks the GPU library for its folders (shadps4 common/path_util.cpp). */
     set_env("THEATRHYTHM_GPU_USER_DIR", cache);
+    char screenshots_dir[PATH_CHARS];
+    snprintf(screenshots_dir, sizeof screenshots_dir, "%s" SEP "screenshots", save);
+    set_env("THEATRHYTHM_SCREENSHOTS_DIR", screenshots_dir);
 
     int count = 0;
     args[count++] = (*argv)[0];

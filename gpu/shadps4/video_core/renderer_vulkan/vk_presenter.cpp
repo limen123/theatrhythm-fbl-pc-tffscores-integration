@@ -229,6 +229,37 @@ std::filesystem::path ScreenshotPath() {
 }
 
 /// Records the copy of `image` (layout TransferSrcOptimal) and saves it once the GPU is done.
+
+static std::mutex s_last_screenshot_mutex;
+static std::string s_last_screenshot_path;
+static uint64_t s_last_screenshot_time_ms = 0;
+
+void RecordLastSavedScreenshot(const std::string& path) {
+    std::scoped_lock lock{s_last_screenshot_mutex};
+    s_last_screenshot_path = path;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    s_last_screenshot_time_ms = static_cast<uint64_t>(now);
+}
+
+extern "C" int theatrhythm_gpu_get_last_screenshot(char* out, size_t size, uint64_t* out_time_ms) {
+    std::scoped_lock lock{s_last_screenshot_mutex};
+    if (s_last_screenshot_path.empty()) return 0;
+    if (out && size) {
+        size_t n = std::min(size - 1, s_last_screenshot_path.size());
+        std::memcpy(out, s_last_screenshot_path.data(), n);
+        out[n] = 0;
+    }
+    if (out_time_ms) *out_time_ms = s_last_screenshot_time_ms;
+    return 1;
+}
+
+extern "C" void theatrhythm_gpu_clear_last_screenshot() {
+    std::scoped_lock lock{s_last_screenshot_mutex};
+    s_last_screenshot_path.clear();
+    s_last_screenshot_time_ms = 0;
+}
+
 void CaptureScreenshot(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
                        const Frame& frame) {
     const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -285,6 +316,7 @@ void CaptureScreenshot(const Instance& instance, Scheduler& scheduler, vk::Comma
         }
         if (saved) {
             std::printf("Screenshot: %s (%ux%u)\n", Common::FS::PathToUTF8String(path).c_str(), width, height);
+            RecordLastSavedScreenshot(Common::FS::PathToUTF8String(path));
             TheatrhythmOverlay::ShowNotice("Screenshot saved: " + Common::FS::PathToUTF8String(path.filename()));
         } else {
             LOG_ERROR(Render_Vulkan, "Screenshot: cannot write {}", Common::FS::PathToUTF8String(path));

@@ -115,6 +115,12 @@ void theatrhythm_gpu_notice(const char *text, int milliseconds);
  * for the runtime's call: id, description and PNG icon. */
 void theatrhythm_gpu_toast_trophy(int id, const char *title, const char *detail, const unsigned char *png,
                                  uint64_t png_size);
+/* Requests a game-only screenshot (F12 equivalent) from the presenter. */
+void theatrhythm_gpu_request_screenshot(void);
+/* Retrieves path and timestamp (ms) of the latest saved screenshot. Returns 1 if found, 0 if none. */
+int theatrhythm_gpu_get_last_screenshot(char *out, size_t size, uint64_t *out_time_ms);
+/* Clears the last screenshot path so it cannot be re-consumed. */
+void theatrhythm_gpu_clear_last_screenshot(void);
 #ifdef __cplusplus
 }
 #endif

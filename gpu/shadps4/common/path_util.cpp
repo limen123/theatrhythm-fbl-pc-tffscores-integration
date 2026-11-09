@@ -123,7 +123,8 @@ static std::unordered_map<PathType, fs::path>& UserPaths() {
     // temp0, download0); not shadPS4's cheats, patches, custom trophy and module folders.
     create_path(PathType::UserDir, user_dir);
     create_path(PathType::LogDir, user_dir / LOG_DIR);
-    create_path(PathType::ScreenshotsDir, user_dir / SCREENSHOTS_DIR);
+    const char* ss_env = std::getenv("THEATRHYTHM_SCREENSHOTS_DIR");
+    create_path(PathType::ScreenshotsDir, (ss_env && ss_env[0]) ? std::filesystem::path(ss_env) : (user_dir / SCREENSHOTS_DIR));
     create_path(PathType::ShaderDir, user_dir / SHADER_DIR);
     create_path(PathType::CacheDir, user_dir / CACHE_DIR);
 

@@ -420,6 +420,11 @@ ScreenshotRequests ConsumeScreenshotRequests() {
 }
 } // namespace VideoCore
 
+extern "C" void theatrhythm_gpu_request_screenshot(void) {
+    VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+}
+
+
 extern "C" int theatrhythm_gpu_vibration_percent(void) {
     return TheatrhythmSettings::Get().vibration.load(std::memory_order_relaxed);
 }
