@@ -102,7 +102,8 @@ def find_probe():
         fail(f'{probe} not found: build it with build.sh (MSYS2 CLANG64 shell on Windows).')
     # Development builds use the MSYS2 CLANG64 DLLs (SDL3, FFmpeg, ...).
     if WINDOWS and not (probe.parent / 'SDL3.dll').is_file():
-        clang64 = Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
+        default_msys = r'C:\msys64' if os.path.isdir(r'C:\msys64') else (r'D:\msys64' if os.path.isdir(r'D:\msys64') else (r'F:\msys64' if os.path.isdir(r'F:\msys64') else r'C:\msys64'))
+        clang64 = Path(os.environ.get('MSYS2_ROOT', default_msys)) / 'clang64' / 'bin'
         if clang64.is_dir():
             os.environ['PATH'] = f'{clang64}{os.pathsep}{os.environ.get("PATH", "")}'
     return probe

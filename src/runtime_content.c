@@ -1,6 +1,7 @@
 /* Offline AppContent provider for the configured base-game profile.
- * Add-ons are the folders under <user>/addcont/ and, when one is set, under an extra DLC folder
- * (none by default); no downloads, entitlement or license emulation. */
+ * Add-ons are the folders under <user>/addcont/, an optional extra DLC folder (--dlc /
+ * extra_dir), <user>/download0/ (dumped DLCs with param.sfo or DLCPACK/PREMIUMEDITION names), and
+ * THEATRHYTHM_DLC_DIR; no downloads, entitlement or license emulation. */
 #include "runtime.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -102,11 +103,12 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
     printf("Runtime: AppContent parameter %u = %d\n",id,*out);
     return 0;
 }
-/* Installed add-ons: each folder <user>/addcont/<label>/ is one, then each <extra>/<label>/ whose
- * label <user>/addcont/ lacks; its name is the entitlement label (up to 16 characters). They are
- * listed in name order and mounted as /addcont<index>. */
+/* Installed add-ons: each folder <user>/addcont/<label>/ is one, then <extra>/<label>/,
+ * <user>/download0/<label>/ and THEATRHYTHM_DLC_DIR (supporting dumped DLC folders via
+ * sce_sys/param.sfo CONTENT_ID or DLCPACK/PREMIUMEDITION names). Listed in name order and mounted
+ * as /addcont<index>. */
 #define LABEL_SIZE 17
-#define MAX_ADDONS 64
+#define MAX_ADDONS 128
 typedef struct { char label[LABEL_SIZE]; char folder[700]; } Addon;
 static Addon addons[MAX_ADDONS];
 static unsigned addon_count, addons_scanned;
@@ -121,6 +123,36 @@ static int is_folder(const char *path) {
     if (!d) return 0;
     closedir(d); return 1;
 }
+/* Read CONTENT_ID from a dumped DLC's sce_sys/param.sfo. */
+static int sfo_content_id(const char *path, char *out, size_t out_size) {
+    FILE *f=fopen(path,"rb");
+    if (!f) return 0;
+    unsigned char data[65536];
+    size_t n=fread(data,1,sizeof(data),f);
+    fclose(f);
+    if (n<20 || memcmp(data,"\0PSF",4)) return 0;
+    uint32_t keys, values, count;
+    memcpy(&keys,data+8,4);
+    memcpy(&values,data+12,4);
+    memcpy(&count,data+16,4);
+    for (uint32_t i=0; i<count && (size_t)i*16+36<=n; ++i) {
+        const unsigned char *e=data+20+(size_t)i*16;
+        uint16_t key_offset;
+        uint32_t length, offset;
+        memcpy(&key_offset,e,2);
+        memcpy(&length,e+4,4);
+        memcpy(&offset,e+12,4);
+        if ((size_t)keys+key_offset>=n || (size_t)values+offset+length>n) continue;
+        if (strcmp((const char *)data+keys+key_offset,"CONTENT_ID")) continue;
+        if (out && out_size) {
+            size_t copy=length<out_size-1 ? length : out_size-1;
+            memcpy(out,data+values+offset,copy);
+            out[copy]=0;
+            return 1;
+        }
+    }
+    return 0;
+}
 /* An extra DLC folder holds the add-ons, or (as shadPS4's addcont folder does) a <title ID>/
  * folder that holds them. */
 void runtime_content_extra_dir(const char *folder,const char *title_id) {
@@ -131,15 +163,40 @@ void runtime_content_extra_dir(const char *folder,const char *title_id) {
     else snprintf(extra_dir,sizeof(extra_dir),"%s",folder);
     printf("Runtime: extra DLC folder %s%s\n",extra_dir,is_folder(extra_dir) ? "" : " (missing)");
 }
-static void scan_folder(const char *path) {
+enum { SCAN_PLAIN = 0, SCAN_DUMPED_ONLY = 1, SCAN_EXTRA = 2 };
+static void scan_folder(const char *path, int mode) {
     DIR *d=opendir(path);
     if (!d) return;
     for (struct dirent *e; addon_count<MAX_ADDONS && (e=readdir(d));) {
-        size_t n=strlen(e->d_name);
-        if (e->d_name[0]=='.' || n>=LABEL_SIZE || find_addon(e->d_name)>=0) continue;
+        if (e->d_name[0]=='.') continue;
         Addon *a=&addons[addon_count];
         if ((size_t)snprintf(a->folder,sizeof(a->folder),"%s/%s",path,e->d_name)>=sizeof(a->folder) || !is_folder(a->folder)) continue;
-        memcpy(a->label,e->d_name,n+1);
+        char label[64]="";
+        if (mode!=SCAN_PLAIN) {
+            char sfo[730], cid[128]="";
+            if ((size_t)snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",a->folder)<sizeof(sfo) && sfo_content_id(sfo,cid,sizeof(cid)) && cid[0]) {
+                if (strlen(cid)>20) snprintf(label,sizeof(label),"%s",cid+20);
+                else {
+                    const char *dash=strrchr(cid,'-');
+                    if (dash && dash[1]) snprintf(label,sizeof(label),"%s",dash+1);
+                }
+            }
+            if (!label[0]) {
+                const char *p=strstr(e->d_name,"DLCPACK");
+                if (!p) p=strstr(e->d_name,"PREMIUMEDITION");
+                if (p) snprintf(label,sizeof(label),"%s",p);
+            }
+        }
+        if (!label[0] && mode!=SCAN_DUMPED_ONLY) {
+            size_t n=strlen(e->d_name);
+            if (n>=LABEL_SIZE) continue;
+            memcpy(label,e->d_name,n+1);
+        }
+        size_t llen=strlen(label);
+        if (!llen) continue;
+        if (llen>=LABEL_SIZE) { label[LABEL_SIZE-1]=0; llen=LABEL_SIZE-1; }
+        if (find_addon(label)>=0) continue;
+        memcpy(a->label,label,llen+1);
         ++addon_count;
     }
     closedir(d);
@@ -148,17 +205,26 @@ static void scan_addons(void) {
     if (addons_scanned) return;
     addons_scanned=1;
     char path[600]; snprintf(path,sizeof(path),"%s/addcont",runtime_file_user_dir());
-    scan_folder(path);
-    if (extra_dir[0]) scan_folder(extra_dir);
+    scan_folder(path,SCAN_PLAIN);
+    if (extra_dir[0]) scan_folder(extra_dir,SCAN_EXTRA);
+    snprintf(path,sizeof(path),"%s/download0",runtime_file_user_dir());
+    scan_folder(path,SCAN_DUMPED_ONLY);
+    const char *custom=getenv("THEATRHYTHM_DLC_DIR");
+    if (custom && *custom && strcmp(custom,extra_dir)!=0) scan_folder(custom,SCAN_EXTRA);
     qsort(addons,addon_count,sizeof(*addons),addon_order);
     for (unsigned i=0;i<addon_count;++i) printf("Runtime: add-on %s installed (%s)\n",addons[i].label,addons[i].folder);
+}
+void runtime_content_init_dlc(const char *app0, const char *user) {
+    (void)app0;
+    (void)user;
+    scan_addons();
 }
 /* sceAppContentGetAddcontInfoList(service, list, capacity, hits): OrbisAppContentAddcontInfo is
  * the entitlement label (17 bytes, 3 padding) and the download status (4 = installed). A null
  * list only counts. Never touch unused list slots. */
 static ABI int32_t addon_list(uint32_t service,void *list,uint32_t capacity,uint32_t *hits) {
     require_initialized();
-    if (service) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
+    if (service>7) { fputs("STOP: nonzero AppContent service label unsupported\n",stderr); exit(21); }
     if ((!capacity || !list) && !hits) return PARAMETER;
     scan_addons();
     unsigned n=list && capacity<addon_count ? capacity : addon_count;
@@ -249,5 +315,5 @@ uintptr_t runtime_content_resolve(const char *name) {
     return 0;
 }
 void runtime_content_report(void) {
-    printf("Runtime: AppContent references=%u, initialized=%u, parameter queries=%u, list queries=%u\n",refs,initialized,queries,lists);
+    printf("Runtime: AppContent references=%u, initialized=%u, parameter queries=%u, list queries=%u, addons=%u\n",refs,initialized,queries,lists,addon_count);
 }

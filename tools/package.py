@@ -449,7 +449,8 @@ def main():
     p.add_argument('--appimagetool', type=Path, help='with --dlcmaker --zip on Linux: appimagetool-x86_64.AppImage')
     p.add_argument('--appimage-runtime', type=Path, help="with --dlcmaker --zip on Linux: the type2 runtime (runtime-x86_64)")
     a = p.parse_args()
-    bin_dir = Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
+    default_msys = r'C:\msys64' if os.path.isdir(r'C:\msys64') else (r'D:\msys64' if os.path.isdir(r'D:\msys64') else (r'F:\msys64' if os.path.isdir(r'F:\msys64') else r'C:\msys64'))
+    bin_dir = Path(os.environ.get('MSYS2_ROOT', default_msys)) / 'clang64' / 'bin'
     if a.dlcmaker:
         return package_dlcmaker(a, bin_dir)
     if LINUX and a.python:

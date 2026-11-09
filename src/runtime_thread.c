@@ -460,7 +460,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     *out=t;
     int e=pthread_create(&t->host,&host,host_start,t);
     pthread_attr_destroy(&host);
-    if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d\n",e); exit(21); }
+    if (e) { fprintf(stderr,"STOP: host pthread_create failed: %d name='%s' stack=%zu\n",e,t->name,stack_bytes); exit(21); }
     if (t->detached) pthread_detach(t->host);
     pthread_mutex_lock(&lock); ++created; pthread_mutex_unlock(&lock);
     if (runtime_verbose()) printf("Runtime: guest thread '%s' created (stack=%llu, prio=%d)\n",t->name,(unsigned long long)stack,t->attr.prio);

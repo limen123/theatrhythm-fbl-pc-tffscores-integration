@@ -854,6 +854,7 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL); /* the patch's version (VERSION stays the disc's) */
         runtime_game_identify(title_id,version,app0,argv[1]);
         if (dlc_dir && dlc_dir[0]) runtime_content_extra_dir(dlc_dir, title_id[0] ? title_id : NULL);
+        runtime_content_init_dlc(app0, user_dir ? user_dir : "user");
     }
     theatrhythm_gpu_register_kernel();
 #ifdef _WIN32

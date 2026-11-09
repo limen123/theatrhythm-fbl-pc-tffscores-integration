@@ -11,3 +11,8 @@ dist-*/
 /settings.ini
 !/settings.example.ini
 /.claude/
+Save/
+save/
+*.inf
+*.dat
+scratch/
