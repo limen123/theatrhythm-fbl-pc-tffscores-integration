@@ -1038,7 +1038,7 @@ int main(int argc, char **argv) {
 #else
     size_t redzone_area = 0;
 #endif
-    image = allocate(round_page(size) + stub_area + 6 * page_size + redzone_area);
+    image = allocate(round_page(size) + stub_area + 7 * page_size + redzone_area);
     printf("Runtime: guest image at %p (guest offsets are relative to it)\n", (void *)image);
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
@@ -1067,6 +1067,10 @@ int main(int argc, char **argv) {
         start_hang_watch();
         if (app0) configure_button_icons(argv[1]); /* settings are read by theatrhythm_gpu_init */
         if (app0) monitor_icon = mount_config_icon(argv[1]);
+        {
+            extern void runtime_judgements_configure(const char *save_dir);
+            runtime_judgements_configure(user_dir ? user_dir : "user");
+        }
         if (theatrhythm_render_4k()) {
             runtime_kernel_set_neo_mode(1);
             if (app0) mount_boot_config_4k(argv[1],app0);
@@ -1165,6 +1169,11 @@ int main(int argc, char **argv) {
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_exit_prompt_install(image, modules[m].base, exit_stub, page_size, display_page))
                 protect(exit_stub, page_size, 5);
+        unsigned char *judgements_stub = exit_stub + page_size;
+        for (uint64_t m = 0; m < module_count; ++m)
+            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
+                !runtime_judgements_install(image, modules[m].base, judgements_stub, page_size))
+                protect(judgements_stub, page_size, 5);
         runtime_game_code_close();
     }
 #ifdef _WIN32
@@ -1185,7 +1194,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     /* Page tracking runs with the GPU only. */
     if (code_before) {
-        unsigned char *trampolines = stubs + stub_area + 6 * page_size;
+        unsigned char *trampolines = stubs + stub_area + 7 * page_size;
         redzone_protect(image, size, trampolines, code_before, segments, ns, modules, module_count, &main_module);
         protect(trampolines, redzone_area, 5);
         free(code_before);

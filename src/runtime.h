@@ -103,6 +103,8 @@ int runtime_skip_opening_install(unsigned char *image, uint64_t module_base, uns
  * (runtime_exit_prompt.c). Its text comes through the Display page's translation hook, so it
  * installs only with `display_page` (that install returned 0). 0 when installed. */
 int runtime_exit_prompt_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size, int display_page);
+/* Per-note judgements and timing recorder (runtime_judgements.c). 0 when installed. */
+int runtime_judgements_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
 /* The text the exit prompt shows for an I2 term while it is open, else NULL (translation hook). */
 const char *runtime_exit_prompt_translation(const char *term);
 /* 1 while the exit prompt's window is open (the pad turns Options into Circle there: No). */
@@ -229,7 +231,9 @@ void runtime_pad_report(void);
 int runtime_pad_describe(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
+const char *runtime_savedata_title_id(void);
 void runtime_savedata_configure(const char *title);
+int runtime_savedata_get_active_save_dir(char *out, size_t size);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 /* OrbisSaveDataParam (1328 bytes) of a save directory of the current title. */

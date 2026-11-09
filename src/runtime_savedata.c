@@ -73,9 +73,20 @@ static char title_id[16]="UNKNOWN";
 static struct { int used; int32_t user; uint64_t blocks; char host[700], meta[700]; } slots[SLOTS];
 static struct { char path[720], dir[700]; uint64_t size; } memories[SLOTS]; /* SaveDataMemory slots */
 static size_t mounts_done, memory_writes, backups_done;
+static char g_last_active_save_host[700];
 
 void runtime_savedata_configure(const char *title) {
     if (title && *title) snprintf(title_id,sizeof(title_id),"%s",title);
+}
+
+const char *runtime_savedata_title_id(void) {
+    return title_id[0] ? title_id : "UNKNOWN";
+}
+
+int runtime_savedata_get_active_save_dir(char *out, size_t size) {
+    if (!g_last_active_save_host[0]) return -1;
+    if (out && size) snprintf(out, size, "%s", g_last_active_save_host);
+    return 0;
 }
 
 static int make_dirs(const char *path) {
@@ -200,6 +211,7 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     slots[slot].user=user;
     snprintf(slots[slot].host,sizeof(slots[slot].host),"%s",host);
     snprintf(slots[slot].meta,sizeof(slots[slot].meta),"%s",meta);
+    snprintf(g_last_active_save_host, sizeof(g_last_active_save_host), "%s", host);
     memset(result,0,sizeof(*result));
     char point[32];
     snprintf(point,sizeof(point),"/savedata%d",slot&15);
