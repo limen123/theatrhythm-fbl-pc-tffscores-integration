@@ -1271,7 +1271,7 @@ static ABI int wrap_music_table_convert(HookRegs *r) {
 
         put64((char *)row + 0x10, (uint64_t)song->managed_id);
         put32((char *)row + 0x18, 2); /* PurchaseStatus = Available */
-        put32((char *)row + 0x1c, 3); /* EditionType = 3 (Custom CX) */
+        put32((char *)row + 0x1c, 0);
         put32((char *)row + 0x40, (uint32_t)(9000000 + added)); /* SortOrder */
         if (series_object) {
             put64((char *)row + 0x48, (uint64_t)series_object);
@@ -2894,6 +2894,7 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
     GetGOPtrFn comp_get_go = (GetGOPtrFn)CODE(CC_COMP_GET_GAMEOBJECT);
     SetSpriteFn set_spr = (SetSpriteFn)CODE(CC_IMAGE_SET_SPRITE);
     SetEnabledFn set_enabled = (SetEnabledFn)CODE(CC_BEHAVIOUR_SET_ENABLED);
+    SetActiveFn set_active = (SetActiveFn)CODE(CC_GO_SET_ACTIVE);
     GetChildCountFn get_cc = (GetChildCountFn)CODE(CC_TR_GET_CHILD_COUNT);
     GetChildFn get_ch = (GetChildFn)CODE(CC_TR_GET_CHILD);
 
@@ -2925,6 +2926,8 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
                 if (i == 0 || i == 1 || (kname && strstr(kname, "Localized"))) {
                     /* Disable LocalizedTMProUGUI / LocalizedText so OnEnable never overwrites "CX" */
                     set_enabled(txt, false, NULL);
+                    void *txt_go = comp_get_go(txt, NULL);
+                    if (uobj_alive(txt_go)) set_active(txt_go, false, NULL);
                     if (i == 0 || (kname && strstr(kname, "TMPro"))) {
                         put64((char *)txt + 0x798, 0);
                         void *info = (void *)load64((char *)txt + 0x7a0);
@@ -2978,7 +2981,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
             break;
         }
     }
-    if (!custom_mark) {
+    if (!custom_mark && is_custom) {
         /* MSMarkBehaviour: +0x20 = _dlcMark, +0x28 = _dxMark */
         void *dlc = (void *)load64((char *)self + 0x20);
         if (!uobj_alive(dlc)) dlc = (void *)load64((char *)self + 0x28);
@@ -3035,7 +3038,12 @@ static ABI int hook_set_active_edition_mark(HookRegs *r) {
     ((SetEditionFn)original_set_active_edition_mark)(self, edition, method);
 
     if (uobj_alive(self)) {
-        cda_apply_ms_mark(self, edition == 3);
+        for (size_t i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
+            if (s_cda_custom_marks[i].ms_mark == self) {
+                cda_apply_ms_mark(self, s_cda_custom_marks[i].is_custom);
+                break;
+            }
+        }
     }
     r->rax = 0;
     return 1;
