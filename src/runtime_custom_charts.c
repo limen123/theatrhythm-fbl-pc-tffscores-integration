@@ -1271,7 +1271,7 @@ static ABI int wrap_music_table_convert(HookRegs *r) {
 
         put64((char *)row + 0x10, (uint64_t)song->managed_id);
         put32((char *)row + 0x18, 2); /* PurchaseStatus = Available */
-        put32((char *)row + 0x1c, 0);
+        put32((char *)row + 0x1c, 3); /* EditionType = 3 (Custom CX) */
         put32((char *)row + 0x40, (uint32_t)(9000000 + added)); /* SortOrder */
         if (series_object) {
             put64((char *)row + 0x48, (uint64_t)series_object);
@@ -2878,13 +2878,15 @@ static void *cda_find_comp_in_children(void *tr, const char *full_name, const ch
     return NULL;
 }
 
+#define CDA_CUSTOM_MARKS_CAP 256
+
 typedef struct {
     void *ms_mark;
     void *custom_mark;
     bool is_custom;
 } CdaCustomMarkEntry;
 
-static CdaCustomMarkEntry s_cda_custom_marks[64];
+static CdaCustomMarkEntry s_cda_custom_marks[CDA_CUSTOM_MARKS_CAP];
 static void *original_set_active_edition_mark = NULL;
 
 static void cda_configure_custom_mark_hierarchy(void *node_tr) {
@@ -2966,7 +2968,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
     GetTransformFn go_get_tr = (GetTransformFn)CODE(CC_GO_GET_TRANSFORM);
     void *custom_mark = NULL;
     int entry_idx = -1;
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
         if (s_cda_custom_marks[i].ms_mark == self) {
             if (uobj_alive(s_cda_custom_marks[i].custom_mark)) {
                 custom_mark = s_cda_custom_marks[i].custom_mark;
@@ -2991,7 +2993,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
                     (void)gc_pin(custom_mark, false);
                     cda_configure_custom_mark_hierarchy(go_get_tr(custom_mark, NULL));
                     if (entry_idx < 0) {
-                        for (int i = 0; i < 64; ++i) {
+                        for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
                             if (!uobj_alive(s_cda_custom_marks[i].ms_mark)) { entry_idx = i; break; }
                         }
                         if (entry_idx < 0) entry_idx = 0;
@@ -3013,6 +3015,9 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
         if (uobj_alive(custom_mark)) {
             set_active(custom_mark, true, NULL);
             cda_configure_custom_mark_hierarchy(go_get_tr(custom_mark, NULL));
+        } else if (uobj_alive(dlc)) {
+            set_active(dlc, true, NULL);
+            cda_configure_custom_mark_hierarchy(go_get_tr(dlc, NULL));
         }
     } else {
         if (uobj_alive(custom_mark)) set_active(custom_mark, false, NULL);
@@ -3030,12 +3035,7 @@ static ABI int hook_set_active_edition_mark(HookRegs *r) {
     ((SetEditionFn)original_set_active_edition_mark)(self, edition, method);
 
     if (uobj_alive(self)) {
-        for (size_t i = 0; i < 64; ++i) {
-            if (s_cda_custom_marks[i].ms_mark == self) {
-                cda_apply_ms_mark(self, s_cda_custom_marks[i].is_custom);
-                break;
-            }
-        }
+        cda_apply_ms_mark(self, edition == 3);
     }
     r->rax = 0;
     return 1;
@@ -5164,13 +5164,28 @@ static ABI int hook_summon_bar_util_setup(HookRegs *r) {
     return 0;
 }
 
-/* Restore true Beginner(4)/Chaos(5) slot onto playSetting (+0x50) before Results & Record save! */
+static void *original_copy_ms_play_data = NULL;
+
+/* Restore true Beginner(4)/Chaos(5) slot onto playSetting (+0x50) before Record save,
+ * but clamp MusicResultPlayData._difficulty (+0x48) to a safe stock slot (0..3)
+ * so native Results scene UI components (length-4 arrays, GetDifficultyIconSprite) never crash! */
 static ABI int hook_copy_ms_play_data(HookRegs *r) {
+    void *result_play_data = (void *)r->rdi;
     void *play_setting = (void *)r->rcx;
     if (play_setting && s_gameplay_chart_slot >= 4) {
         put32((char *)play_setting + 0x50, (uint32_t)s_gameplay_chart_slot);
     }
     s_custom_records_dirty = true;
+
+    if (original_copy_ms_play_data) {
+        typedef void (ABI *CopyFn)(void *this_ptr, int32_t rsi, void *rdx, void *play_setting, int8_t r8b);
+        ((CopyFn)original_copy_ms_play_data)(result_play_data, (int32_t)r->rsi, (void *)r->rdx, (void *)r->rcx, (int8_t)r->r8);
+        if (result_play_data && s_gameplay_chart_slot >= 4) {
+            put32((char *)result_play_data + 0x48, (uint32_t)clamp_extra_slot(s_gameplay_chart_slot));
+        }
+        r->rax = 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -5233,12 +5248,15 @@ static ABI int hook_music_title_display_setup(HookRegs *r) {
     void *mid = (void *)r->rsi;
     int slot = (int)r->rdx;
 
+    if (s_gameplay_chart_slot >= 4 && s_gameplay_chart_slot < MAX_SLOTS) {
+        slot = s_gameplay_chart_slot;
+    }
     if (self) {
         cda_expand_title_color_info(self);
         cda_register_icon_target((void *)load64((char *)self + 0x48), slot);
         cda_apply_ms_mark((void *)load64((char *)self + 0x70), find_song_by_obj(mid) != NULL);
     }
-    if (slot < 0 || slot >= MAX_SLOTS) {
+    if (slot < 0 || slot >= 4) {
         r->rdx = (uint64_t)clamp_extra_slot(slot);
     }
     return 0;
@@ -5271,7 +5289,7 @@ static ABI int hook_load_title_plate_move_next(HookRegs *r) {
     if (state == -2) {
         void *closure = (void *)load64((char *)sm + 0x18);
         if (closure) {
-            int diff = (int)load32((char *)closure + 0x30);
+            int diff = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : (int)load32((char *)closure + 0x30);
             if (diff == 4 || diff == 5) {
                 void *disp = (void *)load64((char *)closure + 0x18);
                 void *img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
@@ -6666,7 +6684,7 @@ int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, un
         {H_BURST_GAUGE_SETUP, hook_clamp_rdi_diff, NULL},
         {H_ABILITY_CONDITION_SETUP, hook_ability_condition_setup, NULL},
         {H_SUMMON_BAR_UTIL_SETUP, hook_summon_bar_util_setup, NULL},
-        {H_COPY_MS_PLAY_DATA, hook_copy_ms_play_data, NULL},
+        {H_COPY_MS_PLAY_DATA, hook_copy_ms_play_data, &original_copy_ms_play_data},
         {H_MUSIC_TITLE_DISPLAY_SETUP, hook_music_title_display_setup, NULL},
         {H_RETRY_WINDOW_ON_UPDATE, hook_retry_window_on_update, NULL},
         {H_IMAGE_ANIM_PROPS, hook_image_anim_props, &original_image_anim_props},
