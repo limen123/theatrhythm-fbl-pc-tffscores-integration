@@ -1174,17 +1174,7 @@ int main(int argc, char **argv) {
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_exit_prompt_install(image, modules[m].base, exit_stub, page_size, display_page))
                 protect(exit_stub, page_size, 5);
-        unsigned char *judgements_stub = exit_stub + page_size;
-        for (uint64_t m = 0; m < module_count; ++m)
-            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
-                !runtime_judgements_install(image, modules[m].base, judgements_stub, page_size))
-                protect(judgements_stub, page_size, 5);
-        unsigned char *tff_stub = judgements_stub + page_size;
-        for (uint64_t m = 0; m < module_count; ++m)
-            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
-                !runtime_tffscores_install(image, modules[m].base, tff_stub, page_size))
-                protect(tff_stub, page_size, 5);
-        unsigned char *custom_stub = tff_stub + page_size;
+        unsigned char *custom_stub = exit_stub + page_size;
         for (uint64_t m = 0; m < module_count; ++m)
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_custom_charts_install(image, modules[m].base, custom_stub, 16 * page_size))

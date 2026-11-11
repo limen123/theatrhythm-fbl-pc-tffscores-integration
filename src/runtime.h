@@ -103,8 +103,7 @@ int runtime_skip_opening_install(unsigned char *image, uint64_t module_base, uns
  * (runtime_exit_prompt.c). Its text comes through the Display page's translation hook, so it
  * installs only with `display_page` (that install returned 0). 0 when installed. */
 int runtime_exit_prompt_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size, int display_page);
-/* Per-note judgements and timing recorder (runtime_judgements.c). 0 when installed. */
-int runtime_judgements_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
+
 /* The text the exit prompt shows for an I2 term while it is open, else NULL (translation hook). */
 const char *runtime_exit_prompt_translation(const char *term);
 /* 1 while the exit prompt's window is open (the pad turns Options into Circle there: No). */
@@ -170,6 +169,8 @@ void runtime_content_configure(const uint32_t values[5]);
 /* An extra folder of add-ons next to <user>/addcont/ (its <title_id>/ subfolder when it has one). */
 void runtime_content_extra_dir(const char *folder,const char *title_id);
 void runtime_content_init_dlc(const char *app0, const char *user);
+void runtime_custom_charts_configure(const char *game_dir, const char *user_dir);
+int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
 uintptr_t runtime_content_resolve(const char *name);
 void runtime_content_report(void);
 typedef struct { const char *name; void *function; } RuntimeExport;
@@ -246,5 +247,11 @@ int runtime_savedata_param(int32_t user, const char *dir, void *param);
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
 int64_t runtime_savedata_mtime(int32_t user, const char *dir);
 void runtime_savedata_preview_path(const char *path);
+/* TFFScores integration */
+void runtime_tffscores_init(const char *user_dir);
+void runtime_tffscores_trigger_auth_hotkey(void);
+void runtime_tffscores_on_save_commit(const char *save_host);
+void runtime_tffscores_on_song_result_finish(void);
+
 void runtime_thread_attach_host(const char *name);
 #endif

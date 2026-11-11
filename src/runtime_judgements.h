@@ -59,21 +59,6 @@ void runtime_judgements_get_summary(float *mean_offset, float *std_dev, int *ear
 /* Load saved judgements for a specific song and difficulty */
 bool runtime_judgements_load(uint32_t music_id, int difficulty);
 
-/* Query current live stage music_id and difficulty */
-void runtime_judgements_get_current_stage(uint32_t *out_music_id, int *out_difficulty);
-
-/* Callbacks for downstream hooks (TFFScores, CustomCharts) so hooks are never duplicated */
-typedef void (*RuntimeJudgementsStageBeginCallback)(void *enumerator, int state_before, bool move_next_pending);
-typedef void (*RuntimeJudgementsScorePBCallback)(void *title_parts_main, bool is_new_best);
-typedef void (*RuntimeJudgementsTitleInitCallback)(void *title_parts_main);
-
-void runtime_judgements_add_stage_begin_callback(RuntimeJudgementsStageBeginCallback cb);
-void runtime_judgements_add_score_pb_callback(RuntimeJudgementsScorePBCallback cb);
-void runtime_judgements_add_title_init_callback(RuntimeJudgementsTitleInitCallback cb);
-
-/* Install GameSite hooks for stage begin, note judgements, and stage end */
-int runtime_judgements_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
-
 #ifdef __cplusplus
 }
 #endif

@@ -596,6 +596,8 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     note_call(SLOW_READ,start);
     pthread_mutex_unlock(&lock);
     if (data->buttons & (BTN_CROSS | BTN_CIRCLE)) {
+        extern void runtime_tffscores_trigger_immediate_screenshot(void);
+        runtime_tffscores_trigger_immediate_screenshot();
         void (*hook)(void) = __atomic_load_n(&pad_confirm_hook, __ATOMIC_ACQUIRE);
         if (hook) hook();
     }

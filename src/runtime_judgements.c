@@ -1,4 +1,5 @@
 #include "runtime_judgements.h"
+#include "runtime_custom_charts.h"
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,10 +11,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-
-static inline bool is_custom_chart_id(uint32_t music_id) {
-    return music_id >= 169000000 && music_id < 170000000;
-}
 
 #define JUDGEMENTS_MAGIC 0x4744554a /* 'JUDG' */
 #define JUDGEMENTS_VERSION 1
@@ -137,7 +134,7 @@ void runtime_judgements_finish_stage(uint32_t score, bool is_new_best) {
     /* Read existing file if present to update or append.
      * Custom charts use placeholder IDs (169xxxxxx) and are isolated in customJudgements.dat
      * so stock judgementsBackup.inf stays 100% pure for TFFScores cloud saves! */
-    bool is_custom = is_custom_chart_id(s_current_music_id);
+    bool is_custom = runtime_custom_charts_is_custom_id(s_current_music_id);
     char path_backup[560], path_dat[560];
     if (is_custom) {
         snprintf(path_backup, sizeof(path_backup), "%s/customJudgements.dat", s_save_dir);
@@ -267,7 +264,7 @@ void runtime_judgements_finish_stage(uint32_t score, bool is_new_best) {
 
 bool runtime_judgements_load(uint32_t music_id, int difficulty) {
     pthread_mutex_lock(&s_judg_lock);
-    bool is_custom = is_custom_chart_id(music_id);
+    bool is_custom = runtime_custom_charts_is_custom_id(music_id);
     char path[560];
     FILE *f = NULL;
     if (is_custom) {
@@ -560,245 +557,4 @@ int runtime_judgements_render_graph(uint8_t *rgba, int width, int height, uint32
 
     pthread_mutex_unlock(&s_judg_lock);
     return (int)s_display_count;
-}
-
-void runtime_judgements_get_current_stage(uint32_t *out_music_id, int *out_difficulty) {
-    pthread_mutex_lock(&s_judg_lock);
-    if (out_music_id) *out_music_id = s_current_music_id;
-    if (out_difficulty) *out_difficulty = s_current_difficulty;
-    pthread_mutex_unlock(&s_judg_lock);
-}
-
-#define MAX_JUDGEMENTS_CALLBACKS 4
-static RuntimeJudgementsStageBeginCallback s_stage_begin_cbs[MAX_JUDGEMENTS_CALLBACKS];
-static size_t s_stage_begin_cb_count = 0;
-static RuntimeJudgementsScorePBCallback s_score_pb_cbs[MAX_JUDGEMENTS_CALLBACKS];
-static size_t s_score_pb_cb_count = 0;
-static RuntimeJudgementsTitleInitCallback s_title_init_cbs[MAX_JUDGEMENTS_CALLBACKS];
-static size_t s_title_init_cb_count = 0;
-
-void runtime_judgements_add_stage_begin_callback(RuntimeJudgementsStageBeginCallback cb) {
-    if (cb && s_stage_begin_cb_count < MAX_JUDGEMENTS_CALLBACKS)
-        s_stage_begin_cbs[s_stage_begin_cb_count++] = cb;
-}
-
-void runtime_judgements_add_score_pb_callback(RuntimeJudgementsScorePBCallback cb) {
-    if (cb && s_score_pb_cb_count < MAX_JUDGEMENTS_CALLBACKS)
-        s_score_pb_cbs[s_score_pb_cb_count++] = cb;
-}
-
-void runtime_judgements_add_title_init_callback(RuntimeJudgementsTitleInitCallback cb) {
-    if (cb && s_title_init_cb_count < MAX_JUDGEMENTS_CALLBACKS)
-        s_title_init_cbs[s_title_init_cb_count++] = cb;
-}
-
-/* =========================================================================
- * GameSite Hooks for Judgements & Timing
- * ========================================================================= */
-
-static uint32_t load32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static uint64_t load64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
-
-enum {
-    H_THEATER_BEGIN_INIT,
-    H_FIXED_TRIGGER_JUDGE,
-    H_NEED_UPDATE_BEST_SCORE,
-    H_TITLE_PARTS_INIT,
-    HOOK_COUNT
-};
-
-static const GameSite s_sites[HOOK_COUNT] = {
-    /* H_THEATER_BEGIN_INIT */ {"Game.Scene.MusicStage.TheaterController/<BeginInitialize>d__125::MoveNext", 0, 0, 0,
-     {"55 48 89 e5 41 57 41 56 | 41 55 41 54 53 50 80 3d ?? ?? ?? ?? 00"}},
-    /* H_FIXED_TRIGGER_JUDGE */ {"Game.Rhythm.ContextPlaydata::FixedTriggerJudge(5)", 0, 0, 0,
-     {"55 48 89 e5 41 57 41 56 | 41 55 41 54 53 48 83 ec 28 80 3d ?? ?? ?? ?? 00"}},
-    /* H_NEED_UPDATE_BEST_SCORE */ {"Game.Scene.MusicResult.MusicResultTitlePartsMain::get_needUpdateBestScore", 0, 0, 0,
-     {"55 48 89 e5 41 56 53 | 80 3d ?? ?? ?? ?? 00 49 89 fe 75 1f 48 8d 3d ?? ?? ?? ??"}},
-    /* H_TITLE_PARTS_INIT */ {"Game.Scene.MusicResult.MusicResultTitlePartsMain::InitializeSetting", 0, 0, 0,
-     {"55 48 89 e5 41 57 41 56 | 53 48 83 e4 e0 48 83 ec 60 4c 8b 3d ?? ?? ?? ??"}},
-};
-
-typedef struct {
-    uint64_t rdi, rsi, rdx, rcx, r8, r9, rax;
-    double xmm0, xmm1;
-} HookRegs;
-
-typedef int (ABI *HookHandler)(HookRegs *r);
-
-typedef struct {
-    uint64_t offset;
-    unsigned moved;
-    HookHandler handler;
-    unsigned char *trampoline;
-} HookEntry;
-
-static void hook_theater_begin_init(HookRegs *r);
-static void hook_fixed_trigger_judge(HookRegs *r);
-static void hook_need_update_best_score(HookRegs *r);
-static void hook_title_parts_init(HookRegs *r);
-
-static int ABI wrap_theater_begin_init(HookRegs *r) { hook_theater_begin_init(r); return 1; }
-static int ABI wrap_fixed_trigger_judge(HookRegs *r) { hook_fixed_trigger_judge(r); return 1; }
-static int ABI wrap_need_update_best_score(HookRegs *r) { hook_need_update_best_score(r); return 1; }
-static int ABI wrap_title_parts_init(HookRegs *r) { hook_title_parts_init(r); return 1; }
-
-static HookEntry s_hooks[HOOK_COUNT] = {
-    [H_THEATER_BEGIN_INIT]    = {.handler = wrap_theater_begin_init},
-    [H_FIXED_TRIGGER_JUDGE]   = {.handler = wrap_fixed_trigger_judge},
-    [H_NEED_UPDATE_BEST_SCORE]= {.handler = wrap_need_update_best_score},
-    [H_TITLE_PARTS_INIT]      = {.handler = wrap_title_parts_init},
-};
-
-static void hook_theater_begin_init(HookRegs *r) {
-    void *enumerator = (void *)(uintptr_t)r->rdi;
-    int state_before = -1;
-    if (enumerator && runtime_memory_is_mapped((uintptr_t)enumerator, 0x20)) {
-        state_before = (int)load32((const unsigned char *)enumerator + 0x10);
-        if (state_before == 0) {
-            void *tc = (void *)(uintptr_t)load64((const unsigned char *)enumerator + 0x18);
-            if (tc && runtime_memory_is_mapped((uintptr_t)tc, 0x40)) {
-                void *ps = (void *)(uintptr_t)load64((const unsigned char *)tc + 0x30);
-                if (ps && runtime_memory_is_mapped((uintptr_t)ps, 0x60)) {
-                    uint32_t mid = load32((const unsigned char *)ps + 0x3c);
-                    int diff = (int)load32((const unsigned char *)ps + 0x50);
-                    runtime_judgements_begin_stage(mid, diff);
-                }
-            }
-        }
-    }
-    for (size_t i = 0; i < s_stage_begin_cb_count; ++i)
-        s_stage_begin_cbs[i](enumerator, state_before, true);
-
-    typedef uint64_t (ABI *OrigFn)(uint64_t, uint64_t);
-    r->rax = ((OrigFn)s_hooks[H_THEATER_BEGIN_INIT].trampoline)(r->rdi, r->rsi);
-
-    for (size_t i = 0; i < s_stage_begin_cb_count; ++i)
-        s_stage_begin_cbs[i](enumerator, state_before, false);
-}
-
-static void hook_fixed_trigger_judge(HookRegs *r) {
-    typedef void (ABI *OrigFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
-    ((OrigFn)s_hooks[H_FIXED_TRIGGER_JUDGE].trampoline)(r->rdi, r->rsi, r->rdx, r->rcx, r->r8, r->r9);
-
-    int judge = (int)r->rsi;
-    void *td = (void *)(uintptr_t)r->rdx;
-    int lane = (int)r->rcx;
-    if (judge < 1 || judge > 6 || !td || !runtime_memory_is_mapped((uintptr_t)td, 0x30))
-        return;
-
-    int target_ms = 0;
-    int offset_ms = 0;
-    int is_rainbow = (judge == 1) ? 1 : 0;
-
-    float t_sec = 0.0f;
-    void *data_base = (void *)(uintptr_t)load64((const unsigned char *)td + 0x10);
-    if (data_base && runtime_memory_is_mapped((uintptr_t)data_base, 0x30)) {
-        memcpy(&t_sec, (const unsigned char *)data_base + 0x20, sizeof(float));
-        target_ms = (int)lroundf(t_sec * 1000.0f);
-    }
-    if (judge >= 1 && judge <= 5) {
-        float judge_time = 0.0f;
-        memcpy(&judge_time, (const unsigned char *)td + 0x20, sizeof(float));
-        if (judge_time > 0.0f && t_sec > 0.0f) {
-            offset_ms = (int)lroundf((judge_time - t_sec) * 1000.0f);
-        }
-    }
-    runtime_judgements_record(target_ms, offset_ms, judge, lane, is_rainbow);
-}
-
-static uint32_t read_title_parts_score(void *title_parts) {
-    if (!title_parts || !runtime_memory_is_mapped((uintptr_t)title_parts, 0x58))
-        return 0;
-    void *play_data = (void *)(uintptr_t)load64((const unsigned char *)title_parts + 0x48);
-    if (!play_data || !runtime_memory_is_mapped((uintptr_t)play_data, 0x40))
-        return 0;
-    return load32((const unsigned char *)play_data + 0x30);
-}
-
-static void hook_need_update_best_score(HookRegs *r) {
-    typedef uint64_t (ABI *OrigFn)(uint64_t, uint64_t);
-    uint64_t res = ((OrigFn)s_hooks[H_NEED_UPDATE_BEST_SCORE].trampoline)(r->rdi, r->rsi);
-    r->rax = res;
-
-    void *title_parts = (void *)(uintptr_t)r->rdi;
-    bool is_pb = (res & 1) != 0;
-    uint32_t score = read_title_parts_score(title_parts);
-    runtime_judgements_finish_stage(score, is_pb);
-
-    for (size_t i = 0; i < s_score_pb_cb_count; ++i)
-        s_score_pb_cbs[i](title_parts, is_pb);
-}
-
-static void hook_title_parts_init(HookRegs *r) {
-    void *title_parts = (void *)(uintptr_t)r->rdi;
-    typedef void (ABI *OrigFn)(uint64_t, uint64_t, uint64_t);
-    ((OrigFn)s_hooks[H_TITLE_PARTS_INIT].trampoline)(r->rdi, r->rsi, r->rdx);
-
-    uint32_t score = read_title_parts_score(title_parts);
-    runtime_judgements_ensure_stage_finished(score);
-
-    for (size_t i = 0; i < s_title_init_cb_count; ++i)
-        s_title_init_cbs[i](title_parts);
-}
-
-static size_t write_stub(unsigned char *out, const unsigned char *replaced, unsigned moved,
-                         uintptr_t resume, HookHandler handler, unsigned char **trampoline) {
-    static const unsigned char body[] = {
-        0x55, 0x48, 0x89, 0xe5, 0x48, 0x83, 0xec, 0x50,
-        0x48, 0x89, 0x7d, 0xb0, 0x48, 0x89, 0x75, 0xb8,
-        0x48, 0x89, 0x55, 0xc0, 0x48, 0x89, 0x4d, 0xc8,
-        0x4c, 0x89, 0x45, 0xd0, 0x4c, 0x89, 0x4d, 0xd8,
-        0xc5, 0xfb, 0x11, 0x45, 0xe8, 0xc5, 0xfb, 0x11, 0x4d, 0xf0,
-        0x48, 0x8d, 0x7d, 0xb0,
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
-        0xff, 0xd0,
-        0x85, 0xc0,
-        0x48, 0x8b, 0x7d, 0xb0, 0x48, 0x8b, 0x75, 0xb8,
-        0x48, 0x8b, 0x55, 0xc0, 0x48, 0x8b, 0x4d, 0xc8,
-        0x4c, 0x8b, 0x45, 0xd0, 0x4c, 0x8b, 0x4d, 0xd8,
-        0x48, 0x8b, 0x45, 0xe0,
-        0xc5, 0xfb, 0x10, 0x45, 0xe8, 0xc5, 0xfb, 0x10, 0x4d, 0xf0,
-        0x48, 0x89, 0xec, 0x5d,
-        0x74, 0x01, 0xc3,
-    };
-    memcpy(out, body, sizeof(body));
-    uintptr_t fn = (uintptr_t)handler;
-    memcpy(out + 48, &fn, 8);
-    size_t n = sizeof(body);
-    *trampoline = out + n;
-    memcpy(out + n, replaced, moved);
-    n += moved;
-    out[n] = 0x48; out[n + 1] = 0xb8;
-    memcpy(out + n + 2, &resume, 8);
-    out[n + 10] = 0xff; out[n + 11] = 0xe0;
-    return (n + 12 + 15) & ~(size_t)15;
-}
-
-static int patch_jump(unsigned char *site, unsigned moved, const unsigned char *stub) {
-    int64_t rel = (int64_t)(stub - (site + 5));
-    if (rel < INT32_MIN || rel > INT32_MAX) return -1;
-    int32_t disp = (int32_t)rel;
-    site[0] = 0xe9;
-    memcpy(site + 1, &disp, 4);
-    for (unsigned i = 5; i < moved; ++i) site[i] = 0x90;
-    return 0;
-}
-
-int runtime_judgements_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size) {
-    GameCode found[HOOK_COUNT];
-    if (runtime_game_code_find(s_sites, HOOK_COUNT, found, "Judgements")) return -1;
-    unsigned char *module = image + module_base;
-    size_t used = 0;
-    for (size_t i = 0; i < HOOK_COUNT; ++i) {
-        s_hooks[i].offset = found[i].offset;
-        s_hooks[i].moved = found[i].moved;
-        unsigned char *site = module + s_hooks[i].offset;
-        if (used + 144 > size) return -1;
-        unsigned char *stub = stubs + used;
-        used += write_stub(stub, site, s_hooks[i].moved, (uintptr_t)(site + s_hooks[i].moved),
-                           s_hooks[i].handler, &s_hooks[i].trampoline);
-        if (patch_jump(site, s_hooks[i].moved, stub)) return -1;
-    }
-    printf("Judgements: %zu hooks installed (%zu stub bytes)\n", (size_t)HOOK_COUNT, used);
-    return 0;
 }

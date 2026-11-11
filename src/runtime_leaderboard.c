@@ -217,17 +217,14 @@ static void *lb_async_fetch_thread(void *arg) {
         }
         WinHttpCloseHandle(hSession);
     }
-#else
-    (void)music_id;
-    (void)difficulty;
-    (void)style_str;
 #endif
     return NULL;
 }
 
 void runtime_leaderboard_fetch(uint32_t music_id, int difficulty, const char *style) {
     const char *st = (style && *style) ? style : "standard";
-    if (music_id >= 169000000 && music_id < 170000000) {
+    extern bool runtime_custom_charts_is_custom_id(uint32_t id);
+    if (runtime_custom_charts_is_custom_id(music_id)) {
         pthread_mutex_lock(&s_lb_lock);
         s_last_music_id = music_id;
         s_last_difficulty = difficulty;
