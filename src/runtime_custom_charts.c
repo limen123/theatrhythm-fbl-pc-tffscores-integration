@@ -4222,14 +4222,40 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
             {"TMPro.TextMeshProUGUI", "TextMeshProUGUI"},
             {"UnityEngine.UI.Text", "Text"}
         };
+        static void *s_cx_str = NULL;
+        if (!s_cx_str) s_cx_str = make_pinned_string("CX", NULL);
+        void *gstr = s_cx_str ? s_cx_str : make_string(NULL, "CX");
+
         for (int i = 0; i < 4; ++i) {
             void *txt = cda_get_comp(go, text_types[i].full_name, text_types[i].short_name);
             if (uobj_alive(txt)) {
                 SetEnabledFn set_enabled = (SetEnabledFn)GUEST(0x1dc8780);
-                set_enabled(txt, false, NULL);
+                set_enabled(txt, true, NULL);
                 SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
                 void *txt_go = comp_get_go(txt, NULL);
-                if (uobj_alive(txt_go)) set_active(txt_go, false, NULL);
+                if (uobj_alive(txt_go)) set_active(txt_go, true, NULL);
+
+                void *klass = object_class(txt);
+                const char *kname = klass ? *(const char **)((char *)klass + 0x10) : "";
+                if (kname && (strcmp(kname, "LocalizedTMProUGUI") == 0 || strstr(kname, "Localized"))) {
+                    /* LocalizedTMProUGUI._termId is at +0x798 */
+                    put64((char *)txt + 0x798, 0);
+                    /* LocalizedInfo is at +0x7a0 */
+                    void *info = (void *)load64((char *)txt + 0x7a0);
+                    if (info && (uintptr_t)info > 0x10000ULL) {
+                        /* Policy = 3 (AsIs / do not localize) */
+                        put32((char *)info + 0x10, 3);
+                        /* Term = NULL */
+                        put64((char *)info + 0x18, 0);
+                    }
+                    /* Also clear LocalizedText._termId at +0x110 */
+                    put64((char *)txt + 0x110, 0);
+                }
+                if (i == 0 || i == 2 || (kname && strstr(kname, "TMPro"))) {
+                    put64((char *)txt + 0xd0, (uint64_t)gstr);
+                    typedef void (ABI *TmpSetTextFn)(void *self, void *str, void *method);
+                    ((TmpSetTextFn)GUEST(0x259D340))(txt, gstr, NULL);
+                }
             }
         }
     }
@@ -6386,11 +6412,14 @@ static void cda_expand_title_color_info(void *owner) {
         int s = extra_slots[k];
         void *info = (void *)load64((char *)arr + 0x20 + (size_t)s * sizeof(void *));
         if (!info) continue;
-        void *custom_icon = unity_native_alive(spr1) ? cda_blue_variant(spr1, s) : NULL;
-        if (!unity_native_alive(custom_icon) || custom_icon == spr1) {
-            custom_icon = cda_artwork_sprite(s == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
+        void *custom_plate = cda_plate_sprite(s);
+        if (!custom_plate && unity_native_alive(spr1)) {
+            custom_plate = cda_blue_variant(spr1, s);
         }
-        if (custom_icon) put64((char *)info + 0x10, (uint64_t)custom_icon);
+        if (!custom_plate) {
+            custom_plate = cda_artwork_sprite(s == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
+        }
+        if (custom_plate) put64((char *)info + 0x10, (uint64_t)custom_plate);
         UGuiVec4 outline = cda_outline_vec4(s);
         UGuiVec4 shadow = cda_shadow_vec4(s);
         memcpy((char *)info + 0x18, &outline, sizeof(UGuiVec4));
@@ -6440,8 +6469,10 @@ static ABI int hook_music_title_display_setup(HookRegs *r) {
         cda_register_icon_target((void *)load64((char *)self + 0x48), slot);
         cda_apply_ms_mark((void *)load64((char *)self + 0x70), find_song_by_obj(mid) != NULL);
     }
-    if (slot < 0 || slot >= 4) {
+    if (slot < 0 || slot >= MAX_SLOTS) {
         r->rdx = (uint64_t)clamp_extra_slot(slot);
+    } else {
+        r->rdx = (uint64_t)slot;
     }
     return 0;
 }
@@ -6475,16 +6506,17 @@ static ABI int hook_load_title_plate_move_next(HookRegs *r) {
         if (closure) {
             int diff = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : (int)load32((char *)closure + 0x30);
             if (diff == 4 || diff == 5) {
+                SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
                 void *disp = (void *)load64((char *)closure + 0x18);
-                void *img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
+                void *img = disp ? (void *)load64((char *)disp + 0x38) : NULL;
                 if (uobj_alive(img)) {
-                    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
-                    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
-                    void *cur = get_spr(img, NULL);
-                    void *rep = cda_blue_variant(cur, diff);
-                    if (rep && rep != cur) {
-                        set_spr(img, rep, NULL);
-                    }
+                    void *plate_spr = cda_plate_sprite(diff);
+                    if (plate_spr) set_spr(img, plate_spr, NULL);
+                }
+                void *icon_img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
+                if (uobj_alive(icon_img)) {
+                    void *icon_spr = cda_artwork_sprite(diff == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
+                    if (icon_spr) set_spr(icon_img, icon_spr, NULL);
                 }
             }
         }
@@ -6508,7 +6540,7 @@ static ABI int hook_retry_window_on_update(HookRegs *r) {
         cda_expand_title_color_info(self);
         cda_apply_ms_mark((void *)load64((char *)self + 0x20), find_song_by_obj(mid) != NULL);
     }
-    if (slot < 0 || slot >= 4) slot = clamp_extra_slot(slot);
+    if (slot < 0 || slot >= MAX_SLOTS) slot = clamp_extra_slot(slot);
     r->rsi = (uint64_t)slot;
     return 0;
 }
