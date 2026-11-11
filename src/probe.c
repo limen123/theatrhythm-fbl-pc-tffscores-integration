@@ -7,7 +7,9 @@
 #include <inttypes.h>
 #include <SDL3/SDL.h>
 #include "runtime.h"
+#include "runtime_judgements.h"
 #include "runtime_tffscores.h"
+#include "runtime_custom_charts.h"
 #include "cpu_check.h"
 #include "isa_rewrite.h"
 #include "gpu/theatrhythm_gpu.h"
@@ -856,6 +858,7 @@ int main(int argc, char **argv) {
         runtime_game_identify(title_id,version,app0,argv[1]);
         if (dlc_dir && dlc_dir[0]) runtime_content_extra_dir(dlc_dir, title_id[0] ? title_id : NULL);
         runtime_content_init_dlc(app0, user_dir ? user_dir : "user");
+        runtime_custom_charts_configure(app0, user_dir ? user_dir : "user");
     }
     theatrhythm_gpu_register_kernel();
 #ifdef _WIN32
@@ -1039,7 +1042,7 @@ int main(int argc, char **argv) {
 #else
     size_t redzone_area = 0;
 #endif
-    image = allocate(round_page(size) + stub_area + 8 * page_size + redzone_area);
+    image = allocate(round_page(size) + stub_area + 24 * page_size + redzone_area);
     printf("Runtime: guest image at %p (guest offsets are relative to it)\n", (void *)image);
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
@@ -1181,6 +1184,11 @@ int main(int argc, char **argv) {
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_tffscores_install(image, modules[m].base, tff_stub, page_size))
                 protect(tff_stub, page_size, 5);
+        unsigned char *custom_stub = tff_stub + page_size;
+        for (uint64_t m = 0; m < module_count; ++m)
+            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
+                !runtime_custom_charts_install(image, modules[m].base, custom_stub, 16 * page_size))
+                protect(custom_stub, 16 * page_size, 5);
         runtime_game_code_close();
     }
 #ifdef _WIN32
@@ -1201,7 +1209,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     /* Page tracking runs with the GPU only. */
     if (code_before) {
-        unsigned char *trampolines = stubs + stub_area + 8 * page_size;
+        unsigned char *trampolines = stubs + stub_area + 24 * page_size;
         redzone_protect(image, size, trampolines, code_before, segments, ns, modules, module_count, &main_module);
         protect(trampolines, redzone_area, 5);
         free(code_before);
