@@ -4225,47 +4225,11 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
         for (int i = 0; i < 4; ++i) {
             void *txt = cda_get_comp(go, text_types[i].full_name, text_types[i].short_name);
             if (uobj_alive(txt)) {
+                SetEnabledFn set_enabled = (SetEnabledFn)GUEST(0x1dc8780);
+                set_enabled(txt, false, NULL);
                 SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
                 void *txt_go = comp_get_go(txt, NULL);
                 if (uobj_alive(txt_go)) set_active(txt_go, false, NULL);
-                void *klass = object_class(txt);
-                const char *kname = klass ? *(const char **)((char *)klass + 0x10) : "";
-                if (kname && (strcmp(kname, "LocalizedTMProUGUI") == 0 || strstr(kname, "Localized"))) {
-                    /* LocalizedTMProUGUI._termId is at +0x798 */
-                    put64((char *)txt + 0x798, 0);
-                    /* LocalizedInfo is at +0x7a0 */
-                    void *info = (void *)load64((char *)txt + 0x7a0);
-                    if (info) {
-                        /* Policy = 3 (Manual / do not localize) */
-                        put32((char *)info + 0x10, 3);
-                        /* Term = NULL */
-                        put64((char *)info + 0x18, 0);
-                    }
-                    /* Also clear LocalizedText._termId at +0x110 */
-                    put64((char *)txt + 0x110, 0);
-                }
-                void *gstr = make_string(NULL, "CX");
-                if (kname && strstr(kname, "TMPro")) {
-                    put64((char *)txt + 0xd0, (uint64_t)gstr);
-                    typedef void (ABI *TmpSetTextFn)(void *self, void *str, void *method);
-                    ((TmpSetTextFn)GUEST(0x228CB90))(txt, gstr, NULL);
-                }
-                if (i == 0 || i == 2) {
-                    if (klass) {
-                        typedef void (ABI *SetTmpTextVirtFn)(void *self, void *str, void *method);
-                        SetTmpTextVirtFn fn = (SetTmpTextVirtFn)load64((const char *)klass + 0x558);
-                        void *m = (void *)load64((const char *)klass + 0x560);
-                        if (fn && gstr) fn(txt, gstr, m);
-                    }
-                } else {
-                    typedef void (ABI *SetTextVirtFn)(void *self, void *str, void *method);
-                    ((SetTextVirtFn)GUEST(0x25A7100))(txt, gstr, NULL);
-                    if (klass) {
-                        SetTextVirtFn fn = (SetTextVirtFn)load64((const char *)klass + 0x5e8);
-                        void *m = (void *)load64((const char *)klass + 0x5f0);
-                        if (fn && gstr) fn(txt, gstr, m);
-                    }
-                }
             }
         }
     }
