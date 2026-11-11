@@ -4188,13 +4188,15 @@ static void *cda_find_comp_in_children(void *tr, const char *full_name, const ch
     return NULL;
 }
 
+#define CDA_CUSTOM_MARKS_CAP 256
+
 typedef struct {
     void *ms_mark;
     void *custom_mark;
     bool is_custom;
 } CdaCustomMarkEntry;
 
-static CdaCustomMarkEntry s_cda_custom_marks[64];
+static CdaCustomMarkEntry s_cda_custom_marks[CDA_CUSTOM_MARKS_CAP];
 static void *original_set_active_edition_mark = NULL;
 
 static void cda_configure_custom_mark_hierarchy(void *node_tr) {
@@ -4223,6 +4225,9 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
         for (int i = 0; i < 4; ++i) {
             void *txt = cda_get_comp(go, text_types[i].full_name, text_types[i].short_name);
             if (uobj_alive(txt)) {
+                SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+                void *txt_go = comp_get_go(txt, NULL);
+                if (uobj_alive(txt_go)) set_active(txt_go, false, NULL);
                 void *klass = object_class(txt);
                 const char *kname = klass ? *(const char **)((char *)klass + 0x10) : "";
                 if (kname && (strcmp(kname, "LocalizedTMProUGUI") == 0 || strstr(kname, "Localized"))) {
@@ -4275,7 +4280,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
     GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
     void *custom_mark = NULL;
     int entry_idx = -1;
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
         if (s_cda_custom_marks[i].ms_mark == self) {
             if (uobj_alive(s_cda_custom_marks[i].custom_mark)) {
                 custom_mark = s_cda_custom_marks[i].custom_mark;
@@ -4285,7 +4290,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
             break;
         }
     }
-    if (!custom_mark) {
+    if (!custom_mark && is_custom) {
         /* MSMarkBehaviour: +0x20 = _dlcMark, +0x28 = _dxMark */
         void *dlc = (void *)load64((char *)self + 0x20);
         if (!uobj_alive(dlc)) dlc = (void *)load64((char *)self + 0x28);
@@ -4300,7 +4305,7 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
                     (void)gc_pin(custom_mark, false);
                     cda_configure_custom_mark_hierarchy(go_get_tr(custom_mark, NULL));
                     if (entry_idx < 0) {
-                        for (int i = 0; i < 64; ++i) {
+                        for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
                             if (!uobj_alive(s_cda_custom_marks[i].ms_mark)) { entry_idx = i; break; }
                         }
                         if (entry_idx < 0) entry_idx = 0;
@@ -4339,7 +4344,7 @@ static ABI int hook_set_active_edition_mark(HookRegs *r) {
     ((SetEditionFn)original_set_active_edition_mark)(self, edition, method);
 
     if (uobj_alive(self)) {
-        for (size_t i = 0; i < 64; ++i) {
+        for (size_t i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
             if (s_cda_custom_marks[i].ms_mark == self) {
                 cda_apply_ms_mark(self, s_cda_custom_marks[i].is_custom);
                 break;
@@ -6463,12 +6468,15 @@ static ABI int hook_music_title_display_setup(HookRegs *r) {
     void *mid = (void *)r->rsi;
     int slot = (int)r->rdx;
 
+    if (s_gameplay_chart_slot >= 4 && s_gameplay_chart_slot < MAX_SLOTS) {
+        slot = s_gameplay_chart_slot;
+    }
     if (self) {
         cda_expand_title_color_info(self);
         cda_register_icon_target((void *)load64((char *)self + 0x48), slot);
         cda_apply_ms_mark((void *)load64((char *)self + 0x70), find_song_by_obj(mid) != NULL);
     }
-    if (slot < 0 || slot >= MAX_SLOTS) {
+    if (slot < 0 || slot >= 4) {
         r->rdx = (uint64_t)clamp_extra_slot(slot);
     }
     return 0;
@@ -6501,7 +6509,7 @@ static ABI int hook_load_title_plate_move_next(HookRegs *r) {
     if (state == -2) {
         void *closure = (void *)load64((char *)sm + 0x18);
         if (closure) {
-            int diff = (int)load32((char *)closure + 0x30);
+            int diff = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : (int)load32((char *)closure + 0x30);
             if (diff == 4 || diff == 5) {
                 void *disp = (void *)load64((char *)closure + 0x18);
                 void *img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
@@ -6536,7 +6544,7 @@ static ABI int hook_retry_window_on_update(HookRegs *r) {
         cda_expand_title_color_info(self);
         cda_apply_ms_mark((void *)load64((char *)self + 0x20), find_song_by_obj(mid) != NULL);
     }
-    if (slot < 0 || slot >= MAX_SLOTS) slot = clamp_extra_slot(slot);
+    if (slot < 0 || slot >= 4) slot = clamp_extra_slot(slot);
     r->rsi = (uint64_t)slot;
     return 0;
 }
