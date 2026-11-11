@@ -6412,14 +6412,11 @@ static void cda_expand_title_color_info(void *owner) {
         int s = extra_slots[k];
         void *info = (void *)load64((char *)arr + 0x20 + (size_t)s * sizeof(void *));
         if (!info) continue;
-        void *custom_plate = cda_plate_sprite(s);
-        if (!custom_plate && unity_native_alive(spr1)) {
-            custom_plate = cda_blue_variant(spr1, s);
+        void *custom_icon = unity_native_alive(spr1) ? cda_blue_variant(spr1, s) : NULL;
+        if (!unity_native_alive(custom_icon) || custom_icon == spr1) {
+            custom_icon = cda_artwork_sprite(s == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
         }
-        if (!custom_plate) {
-            custom_plate = cda_artwork_sprite(s == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
-        }
-        if (custom_plate) put64((char *)info + 0x10, (uint64_t)custom_plate);
+        if (custom_icon) put64((char *)info + 0x10, (uint64_t)custom_icon);
         UGuiVec4 outline = cda_outline_vec4(s);
         UGuiVec4 shadow = cda_shadow_vec4(s);
         memcpy((char *)info + 0x18, &outline, sizeof(UGuiVec4));
@@ -6506,17 +6503,16 @@ static ABI int hook_load_title_plate_move_next(HookRegs *r) {
         if (closure) {
             int diff = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : (int)load32((char *)closure + 0x30);
             if (diff == 4 || diff == 5) {
-                SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
                 void *disp = (void *)load64((char *)closure + 0x18);
-                void *img = disp ? (void *)load64((char *)disp + 0x38) : NULL;
+                void *img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
                 if (uobj_alive(img)) {
-                    void *plate_spr = cda_plate_sprite(diff);
-                    if (plate_spr) set_spr(img, plate_spr, NULL);
-                }
-                void *icon_img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
-                if (uobj_alive(icon_img)) {
-                    void *icon_spr = cda_artwork_sprite(diff == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
-                    if (icon_spr) set_spr(icon_img, icon_spr, NULL);
+                    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
+                    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
+                    void *cur = get_spr(img, NULL);
+                    void *rep = cda_blue_variant(cur, diff);
+                    if (rep && rep != cur) {
+                        set_spr(img, rep, NULL);
+                    }
                 }
             }
         }
