@@ -2,6 +2,7 @@
 // The system UI the PS4 draws over a game (save list, text entry, trophy and screenshot notices) and
 // the shader-cache notes, drawn with Dear ImGui by the presenter after the game frame.
 #include "theatrhythm_overlay.h"
+extern "C" void runtime_tffscores_trigger_auth_hotkey(void);
 
 #include <algorithm>
 #include <array>
@@ -926,6 +927,10 @@ bool HandleEvent(const SDL_Event& event) {
     }
     if (display_open) {
         return HandleDisplayEvent(event);
+    }
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat && !text_entry_active) {
+        runtime_tffscores_trigger_auth_hotkey();
+        return true;
     }
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat && !text_entry_active) {
         display_row = 0;

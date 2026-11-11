@@ -74,9 +74,17 @@ static struct { int used; int32_t user; uint64_t blocks; char host[700], meta[70
 static struct { char path[720], dir[700]; uint64_t size; } memories[SLOTS]; /* SaveDataMemory slots */
 static size_t mounts_done, memory_writes, backups_done;
 static char g_last_active_save_host[700];
+static int (*cloud_pre_mount)(const char *save_host, const char *title_id);
+static void (*cloud_post_commit)(const char *save_host);
 
 void runtime_savedata_configure(const char *title) {
     if (title && *title) snprintf(title_id,sizeof(title_id),"%s",title);
+}
+
+void runtime_savedata_set_cloud_hooks(int (*pre_mount)(const char *save_host, const char *title_id),
+                                      void (*post_commit)(const char *save_host)) {
+    cloud_pre_mount = pre_mount;
+    cloud_post_commit = post_commit;
 }
 
 const char *runtime_savedata_title_id(void) {
@@ -206,6 +214,7 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     if (slot<0) { pthread_mutex_unlock(&lock); return ERR_MOUNT_FULL; }
     if (!exists && (make_dirs(host) || make_dirs(meta))) { pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
     if (!exists) { Param empty={0}; write_param(meta,&empty); }
+    if (cloud_pre_mount) cloud_pre_mount(host, title ? title : title_id);
     slots[slot].used=1;
     slots[slot].blocks=blocks ? blocks : DEFAULT_BLOCKS;
     slots[slot].user=user;
@@ -241,8 +250,10 @@ static ABI int32_t save_umount(const MountPoint *point) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     pthread_mutex_lock(&lock);
     int slot=slot_of(point);
-    if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
+    char host[700]="";
+    if (slot>=0) { snprintf(host,sizeof(host),"%s",slots[slot].host); runtime_file_unmount(point->data); slots[slot].used=0; }
     pthread_mutex_unlock(&lock);
+    if (slot>=0 && host[0] && cloud_post_commit) cloud_post_commit(host);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
@@ -621,6 +632,7 @@ static ABI int32_t save_umount_backup(const MountPoint *point) {
     int32_t r=make_backup(host,meta,backup);
     const char *dir=strrchr(host,'/');
     if (!r) push_event(1,user,NULL,dir ? dir+1 : host);
+    if (cloud_post_commit) cloud_post_commit(host);
     return r;
 }
 /* sceSaveDataSyncSaveDataMemory(sync): writes reach the file at once; only the event remains. */

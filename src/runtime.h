@@ -146,6 +146,7 @@ void runtime_module_report(void);
 /* Starts a linked module by file name ("libSceNpToolkit2.prx") unless it already runs: its
  * handle (>0) and, for a new start, the start routine's result; or a negative SCE error. */
 int32_t runtime_module_start(const char *file, uint64_t args, const void *argp, int32_t *result);
+void *runtime_module_export(const char *file, const char *name);
 void runtime_set_module_tls(uint64_t module, const void *data, uint64_t filesz, uint64_t memsz);
 void runtime_set_procparam(void *param);
 void **runtime_application_heap_api(void);
@@ -227,12 +228,15 @@ uintptr_t runtime_audio_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
+void runtime_pad_set_confirm_hook(void (*hook)(void));
 /* probe --gamepad: prints one "Gamepad:" line for the first pad found (returns 1) or none (0). */
 int runtime_pad_describe(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 const char *runtime_savedata_title_id(void);
 void runtime_savedata_configure(const char *title);
+void runtime_savedata_set_cloud_hooks(int (*pre_mount)(const char *save_host, const char *title_id),
+                                      void (*post_commit)(const char *save_host));
 int runtime_savedata_get_active_save_dir(char *out, size_t size);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);

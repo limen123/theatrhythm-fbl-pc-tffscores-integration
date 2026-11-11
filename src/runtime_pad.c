@@ -582,6 +582,11 @@ static ABI int32_t pad_close(int32_t handle) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     opened=0; return 0;
 }
+static void (*pad_confirm_hook)(void);
+void runtime_pad_set_confirm_hook(void (*hook)(void)) {
+    __atomic_store_n(&pad_confirm_hook, hook, __ATOMIC_RELEASE);
+}
+
 static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!data) return ERR_INVALID_ARG;
@@ -590,6 +595,10 @@ static ABI int32_t pad_read_state(int32_t handle, PadData *data) {
     sample(data); ++reads;
     note_call(SLOW_READ,start);
     pthread_mutex_unlock(&lock);
+    if (data->buttons & (BTN_CROSS | BTN_CIRCLE)) {
+        void (*hook)(void) = __atomic_load_n(&pad_confirm_hook, __ATOMIC_ACQUIRE);
+        if (hook) hook();
+    }
     return 0;
 }
 /* Buffered read: the port samples once per call, so one entry is returned. */

@@ -125,7 +125,7 @@ target_compile_definitions(theatrhythm_gpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYP
     THEATRHYTHM_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
 set_source_files_properties(shim/theatrhythm_overlay.cpp PROPERTIES
     OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf")
-target_include_directories(theatrhythm_gpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/half/include)
+target_include_directories(theatrhythm_gpu PRIVATE shim shadps4 ../src ${SHADER_INCLUDE} third_party/half/include)
 target_compile_definitions(theatrhythm_gpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(theatrhythm_gpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 target_link_libraries(theatrhythm_gpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
@@ -169,7 +169,7 @@ target_link_libraries(theatrhythm-fbl PRIVATE theatrhythm_gpu atrac9 -pthread)
 if (WIN32)
     enable_language(RC)
     target_sources(theatrhythm-fbl PRIVATE ../packaging/windows/theatrhythm-fbl.rc)
-    target_link_libraries(theatrhythm-fbl PRIVATE onecore bcrypt ws2_32)
+    target_link_libraries(theatrhythm-fbl PRIVATE onecore bcrypt ws2_32 winhttp)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(theatrhythm-fbl PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")

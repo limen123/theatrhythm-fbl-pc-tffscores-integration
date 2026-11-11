@@ -128,6 +128,18 @@ int32_t runtime_module_start(const char *file, uint64_t args, const void *argp, 
     if (result) *result=r;
     return (int32_t)i+1;
 }
+void *runtime_module_export(const char *file, const char *name) {
+    if (!image || !file || !name) return NULL;
+    int64_t idx=find(file);
+    if (idx<0) return NULL;
+    char nid[12];
+    if (name_to_nid(name,nid)) {
+        const RuntimeModule *m=&modules[idx];
+        for (uint64_t i=0;i<m->export_count;++i)
+            if (!strcmp(m->exports[i].nid,nid)) return image+m->exports[i].address;
+    }
+    return NULL;
+}
 /* sceKernelLoadStartModule(path, args, argp, flags, option, result): the module's handle, or
  * ENOENT when the dump has no module of that file name. A module that already runs returns its
  * handle without starting again and leaves *result untouched. */

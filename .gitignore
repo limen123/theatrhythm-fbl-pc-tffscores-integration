@@ -15,4 +15,5 @@ Save/
 save/
 *.inf
 *.dat
+*tffscores.json
 scratch/
