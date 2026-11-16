@@ -15,14 +15,13 @@ dump of your own copy of the game (PS4, version 1.00 or 1.04).
 
 ## Features
 
-- **TFFScores integration:** press **F9** (or use the **F10** overlay) to link your `tffscores.com` account,
-  upload Personal Best proofs automatically, back up/restore cloud saves, and view live leaderboards on Results Page 3.
-- **Custom charts & 6-difficulty support:** drop song folders exported from **DupliConverter** (available as a separate download on the releases page) into `CustomCharts/` next to the game or in your save folder, with full Beginner/Chaos slots and custom record persistence.
+- **TFFScores integration:** press **F9** to link your `tffscores.com` account,
+  upload Personal Best proofs automatically, back up/restore cloud saves, and view live leaderboards as well as live judgement graphs on Results Page 3.
+- **Custom charts & 6-difficulty support:** drop song folders exported from **DupliConverter** (available as a separate download on the releases page) into `CustomCharts/` next to the game or in your save folder, with full Beginner/Chaos slots and custom record persistence. Upload custom charts to TFFScores first to enable leaderboard tracking and verified scores.
 - **SlideHold & custom Note Skins:** native-styled directional SlideHold notes plus live hue/saturation customization in `settings.ini` and the F10 overlay.
 - **PC display & frame pacing settings:** windowed, borderless or fullscreen at your desktop's resolution, with improved frame pacing and background controller support.
-- **Keyboard and controller:** PlayStation, Xbox, Switch-layout (Xbox-derived), and keyboard button prompts with Live Info pad art, plus an in-game Controller Settings menu and confirm/cancel layout swap.
+- **Keyboard and controller:** PlayStation, Xbox, Switch-layout, and keyboard button prompts with Live Info pad art, plus an in-game Controller Settings menu and confirm/cancel layout swap.
 - **Easy setup:** point the installer at your dump, and it can add a desktop shortcut.
-- **DLC maker:** [dlcmaker](tools/dlcmaker/README.md) can also pack custom songs as PS4-style add-on folders inside your save's `addcont` directory.
 
 ## Supported languages
 
