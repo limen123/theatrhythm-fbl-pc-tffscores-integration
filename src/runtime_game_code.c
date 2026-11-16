@@ -80,6 +80,7 @@ void runtime_game_code_open(unsigned char *base, uint64_t size, uint64_t text_si
     module=base; module_size=size; code_size=text_size && text_size<=size ? text_size : size; app0_dir=app0;
 }
 void runtime_game_code_close(void) {
+    if (module) runtime_summonstone_install(module);
     free(meta); meta=NULL; meta_size=0; meta_tried=0; cgm_count=0;
 }
 

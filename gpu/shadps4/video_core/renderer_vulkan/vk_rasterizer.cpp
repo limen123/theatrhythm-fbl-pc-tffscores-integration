@@ -3364,26 +3364,34 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
 }
 
 bool Rasterizer::DrawsFreshTarget() {
-    constexpr u64 RecentFrames = 4;   // unused for longer: the next use starts fresh again
+    constexpr u64 RecentFrames = 4;   // unused for longer (and outside RecentWindowNs): fresh
+    constexpr u64 RecentWindowNs = 500'000'000ULL;
     constexpr u64 ForgetFrames = 600; // entries pruned once unused this long
+    constexpr u64 ForgetWindowNs = 10'000'000'000ULL;
     constexpr size_t PruneAbove = 64;
     const auto& regs = Regs();
     const u64 frame = TheatrhythmStats::gpu_frames.load(std::memory_order_relaxed);
+    const u64 now_ns = SteadyClockNowNs();
     bool fresh = false;
     // Every draw in the first frame of a target's (re)use is fresh, not only the first one.
     const auto note = [&](VAddr address, u32 extent) {
+        if (FrameCapture::IsDisplayBuffer(address)) {
+            return;
+        }
         for (auto& target : recent_targets) {
             if (target.address == address && target.extent == extent) {
-                if (frame - target.frame > RecentFrames) {
+                if (!IsTargetStillRecent(frame, target.frame, now_ns, target.time_ns, RecentFrames,
+                                         RecentWindowNs)) {
                     target.since = frame;
                 }
                 target.frame = frame;
+                target.time_ns = now_ns;
                 fresh |= target.since == frame;
                 return;
             }
         }
         fresh = true;
-        recent_targets.push_back({address, extent, frame, frame});
+        recent_targets.push_back({address, extent, frame, frame, now_ns});
     };
     bool has_color = false;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
@@ -3397,8 +3405,9 @@ bool Rasterizer::DrawsFreshTarget() {
     }
     if (recent_targets.size() > PruneAbove && frame != recent_targets_pruned) {
         recent_targets_pruned = frame;
-        std::erase_if(recent_targets, [frame](const RecentTarget& target) {
-            return frame - target.frame > ForgetFrames;
+        std::erase_if(recent_targets, [frame, now_ns](const RecentTarget& target) {
+            return ShouldForgetRecentTarget(frame, target.frame, now_ns, target.time_ns,
+                                            ForgetFrames, ForgetWindowNs);
         });
     }
     return fresh;

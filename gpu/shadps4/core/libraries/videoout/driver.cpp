@@ -13,6 +13,7 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <mmsystem.h>
 #endif
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -29,6 +30,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
+#include "core/libraries/videoout/frame_pacing.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -97,6 +99,7 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
             return; // a redraw of the last frame is pointless while frames are queued
         }
         swap_queue.push_back(std::move(work));
+        swap_queue_depth.store(swap_queue.size(), std::memory_order_release);
     }
     swap_cv.notify_one();
 }
@@ -111,11 +114,20 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
             if (!swap_cv.wait(lock, token, [this] { return !swap_queue.empty(); })) {
                 return;
             }
+            swap_in_flight.store(true, std::memory_order_release);
             work = std::move(swap_queue.front());
             swap_queue.pop_front();
+            swap_queue_depth.store(swap_queue.size(), std::memory_order_release);
             swap_busy = true;
         }
         work();
+        swap_in_flight.store(false, std::memory_order_release);
+        if (swap_queue_depth.load(std::memory_order_acquire) == 0) {
+            {
+                std::scoped_lock lk{mutex};
+            }
+            request_cv.notify_one();
+        }
     }
 }
 
@@ -335,8 +347,19 @@ void VideoOutDriver::Flip(const Request& req) {
         static const bool refresh_stamps = [] {
             std::thread([] {
                 Common::SetCurrentThreadName("theatrhythm:RefreshStamps");
-                while (TheatrhythmWaitForVblank()) {
-                    refresh_ns = Clock::now().time_since_epoch().count();
+                for (;;) {
+                    const auto before = Clock::now();
+                    if (!TheatrhythmWaitForVblank()) {
+                        break;
+                    }
+                    const auto after = Clock::now();
+                    if (after - before < std::chrono::milliseconds(1)) {
+                        // Display asleep or virtual: DXGI WaitForVBlank returns immediately; avoid spinning.
+                        refresh_ns = 0;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                        continue;
+                    }
+                    refresh_ns = after.time_since_epoch().count();
                 }
             }).detach();
             return true;
@@ -570,6 +593,31 @@ void VideoOutDriver::Flip(const Request& req) {
                             clock, median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
                             sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
             }
+            std::printf(
+                "Present breakdown (%.2fs): calls=%llu, draw_last=%llu, ready=%.1f%%, acquire=%.1f%%, "
+                "prepare=%.1f%%, flush=%.1f%%, mutex=%.1f%%, khr=%.1f%%, fences=%.1f%%, free=%.1f%% | "
+                "sched: mutex=%.1f%%, submit_prep=%.1f%%, wait_copies=%.1f%%, vk_submit=%.1f%%, "
+                "deferred_sig=%.1f%%, host_copy_only=%.1f%% | cycles(M): sem=%.1f fence=%.1f acq=%.1f\n",
+                window,
+                static_cast<unsigned long long>(TheatrhythmStats::present_calls.exchange(0)),
+                static_cast<unsigned long long>(TheatrhythmStats::draw_last_frame_calls.exchange(0)),
+                TheatrhythmStats::present_ready_wait_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_acquire_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_prepare_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_flush_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_mutex_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_khr_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_wait_fences_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::present_free_wait_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::sched_submit_mutex_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::sched_on_submit_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::sched_wait_host_copies_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::sched_vk_submit_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::wait_deferred_signals_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::wait_host_copies_only_ns.exchange(0) / (window * 1e7),
+                TheatrhythmStats::sem_wait_cycles.exchange(0) / 1e6,
+                TheatrhythmStats::fence_wait_cycles.exchange(0) / 1e6,
+                TheatrhythmStats::acquire_cycles.exchange(0) / 1e6);
             // Flip phase from the start of a refresh, wrapped to half a refresh either side: a
             // spread or a drift between windows means flips cross refreshes (judder at VSync).
             if (phases.size() > 2) {
@@ -633,6 +681,9 @@ void VideoOutDriver::DrawBlankFrame() {
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::draw_last_frame_calls.fetch_add(1, std::memory_order_relaxed);
+    }
     RunPresenter([this] {
         const auto frame = presenter->PrepareLastFrame();
         if (frame != nullptr) {
@@ -693,47 +744,56 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period = EmulatorSettings.GetVblankPeriod();
+    const double vblank_hz = static_cast<double>(EmulatorSettings.GetVblankFrequency());
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
 
+#ifdef _WIN32
+    struct ScopedTimerPeriod {
+        explicit ScopedTimerPeriod(UINT ms)
+            : period(ms), active(::timeBeginPeriod(ms) == TIMERR_NOERROR) {}
+        ~ScopedTimerPeriod() {
+            if (active) {
+                ::timeEndPeriod(period);
+            }
+        }
+        UINT period;
+        bool active;
+    } scoped_timer_period{1};
+#endif
+
     Common::AccurateTimer timer{vblank_period};
 
-    // theatrhythm: frame limit (see EmulatorSettings::GetFrameLimit). A request waits in the queue
-    // until its slot; slots advance by one period (no drift) but never lag behind by more.
-    // theatrhythm: TheatrhythmSettings::fps_limit (0: one flip per vblank; FpsUnlimited: each flip as
-    // it comes, between vblanks, with no slot); THEATRHYTHM_FPS_LIMIT (measurements) is used as given.
-    constexpr u32 unlimited = std::numeric_limits<u32>::max();
     const bool measured_limit = std::getenv("THEATRHYTHM_FPS_LIMIT") != nullptr;
-    const int vblank_hz = int(EmulatorSettings.GetVblankFrequency());
-    // theatrhythm: fps_limit 0 on a display faster than the vblank (120 Hz against the default 60)
-    // is a limit at the display's rate, so "Off" follows the display instead of the 60 Hz vblank
-    // (issue #9); GetFramePeriod snaps it to the exact rate. The vblank the game sees stays at
-    // its rate. A display at the vblank rate or slower keeps one flip per vblank.
-    const double display_hz = TheatrhythmWindowRefreshRate();
-    const u32 display_limit = display_hz > vblank_hz + 0.5 ? u32(std::lround(display_hz)) : 0;
-    const auto current_limit = [&] {
-        if (measured_limit) {
-            return EmulatorSettings.GetFrameLimit();
+    const u32 env_limit = measured_limit ? EmulatorSettings.GetFrameLimit() : 0u;
+    const bool allow_vblank_lock =
+        !EmulatorSettingsImpl::Flag("THEATRHYTHM_VBLANK_TIMER", false) &&
+        std::getenv("THEATRHYTHM_VBLANK_HZ") == nullptr;
+
+    double display_hz = TheatrhythmWindowRefreshRate();
+    int last_setting_fps = TheatrhythmSettings::Get().fps_limit.load(std::memory_order_relaxed);
+    bool last_vsync = TheatrhythmSettings::Get().vsync.load(std::memory_order_relaxed);
+    PacingDecision pacing = ComputePacingDecision(last_setting_fps, last_vsync, display_hz,
+                                                  vblank_hz, measured_limit, env_limit,
+                                                  allow_vblank_lock);
+
+    const auto log_pacing = [&](const PacingDecision& p, int setting_fps, bool vsync, double hz) {
+        if (!p.immediate_flips) {
+            std::printf("VideoOut: vblank %.3f Hz, locked to vblank%s (display %.3f Hz)\n",
+                        1e9 / vblank_period.count(),
+                        p.follow_display && vsync ? "/display" : "", hz);
+        } else if (p.frame_period.count() == 0) {
+            std::printf("VideoOut: vblank %.3f Hz, %s (display %.3f Hz, vsync %s)\n",
+                        1e9 / vblank_period.count(),
+                        setting_fps < 0 ? "uncapped" : "VSync-paced display rate", hz,
+                        vsync ? "on" : "off");
+        } else {
+            std::printf("VideoOut: vblank %.3f Hz, frame limit %.3f FPS (display %.3f Hz)\n",
+                        1e9 / vblank_period.count(), 1e9 / p.frame_period.count(), hz);
         }
-        const int limit = TheatrhythmSettings::Get().fps_limit.load();
-        if (limit == 0) {
-            return display_limit;
-        }
-        return limit == TheatrhythmGraphics::FpsUnlimited ? unlimited : u32(limit);
     };
-    const auto period_of = [&](u32 limit) {
-        return limit == unlimited ? std::chrono::nanoseconds(0) : EmulatorSettings.GetFramePeriod(limit);
-    };
-    u32 frame_limit = current_limit();
-    auto frame_period = period_of(frame_limit);
-    auto next_flip = std::chrono::steady_clock::now();
-    if (frame_limit == unlimited) {
-        std::printf("VideoOut: vblank %.3f Hz, no frame limit\n", 1e9 / vblank_period.count());
-    } else {
-        std::printf("VideoOut: vblank %.3f Hz, frame limit %.3f FPS\n", 1e9 / vblank_period.count(),
-                    frame_limit ? 1e9 / frame_period.count() : 0.0);
-    }
+    log_pacing(pacing, last_setting_fps, last_vsync, display_hz);
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -744,77 +804,90 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         return {};
     };
+    const auto can_submit_swap = [this] {
+        return !separate_swap || (!swap_in_flight.load(std::memory_order_acquire) &&
+                                  swap_queue_depth.load(std::memory_order_acquire) == 0);
+    };
 
-    // theatrhythm: with a frame limit (uncapped presets) a queued flip is presented as soon as it
-    // arrives and its slot allows, between vblanks, instead of on the next vblank tick.
-    bool immediate_flips = frame_limit != 0;
-
-    // theatrhythm: with VSync on and one flip per vblank, a tick starts with the display's own
-    // refresh (TheatrhythmWaitForVblank) instead of the timer at its nominal rate: the timer's
-    // flips drifted ~0.04 ms/s against the real refresh (crossing it every few minutes) with a
-    // 0.5 ms spread, so the guest's frame times wavered; locked, the spread is 0.04 ms and the
-    // phase stays within 0.1 ms of the refresh. A display at another rate than the vblank, or
-    // a wait that fails or returns at once (minimized), keeps the timer. THEATRHYTHM_VBLANK_TIMER=1
-    // always uses it (measurements).
-    const bool follow_display = !EmulatorSettingsImpl::Flag("THEATRHYTHM_VBLANK_TIMER", false) &&
-                                std::getenv("THEATRHYTHM_VBLANK_HZ") == nullptr &&
-                                std::abs(TheatrhythmWindowRefreshRate() - vblank_hz) < 0.5;
-    bool on_display = false;
+    auto next_flip = std::chrono::steady_clock::now();
     auto last_tick = std::chrono::steady_clock::now();
+    auto next_vblank = last_tick;
+    bool on_display = false;
 
     while (!token.stop_requested()) {
-        if (const u32 limit = current_limit(); limit != frame_limit) {
-            frame_limit = limit;
-            frame_period = period_of(limit);
-            immediate_flips = limit != 0;
+        const int setting_fps =
+            TheatrhythmSettings::Get().fps_limit.load(std::memory_order_relaxed);
+        const bool vsync = TheatrhythmSettings::Get().vsync.load(std::memory_order_relaxed);
+        display_hz = TheatrhythmWindowRefreshRate();
+        const PacingDecision next_pacing =
+            ComputePacingDecision(setting_fps, vsync, display_hz, vblank_hz, measured_limit,
+                                  env_limit, allow_vblank_lock);
+        if (next_pacing != pacing || setting_fps != last_setting_fps || vsync != last_vsync) {
+            pacing = next_pacing;
+            last_setting_fps = setting_fps;
+            last_vsync = vsync;
             next_flip = std::chrono::steady_clock::now();
-            if (limit == unlimited) {
-                std::printf("VideoOut: no frame limit\n");
-            } else {
-                std::printf("VideoOut: frame limit %u FPS\n", limit);
+            timer = Common::AccurateTimer{vblank_period};
+            log_pacing(pacing, setting_fps, vsync, display_hz);
+        }
+
+        const bool run_immediate = pacing.immediate_flips && main_port.flip_rate == 0;
+        bool display_tick = false;
+        if (!run_immediate) {
+            display_tick = pacing.follow_display && vsync && TheatrhythmWaitForVblank();
+            if (display_tick && std::chrono::steady_clock::now() - last_tick < vblank_period / 2) {
+                display_tick = false; // no refresh to wait for: the timer keeps the rate
             }
-        }
-        bool display_tick = follow_display && !frame_limit && TheatrhythmSettings::Get().vsync &&
-                            TheatrhythmWaitForVblank();
-        if (display_tick && std::chrono::steady_clock::now() - last_tick < vblank_period / 2) {
-            display_tick = false; // no refresh to wait for: the timer keeps the rate
-        }
-        if (!display_tick) {
+            if (!display_tick) {
+                if (on_display) {
+                    timer = Common::AccurateTimer{vblank_period};
+                }
+                timer.Start();
+            }
+            on_display = display_tick;
+            const auto now = std::chrono::steady_clock::now();
+            last_tick = now;
+            next_vblank = now + vblank_period;
+        } else {
             if (on_display) {
+                on_display = false;
                 timer = Common::AccurateTimer{vblank_period};
             }
-            timer.Start();
+            const auto now = std::chrono::steady_clock::now();
+            last_tick = now;
+            next_vblank = AdvanceVblankDeadline(next_vblank, vblank_period, now);
         }
-        on_display = display_tick;
-        last_tick = std::chrono::steady_clock::now();
-        const auto tick_deadline = last_tick + vblank_period;
+        const auto tick_deadline = next_vblank;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
-            timer.End();
+            if (!run_immediate) {
+                timer.End();
+            } else {
+                Common::AccurateWaitUntil(tick_deadline);
+            }
             continue;
         }
 
-        // Check if it's time to take a request.
+        // Check if it's time to take a request at this vblank boundary.
         auto& vblank_status = main_port.vblank_status;
         const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !frame_limit || now >= next_flip;
-        if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_slot = pacing.frame_period.count() == 0 || now >= next_flip;
+        if (flip_slot && can_submit_swap() && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
-            if (request && frame_limit) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
-            }
-            if (!request) {
-                if (display_tick || timer.GetTotalWait().count() < 0) { // Dont draw too fast
-                    if (!main_port.is_open) {
-                        DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
-                        DrawLastFrame();
-                    }
+            if (request) {
+                if (pacing.frame_period.count() > 0) {
+                    next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period, now);
                 }
-            } else {
                 Flip(request);
                 FRAME_END;
+            } else if (!main_port.is_open &&
+                       (run_immediate || display_tick || timer.GetTotalWait().count() < 0)) {
+                DrawBlankFrame();
+            } else if (main_port.is_open && !run_immediate &&
+                       (display_tick || timer.GetTotalWait().count() < 0) &&
+                       ImGui::Core::MustKeepDrawing()) {
+                DrawLastFrame();
             }
         }
 
@@ -842,33 +915,51 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        if (!immediate_flips || main_port.flip_rate != 0) {
+        if (!run_immediate) {
             timer.End();
             continue;
         }
         while (!token.stop_requested()) {
+            Request request{};
             {
                 std::unique_lock lk{mutex};
-                if (!request_cv.wait_until(lk, tick_deadline,
-                                           [&] { return !requests.empty(); })) {
+                if (!request_cv.wait_until(lk, tick_deadline, [&] {
+                        return token.stop_requested() || (!requests.empty() && can_submit_swap());
+                    })) {
                     break; // next vblank
                 }
-            }
-            if (std::chrono::steady_clock::now() < next_flip) {
-                if (next_flip >= tick_deadline) {
+                if (token.stop_requested()) {
                     break;
                 }
-                std::this_thread::sleep_until(next_flip);
+                if (pacing.frame_period.count() > 0) {
+                    const auto flip_at = next_flip;
+                    if (flip_at >= tick_deadline) {
+                        lk.unlock();
+                        Common::AccurateWaitUntil(tick_deadline);
+                        break; // keep 60 Hz vblank cadence aligned before taking this flip
+                    }
+                    if (std::chrono::steady_clock::now() < flip_at) {
+                        lk.unlock();
+                        Common::AccurateWaitUntil(flip_at);
+                        lk.lock();
+                        if (token.stop_requested() || requests.empty() || !can_submit_swap()) {
+                            continue;
+                        }
+                    }
+                }
+                request = requests.front();
+                requests.pop();
             }
-            const auto now = std::chrono::steady_clock::now();
-            const auto request = receive_request();
-            if (request) {
-                next_flip = std::max(next_flip + frame_period, now - frame_period);
-                Flip(request);
-                FRAME_END;
+            const auto flip_now = std::chrono::steady_clock::now();
+            if (pacing.frame_period.count() > 0) {
+                next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period, flip_now);
             }
+            Flip(request);
+            FRAME_END;
         }
-        std::this_thread::sleep_until(tick_deadline);
+        if (!token.stop_requested()) {
+            Common::AccurateWaitUntil(tick_deadline);
+        }
     }
 }
 

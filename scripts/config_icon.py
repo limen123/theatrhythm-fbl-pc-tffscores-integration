@@ -33,6 +33,7 @@ from button_icons import forge_crc, read_bundle, write_bundle
 
 PORT = Path(__file__).resolve().parent.parent
 ASSET = PORT / 'assets' / 'config_icon' / 'display.bc7'
+CTRL_ASSET = PORT / 'assets' / 'config_icon' / 'controller.bc7'
 CONFIG_BUNDLE = 'Media/StreamingAssets/aa/PS4/0aecbe09e3673328eba2f60a0720e8b5.bundle'
 CONFIG_CRC = 1805126692  # catalog.json m_Crc of CONFIG_BUNDLE (CUSA32853 v01.00)
 METADATA = 'Media/Metadata/global-metadata.dat'
@@ -40,12 +41,13 @@ KEY_LITERAL = 1152  # string literal that AssetBundleCryptographyParam.get_Encry
 TEXTURE_BYTES = 1024 * 1024  # BC7, one byte per texel, no mipmaps
 BLOCKS = 256  # blocks per row and column
 # Logo Usage's icon (ConfigTop_Button_Icon_07) covers atlas columns 211-269, rows 95-148 (top row
-# first). The patch was drawn on the whole blocks around it, ICON_FROM: block columns 52-67 and,
-# counted from the bottom row as Unity stores rows, block rows 218-232. It goes to PATCH instead,
-# where nothing is drawn within 40 px (10 blocks), room for the sprite's whole 92x92 rect.
-# src/runtime_display_page.c moves Logo Usage's sprite by PATCH - ICON_FROM (ICON_MOVE_X/Y).
+# first). The patches were drawn on the whole blocks around it, ICON_FROM: block columns 52-67 and,
+# counted from the bottom row as Unity stores rows, block rows 218-232. They go to PATCH /
+# CTRL_PATCH instead, where nothing is drawn within 40 px (10 blocks), room for each sprite's
+# whole 92x92 rect. src/runtime_display_page.c moves cloned sprites by patch - ICON_FROM.
 ICON_FROM = (52, 218)
 PATCH = (208, 192, 16, 15)  # block x, block y, width, height in blocks
+CTRL_PATCH = (208, 224, 16, 15)  # Controller Settings icon block rect, 17 blocks above PATCH
 PATCH_BYTES = PATCH[2] * PATCH[3] * 16
 # The last block of the tiled data is the sheet's top right corner (texels 1020-1023 of the top
 # rows), which no sprite uses. BC7 mode 6 with every endpoint 0 decodes to transparent black
@@ -233,18 +235,25 @@ def original_texture(game):
     return b['stream'][atlas_node(b):]
 
 
-def build(original, secret, patch):
-    """The encrypted Config bundle (bytes) with `patch` (PATCH's blocks, row by row) in the atlas."""
+def _apply_patch(linear, rect, data):
+    """Copy a row-major BC7 block patch into linear atlas blocks at `rect`."""
+    x, y, w, h = rect
+    expected = w * h * 16
+    if len(data) != expected: raise ValueError(f'patch is {len(data)} bytes, expected {expected}')
+    for row in range(h):
+        at = ((y + row) * BLOCKS + x) * 16
+        linear[at:at + w * 16] = data[row * w * 16:(row + 1) * w * 16]
+
+
+def build(original, secret, patch, extra=()):
+    """The encrypted Config bundle (bytes) with `patch` at PATCH and optional `(rect, data)` pairs."""
     b = read_bundle(decrypt(original, secret))
     crc = zlib.crc32(b['stream'])
     if crc != CONFIG_CRC: raise ValueError(f'Config bundle CRC {crc} is not {CONFIG_CRC}: another game version?')
-    if len(patch) != PATCH_BYTES: raise ValueError(f'patch is {len(patch)} bytes, expected {PATCH_BYTES}')
     offset = atlas_node(b)
     linear = bytearray(untile(b['stream'][offset:]))
-    x, y, w, h = PATCH
-    for row in range(h):
-        at = ((y + row) * BLOCKS + x) * 16
-        linear[at:at + w * 16] = patch[row * w * 16:(row + 1) * w * 16]
+    _apply_patch(linear, PATCH, patch)
+    for rect, data in extra: _apply_patch(linear, rect, data)
     # forge_crc rewrites the stream's last 4 bytes: the index bits of CLEAR_BLOCK
     stream = b['stream'][:offset] + tile(linear)[:-16] + CLEAR_BLOCK
     return encrypt(write_bundle(b, forge_crc(stream, crc)), original[:32], secret)
@@ -264,7 +273,8 @@ def main():
         print(f"Config icon: {source} or the metadata not found; Display Settings shows Logo Usage's icon")
         return 0
     try:
-        bundle = build(source.read_bytes(), secret_of(a.game), ASSET.read_bytes())
+        extra = [(CTRL_PATCH, CTRL_ASSET.read_bytes())] if CTRL_ASSET.is_file() else []
+        bundle = build(source.read_bytes(), secret_of(a.game), ASSET.read_bytes(), extra=extra)
     except (OSError, ValueError, UnicodeDecodeError) as e:
         print(f"Config icon: {e}; Display Settings shows Logo Usage's icon")
         return 0

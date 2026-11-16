@@ -47,12 +47,13 @@ void runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size);
 void runtime_memory_visit_mapped(void (*visit)(uintptr_t address, const unsigned char *bytes, uint64_t size,
                                                void *context), void *context);
 void runtime_memory_invalidate(uintptr_t address, uint64_t size);
-/* Button prompt icons and the Live Info pad (runtime_button_icons.c): mode "ps4", "xbox", "keyboard"
- * or "auto" (follows the device the player last used, reported by the pad code); the folders hold
- * prepare's icon and pad files. runtime_button_icons_pad: the pad drawing the atlas shows now
- * (BUTTON_ICONS_PS4 or BUTTON_ICONS_XBOX; keyboard players keep the DualShock 4). */
-enum { BUTTON_ICONS_PS4, BUTTON_ICONS_XBOX, BUTTON_ICONS_KEYBOARD, BUTTON_ICONS_SETS };
+/* Button prompt icons and the Live Info pad (runtime_button_icons.c): mode "ps4", "xbox", "switch",
+ * "keyboard" or "auto" (follows the device the player last used, reported by the pad code); the
+ * folders hold prepare's icon and pad files. runtime_button_icons_pad: the pad drawing the atlas shows
+ * now (BUTTON_ICONS_PS4, BUTTON_ICONS_XBOX or BUTTON_ICONS_SWITCH; keyboard players keep the DualShock 4). */
+enum { BUTTON_ICONS_PS4, BUTTON_ICONS_XBOX, BUTTON_ICONS_SWITCH, BUTTON_ICONS_KEYBOARD, BUTTON_ICONS_SETS };
 void runtime_button_icons_configure(const char *icons, const char *pad, const char *mode);
+void runtime_button_icons_set_mode(const char *mode);
 void runtime_button_icons_input(int set);
 int runtime_button_icons_pad(void);
 /* The game code the runner patches, found by name and bytes in any game version
@@ -75,6 +76,7 @@ const char *runtime_game_version(void);
  * (its global-metadata.dat): before runtime_game_code_find; close frees the metadata. */
 void runtime_game_code_open(unsigned char *module, uint64_t size, uint64_t code_size, const char *app0);
 void runtime_game_code_close(void);
+int runtime_summonstone_install(unsigned char *module);
 /* Every site of `sites` into `found`: 0, or -1 after logging "<who>: <site> not found in game ...". */
 int runtime_game_code_find(const GameSite *sites, size_t count, GameCode *found, const char *who);
 /* Display Settings in the game's Options menu, and all nine display languages on its Language page
@@ -82,6 +84,7 @@ int runtime_game_code_find(const GameSite *sites, size_t count, GameCode *found,
  * image (still writable), with stubs written to `stubs` (`size` bytes, within rel32 reach of it);
  * `monitor_icon`: the Config atlas bundle with the button's icon is mounted. 0 when installed. */
 int runtime_display_page_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size, int monitor_icon);
+int runtime_note_skins_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
 /* The party's walk on field stages at any frame rate (runtime_field_walk.c): StageCharacter's
  * motion check measures movement in 60ths of a second, with its stub written to `stubs` (`size`
  * bytes, within rel32 reach of the image, which is still writable). 0 when installed. */
@@ -90,10 +93,12 @@ int runtime_field_walk_install(unsigned char *image, uint64_t module_base, unsig
  * hides itself for a count of 0, with its stub written to `stubs` (`size` bytes, within rel32 reach
  * of the image, which is still writable). 0 when installed. */
 int runtime_dlc_bonus_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
-/* The Live Info pad fitted to the Xbox drawing when the pad atlas shows it (runtime_xbox_pad.c):
+/* The Live Info pad fitted to the Xbox/Switch drawing when the pad atlas shows it (runtime_xbox_pad.c):
  * hooks MSGamePad's per-frame calls, with stubs written to `stubs` (`size` bytes, within rel32 reach
  * of the image, which is still writable). 0 when installed. */
 int runtime_xbox_pad_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
+/* Live confirm/cancel layout sync via GameInput::SetDecideButtonType (runtime_confirm_layout.c). */
+int runtime_confirm_layout_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
 /* settings.ini skip_opening (runtime_skip_opening.c): the start-up logo scene jumps to its end on its
  * second frame and the first Opening scene after each start ends before its movie plays, so the start
  * goes to the title screen; stubs written to `stubs` (`size`
@@ -230,6 +235,7 @@ void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
 void runtime_pad_set_confirm_hook(void (*hook)(void));
+void runtime_pad_get_sticks(float *lx, float *ly, float *rx, float *ry);
 /* probe --gamepad: prints one "Gamepad:" line for the first pad found (returns 1) or none (0). */
 int runtime_pad_describe(void);
 uintptr_t runtime_rtc_resolve(const char *name);

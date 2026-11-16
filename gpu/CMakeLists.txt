@@ -361,3 +361,17 @@ add_executable(swapchain-focus-test EXCLUDE_FROM_ALL ../tests/test_swapchain_foc
 target_include_directories(swapchain-focus-test PRIVATE shim shadps4)
 target_link_libraries(swapchain-focus-test PRIVATE PkgConfig::SDL3 Vulkan::Vulkan fmt::fmt)
 target_compile_options(swapchain-focus-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+
+add_executable(frame-pacing-test EXCLUDE_FROM_ALL ../tests/test_frame_pacing.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_definitions(frame-pacing-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(frame-pacing-test PRIVATE . shim shadps4)
+target_link_libraries(frame-pacing-test PRIVATE theatrhythm_gpu)
+target_compile_options(frame-pacing-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -fPIC)
+if (WIN32)
+    target_sources(frame-pacing-test PRIVATE ../src/compat_win.c)
+    target_compile_definitions(frame-pacing-test PRIVATE sigjmp_buf=theatrhythm_jmp_buf)
+    target_compile_options(frame-pacing-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
+    target_link_libraries(frame-pacing-test PRIVATE onecore)
+endif()

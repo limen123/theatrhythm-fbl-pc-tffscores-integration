@@ -6,6 +6,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
@@ -15,6 +16,7 @@
 #include "theatrhythm_overlay.h"
 #include "theatrhythm_settings.h"
 #include "theatrhythm_graphics.h"
+#include "theatrhythm_toggles.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_warmup_inbox.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -930,6 +932,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::present_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // theatrhythm: a minimized window has no pixels on Windows (0x0) or is hidden/occluded; keep the swapchain
     // and skip presenting until the window is restored.
     if (window.IsMinimized() || window.GetWidth() <= 0 || window.GetHeight() <= 0) {
@@ -937,24 +943,50 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         return;
     }
 
-    // Recreate the swapchain if the window was resized.
-    swapchain.UpdateVsync();
-    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    // Wait for the frame's draw_scheduler work to finish before acquiring a swapchain image so
+    // an unrendered frame never pins a swapchain buffer and stalls vkAcquireNextImageKHR.
+    if (!is_reusing_frame && frame->ready_tick > 0 &&
+        frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        TheatrhythmStats::Timer ready_timer{TheatrhythmStats::present_ready_wait_ns};
+        draw_scheduler.Wait(frame->ready_tick);
     }
 
-    if (!swapchain.AcquireNextImage()) {
-        if (!window.IsMinimized() && window.GetWidth() > 0 && window.GetHeight() > 0) {
+    {
+        TheatrhythmStats::Timer acquire_timer{TheatrhythmStats::present_acquire_ns};
+#ifdef _WIN32
+        ULONG64 acq_c0 = 0;
+        if (TheatrhythmStats::enabled) {
+            QueryThreadCycleTime(GetCurrentThread(), &acq_c0);
+        }
+#endif
+        // Recreate the swapchain if the window was resized.
+        swapchain.UpdateVsync();
+        if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+
         if (!swapchain.AcquireNextImage()) {
-            // User resizes the window too fast and GPU can't keep up. Skip this frame.
-            LOG_WARNING(Render_Vulkan, "Skipping frame!");
-            free_frame();
-            return;
+            if (!window.IsMinimized() && window.GetWidth() > 0 && window.GetHeight() > 0) {
+                swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            }
+            if (!swapchain.AcquireNextImage()) {
+                // User resizes the window too fast and GPU can't keep up. Skip this frame.
+                LOG_WARNING(Render_Vulkan, "Skipping frame!");
+                free_frame();
+                return;
+            }
         }
+#ifdef _WIN32
+        if (TheatrhythmStats::enabled) {
+            ULONG64 acq_c1 = 0;
+            QueryThreadCycleTime(GetCurrentThread(), &acq_c1);
+            TheatrhythmStats::acquire_cycles.fetch_add(acq_c1 - acq_c0, std::memory_order_relaxed);
+        }
+#endif
     }
 
+    const auto prepare_t0 =
+        TheatrhythmStats::enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
     // skip frame because of slow swapchain recreation. If a frame skip occurs, we skip signal
     // the frame's present fence and future GetRenderFrame() call will hang waiting for this frame.
@@ -1078,17 +1110,37 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 
     // Flush vulkan commands.
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::present_prepare_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - prepare_t0)
+                .count(),
+            std::memory_order_relaxed);
+    }
 
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
-    scheduler.Flush(info);
+    {
+        TheatrhythmStats::Timer flush_timer{TheatrhythmStats::present_flush_ns};
+        scheduler.Flush(info);
+    }
 
     // Present to swapchain.
     {
+        const auto mutex_t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        if (TheatrhythmStats::enabled) {
+            TheatrhythmStats::present_mutex_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - mutex_t0)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+        TheatrhythmStats::Timer khr_timer{TheatrhythmStats::present_khr_ns};
         if (!swapchain.Present() && !window.IsMinimized() && window.GetWidth() > 0 &&
             window.GetHeight() > 0) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -1105,6 +1157,7 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
     {
+        TheatrhythmStats::Timer free_timer{TheatrhythmStats::present_free_wait_ns};
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
@@ -1117,19 +1170,49 @@ Frame* Presenter::GetRenderFrame() {
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
 
-    const auto wait = [&]() {
-        result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
-        return result;
-    };
-
-    // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+    // Wait for the presentation to be finished so all frame resources are free.
+    // Poll briefly then use high-res sleep on Windows so NVIDIA waitForFences does not busy-spin CPU.
+    {
+        TheatrhythmStats::Timer fences_timer{TheatrhythmStats::present_wait_fences_ns};
+#ifdef _WIN32
+        ULONG64 f_c0 = 0;
+        if (TheatrhythmStats::enabled) {
+            QueryThreadCycleTime(GetCurrentThread(), &f_c0);
         }
+        result = device.getFenceStatus(frame->present_done);
+        if (result != vk::Result::eSuccess) {
+            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(30);
+            while (result == vk::Result::eNotReady &&
+                   std::chrono::steady_clock::now() < spin_until) {
+                __builtin_ia32_pause();
+                result = device.getFenceStatus(frame->present_done);
+            }
+            while (result == vk::Result::eNotReady) {
+                Common::AccurateSleep(std::chrono::microseconds(250), nullptr, false);
+                result = device.getFenceStatus(frame->present_done);
+            }
+            ASSERT_MSG(result == vk::Result::eSuccess,
+                       "Device lost during waiting for a frame: {}", vk::to_string(result));
+        }
+        if (TheatrhythmStats::enabled) {
+            ULONG64 f_c1 = 0;
+            QueryThreadCycleTime(GetCurrentThread(), &f_c1);
+            TheatrhythmStats::fence_wait_cycles.fetch_add(f_c1 - f_c0, std::memory_order_relaxed);
+        }
+#else
+        const auto wait = [&]() {
+            result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
+            return result;
+        };
+        while (wait() != vk::Result::eSuccess) {
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                       "Device lost during waiting for a frame");
+            // Retry if the waiting times out
+            if (result == vk::Result::eTimeout) {
+                continue;
+            }
+        }
+#endif
     }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||

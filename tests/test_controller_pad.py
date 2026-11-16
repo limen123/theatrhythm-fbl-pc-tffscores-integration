@@ -7,7 +7,7 @@ import unittest
 import zlib
 from pathlib import Path
 from button_icons import read_bundle, write_bundle
-from controller_pad import (ASSET, BLOCKS, BLOCK_BYTES, CLEAR_BLOCK, PAD_BUNDLE, PAD_CRC, PATCH_BYTES, REGIONS,
+from controller_pad import (ASSET, ASSETS, BLOCKS, BLOCK_BYTES, CLEAR_BLOCK, PAD_BUNDLE, PAD_CRC, PATCH_BYTES, REGIONS,
                             TEXTURE_BYTES, build, tile, untile)
 
 GAME = Path(os.environ['THEATRHYTHM_GAME_DIR']) if os.environ.get('THEATRHYTHM_GAME_DIR') else None
@@ -20,6 +20,8 @@ class LayoutTests(unittest.TestCase):
         self.assertNotEqual(tile(linear), linear)
 
     def test_patch_is_the_regions_blocks(self):
+        for name in ('xbox', 'switch'):
+            self.assertEqual(len((ASSETS / f'{name}.bc7').read_bytes()), PATCH_BYTES)
         self.assertEqual(len(ASSET.read_bytes()), PATCH_BYTES)
         for x, y, w, h in REGIONS:
             self.assertLessEqual(x + w, BLOCKS)
@@ -61,10 +63,13 @@ class GameTests(unittest.TestCase):
             subprocess.run([sys.executable, str(ROOT / 'scripts' / 'controller_pad.py'), str(GAME), '--out', out],
                            check=True, stdout=subprocess.DEVNULL)
             folder = Path(out) / 'controller_pad'
-            ps4, xbox = (folder / 'ps4.texture').read_bytes(), (folder / 'xbox.texture').read_bytes()
+            ps4 = (folder / 'ps4.texture').read_bytes()
+            xbox = (folder / 'xbox.texture').read_bytes()
+            switch = (folder / 'switch.texture').read_bytes()
             self.assertEqual(ps4, read_bundle((GAME / PAD_BUNDLE).read_bytes())['stream'][-TEXTURE_BYTES:])
             self.assertEqual(xbox, read_bundle((folder / 'xbox.bundle').read_bytes())['stream'][-TEXTURE_BYTES:])
-            self.assertNotEqual(ps4, xbox)
+            self.assertEqual(switch, read_bundle((folder / 'switch.bundle').read_bytes())['stream'][-TEXTURE_BYTES:])
+            self.assertEqual(len({ps4, xbox, switch}), 3)
 
     def test_other_game_versions_are_refused(self):
         b = read_bundle((GAME / PAD_BUNDLE).read_bytes())

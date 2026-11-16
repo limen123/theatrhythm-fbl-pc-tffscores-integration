@@ -17,3 +17,13 @@ save/
 *.dat
 *tffscores.json
 scratch/
+/CustomCharts/
+/symbols_*.tsv
+/assets/extracted_native_reference/
+/assets/slidehold/
+*.pyc
+*.pyo
+*.bak
+*.log
+*.running.old
+.pytest_cache/

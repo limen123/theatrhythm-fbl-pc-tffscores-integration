@@ -58,7 +58,7 @@ class BundleTests(unittest.TestCase):
 
     def test_checked_in_sheets_are_whole_textures(self):
         sheets = sorted(p.stem for p in ASSETS.glob('*.bc7'))
-        self.assertEqual(sheets, ['keyboard', 'xbox'])
+        self.assertEqual(sheets, ['keyboard', 'switch', 'xbox'])
         for name in sheets:
             self.assertEqual((ASSETS / f'{name}.bc7').stat().st_size, TEXTURE_BYTES)
 
@@ -82,11 +82,11 @@ class GameBundleTests(unittest.TestCase):
             subprocess.run([sys.executable, str(ROOT / 'scripts' / 'button_icons.py'), str(GAME), '--out', out],
                            check=True, stdout=subprocess.DEVNULL)
             folder = Path(out) / 'button_icons'
-            textures = {name: (folder / f'{name}.texture').read_bytes() for name in ('ps4', 'xbox', 'keyboard')}
+            textures = {name: (folder / f'{name}.texture').read_bytes() for name in ('ps4', 'xbox', 'switch', 'keyboard')}
             self.assertEqual(textures['ps4'], read_bundle((GAME / ICON_BUNDLE).read_bytes())['stream'][-TEXTURE_BYTES:])
-            for name in ('xbox', 'keyboard'):
+            for name in ('xbox', 'switch', 'keyboard'):
                 self.assertEqual(textures[name], read_bundle((folder / f'{name}.bundle').read_bytes())['stream'][-TEXTURE_BYTES:])
-            self.assertEqual(len(set(textures.values())), 3)
+            self.assertEqual(len(set(textures.values())), 4)
 
     def test_other_game_versions_are_refused(self):
         original = bytearray((GAME / ICON_BUNDLE).read_bytes())

@@ -8,9 +8,9 @@ import unittest
 import zlib
 from pathlib import Path
 from button_icons import read_bundle
-from config_icon import (ASSET, BLOCKS, CLEAR_BLOCK, CONFIG_BUNDLE, CONFIG_CRC, ICON_FROM, PATCH, PATCH_BYTES,
-                         TEXTURE_BYTES, atlas_node, build, cbc_decrypt, cbc_encrypt, decrypt, encrypt, original_texture,
-                         password, secret_of, tile, untile)
+from config_icon import (ASSET, BLOCKS, CLEAR_BLOCK, CONFIG_BUNDLE, CONFIG_CRC, CTRL_ASSET, CTRL_PATCH,
+                         ICON_FROM, PATCH, PATCH_BYTES, TEXTURE_BYTES, atlas_node, build, cbc_decrypt,
+                         cbc_encrypt, decrypt, encrypt, original_texture, password, secret_of, tile, untile)
 
 GAME = Path(os.environ['THEATRHYTHM_GAME_DIR']) if os.environ.get('THEATRHYTHM_GAME_DIR') else None
 
@@ -76,17 +76,21 @@ class TextureTests(unittest.TestCase):
         self.assertEqual(tiled[32:48], linear[BLOCKS * 16:BLOCKS * 16 + 16])
 
     def test_checked_in_patch_is_whole_blocks(self):
-        self.assertEqual(ASSET.stat().st_size, PATCH_BYTES)
-        x, y, w, h = PATCH
-        self.assertLessEqual(x + w, BLOCKS)
-        self.assertLessEqual(y + h, BLOCKS)
+        for asset, rect in ((ASSET, PATCH), (CTRL_ASSET, CTRL_PATCH)):
+            x, y, w, h = rect
+            self.assertEqual(asset.stat().st_size, w * h * 16)
+            self.assertLessEqual(x + w, BLOCKS)
+            self.assertLessEqual(y + h, BLOCKS)
 
     def test_runtime_moves_the_sprite_to_the_patch(self):
-        # the Display Settings button shows Logo Usage's sprite moved by PATCH - ICON_FROM blocks
+        # the Display Settings and Controller Settings buttons move Logo Usage's sprite by patch - ICON_FROM blocks
         source = (ROOT / 'src' / 'runtime_display_page.c').read_text(encoding='utf-8')
         move = re.search(r'#define ICON_MOVE_X \(\((\d+)-(\d+)\)\*4\)\s*#define ICON_MOVE_Y \(\((\d+)-(\d+)\)\*4\)', source)
         self.assertIsNotNone(move)
         self.assertEqual(tuple(map(int, move.groups())), (PATCH[0], ICON_FROM[0], PATCH[1], ICON_FROM[1]))
+        ctrl_move = re.search(r'#define CTRL_ICON_MOVE_X \(\((\d+)-(\d+)\)\*4\)\s*#define CTRL_ICON_MOVE_Y \(\((\d+)-(\d+)\)\*4\)', source)
+        self.assertIsNotNone(ctrl_move)
+        self.assertEqual(tuple(map(int, ctrl_move.groups())), (CTRL_PATCH[0], ICON_FROM[0], CTRL_PATCH[1], ICON_FROM[1]))
 
 
 @unittest.skipUnless(GAME and (GAME / CONFIG_BUNDLE).is_file(), 'needs the game dump (THEATRHYTHM_GAME_DIR)')
@@ -95,7 +99,8 @@ class GameBundleTests(unittest.TestCase):
         original = (GAME / CONFIG_BUNDLE).read_bytes()
         secret = secret_of(GAME)
         patch = ASSET.read_bytes()
-        out = build(original, secret, patch)
+        ctrl_patch = CTRL_ASSET.read_bytes()
+        out = build(original, secret, patch, extra=[(CTRL_PATCH, ctrl_patch)])
         self.assertEqual(out[:32], original[:32])
         before, after = read_bundle(decrypt(original, secret)), read_bundle(decrypt(out, secret))
         self.assertEqual(zlib.crc32(after['stream']), CONFIG_CRC)
@@ -103,27 +108,30 @@ class GameBundleTests(unittest.TestCase):
         offset = atlas_node(before)
         self.assertEqual(after['stream'][:offset], before['stream'][:offset])
         old, new = untile(before['stream'][offset:]), untile(after['stream'][offset:])
-        x, y, w, h = PATCH
         changed = {i for i in range(BLOCKS * BLOCKS) if old[i * 16:i * 16 + 16] != new[i * 16:i * 16 + 16]}
-        inside = {(y + r) * BLOCKS + x + c for r in range(h) for c in range(w)}
+        inside = set()
+        for rect, data in ((PATCH, patch), (CTRL_PATCH, ctrl_patch)):
+            x, y, w, h = rect
+            inside |= {(y + r) * BLOCKS + x + c for r in range(h) for c in range(w)}
+            for r in range(h):
+                at = ((y + r) * BLOCKS + x) * 16
+                self.assertEqual(new[at:at + w * 16], data[r * w * 16:(r + 1) * w * 16])
         self.assertEqual(changed - inside, {BLOCKS * BLOCKS - 1})  # the CRC block in the corner
         self.assertEqual(new[-16:-4], CLEAR_BLOCK[:12])
-        for r in range(h):
-            at = ((y + r) * BLOCKS + x) * 16
-            self.assertEqual(new[at:at + w * 16], patch[r * w * 16:(r + 1) * w * 16])
 
     @unittest.skipUnless(importlib.util.find_spec('texture2ddecoder'), 'needs texture2ddecoder')
     def test_patch_goes_where_nothing_is_drawn(self):
-        # the button's sprite is 92x92 around the icon, so 10 blocks around the patch must be clear too
+        # the button's sprite is 92x92 around the icon, so 10 blocks around each patch must be clear too
         import texture2ddecoder
         bgra = texture2ddecoder.decode_bc7(untile(original_texture(GAME)), BLOCKS * 4, BLOCKS * 4)
         alpha = bgra[3::4]
-        x, y, w, h = PATCH
         margin = 10
-        drawn = [(bx, by) for by in range(y - margin, y + h + margin) for bx in range(x - margin, x + w + margin)
-                 if any(alpha[(by * 4 + r) * BLOCKS * 4 + bx * 4:(by * 4 + r) * BLOCKS * 4 + bx * 4 + 4] != bytes(4)
-                        for r in range(4))]
-        self.assertEqual(drawn, [])
+        for rect in (PATCH, CTRL_PATCH):
+            x, y, w, h = rect
+            drawn = [(bx, by) for by in range(y - margin, y + h + margin) for bx in range(x - margin, x + w + margin)
+                     if any(alpha[(by * 4 + r) * BLOCKS * 4 + bx * 4:(by * 4 + r) * BLOCKS * 4 + bx * 4 + 4] != bytes(4)
+                            for r in range(4))]
+            self.assertEqual(drawn, [])
 
     def test_other_game_versions_are_refused(self):
         with self.assertRaisesRegex(ValueError, 'another game version'):

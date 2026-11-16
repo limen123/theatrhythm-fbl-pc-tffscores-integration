@@ -10,6 +10,12 @@
 
 int theatrhythm_gpu_overlay_captures_input(void) { return 0; }
 int theatrhythm_gpu_vibration_percent(void) { return 100; }
+int theatrhythm_gpu_background_controller(void) { return 0; }
+static int menu_confirm_swap;
+int theatrhythm_gpu_menu_confirm_swap(void) { return menu_confirm_swap; }
+const char *theatrhythm_button_icons(void) { return "auto"; }
+void theatrhythm_gpu_set_active_button_icons(const char *set_name) { (void)set_name; }
+void runtime_button_icons_set_mode(const char *mode) { (void)mode; }
 const char *theatrhythm_pad_map(int keyboard) { (void)keyboard; return ""; }
 void runtime_button_icons_input(int set) { (void)set; }
 static int prompt_open;
@@ -119,6 +125,20 @@ static void test_exit_prompt_no(void) {
     host_sample.buttons=BTN_CIRCLE; /* Circle outside the prompt is Circle */
     sample(&d);
     assert(d.buttons==BTN_CIRCLE);
+    /* In Nintendo/swapped confirm layout, Cross cancels and confirms No with Circle */
+    menu_confirm_swap=1;
+    host_sample=(PadData){.connected=1,.connected_count=1,.buttons=BTN_CROSS|BTN_UP};
+    prompt_open=1;
+    sample(&d);
+    assert(d.buttons==BTN_LEFT);
+    SDL_Delay(120); sample(&d);
+    assert(d.buttons==0);
+    SDL_Delay(80); sample(&d);
+    assert(d.buttons==BTN_CIRCLE);
+    prompt_open=0;
+    sample(&d);
+    assert(d.buttons==BTN_UP);
+    menu_confirm_swap=0;
     host_sample=(PadData){0};
 }
 

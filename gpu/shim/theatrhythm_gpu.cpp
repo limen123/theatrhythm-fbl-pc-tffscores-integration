@@ -217,9 +217,10 @@ u32 TheatrhythmDisplayRefreshHz() {
 }
 
 double TheatrhythmWindowRefreshRate() {
-    SDL_DisplayID display = g_window ? SDL_GetDisplayForWindow(g_window->GetSDLWindow()) : 0;
-    if (!display) display = SDL_GetPrimaryDisplay();
-    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+    if (g_window) {
+        return g_window->GetRefreshRate();
+    }
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
     if (!mode) return 0.0;
     if (mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0) {
         return double(mode->refresh_rate_numerator) / mode->refresh_rate_denominator;
@@ -450,6 +451,46 @@ extern "C" void theatrhythm_display_settings_open(void) {
     TheatrhythmOverlay::OpenDisplaySettings();
 }
 
+void theatrhythm_note_skin_open(void) {
+    TheatrhythmOverlay::OpenNoteSkins();
+}
+
+uint32_t theatrhythm_note_skin_version(void) {
+    return TheatrhythmSettings::Get().note_skin_version.load(std::memory_order_acquire);
+}
+
+void theatrhythm_note_skin_get(int category, int* hue, int* sat) {
+    const auto& v = TheatrhythmSettings::Get();
+    const int idx = (category >= 0 && category < TheatrhythmSettings::Values::NoteSkinCount) ? category : 0;
+    if (hue) *hue = v.note_skin_hue[idx].load(std::memory_order_relaxed);
+    if (sat) *sat = v.note_skin_sat[idx].load(std::memory_order_relaxed);
+}
+
+void theatrhythm_note_skin_get_rgb(int category, float* r, float* g, float* b) {
+    int h = 0, s = 100;
+    theatrhythm_note_skin_get(category, &h, &s);
+    const int hm = ((h % 360) + 360) % 360;
+    const float hf = static_cast<float>(hm) / 60.0f;
+    const float sf = static_cast<float>(s < 0 ? 0 : (s > 100 ? 100 : s)) / 100.0f;
+    const int sec = static_cast<int>(hf);
+    const float f = hf - static_cast<float>(sec);
+    const float p = 1.0f - sf;
+    const float q = 1.0f - sf * f;
+    const float t = 1.0f - sf * (1.0f - f);
+    float rr = 1.0f, gg = 1.0f, bb = 1.0f;
+    switch (sec % 6) {
+        case 0: rr = 1.0f; gg = t; bb = p; break;
+        case 1: rr = q; gg = 1.0f; bb = p; break;
+        case 2: rr = p; gg = 1.0f; bb = t; break;
+        case 3: rr = p; gg = q; bb = 1.0f; break;
+        case 4: rr = t; gg = p; bb = 1.0f; break;
+        default: rr = 1.0f; gg = p; bb = q; break;
+    }
+    if (r) *r = rr;
+    if (g) *g = gg;
+    if (b) *b = bb;
+}
+
 extern "C" int theatrhythm_display_settings_is_open(void) {
     return TheatrhythmOverlay::DisplaySettingsOpen() ? 1 : 0;
 }
@@ -477,6 +518,10 @@ extern "C" int theatrhythm_display_get(int setting) {
     case THEATRHYTHM_DISPLAY_VSYNC: return s.vsync ? 1 : 0;
     case THEATRHYTHM_DISPLAY_FPS_LIMIT: return s.fps_limit;
     case THEATRHYTHM_DISPLAY_RENDER_4K: return s.render_resolution == TheatrhythmSettings::Render4k ? 1 : 0;
+    case THEATRHYTHM_DISPLAY_TEARING: return s.tearing ? 1 : 0;
+    case THEATRHYTHM_DISPLAY_BUTTON_ICONS: return s.button_icons;
+    case THEATRHYTHM_DISPLAY_CONFIRM_SWAP: return s.menu_confirm_swap ? 1 : 0;
+    case THEATRHYTHM_DISPLAY_BACKGROUND_CONTROLLER: return s.background_controller ? 1 : 0;
     default: return 0;
     }
 }
@@ -498,6 +543,12 @@ extern "C" void theatrhythm_display_set(int setting, int value) {
     case THEATRHYTHM_DISPLAY_RENDER_4K:
         s.render_resolution = value ? TheatrhythmSettings::Render4k : TheatrhythmSettings::Render1080p;
         break;
+    case THEATRHYTHM_DISPLAY_TEARING: s.tearing = value != 0; break;
+    case THEATRHYTHM_DISPLAY_BUTTON_ICONS:
+        if (value >= 0 && value < TheatrhythmSettings::ButtonIconsCount) s.button_icons = value;
+        break;
+    case THEATRHYTHM_DISPLAY_CONFIRM_SWAP: s.menu_confirm_swap = value ? 1 : 0; break;
+    case THEATRHYTHM_DISPLAY_BACKGROUND_CONTROLLER: s.background_controller = value != 0; break;
     default: return;
     }
 }

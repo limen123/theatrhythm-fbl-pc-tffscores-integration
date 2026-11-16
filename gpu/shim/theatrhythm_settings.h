@@ -30,8 +30,8 @@ inline int ParseAudioChannels(std::string_view value) {
 inline constexpr int MasterVolumeMin = 0, MasterVolumeMax = 200, MasterVolumeDefault = 100;
 /// Button icon set the game's prompts show (key button_icons): the device last used (auto), the
 /// game's own PS4 icons, or a sheet from assets/button_icons (src/runtime_button_icons.c).
-enum ButtonIcons : int { ButtonIconsAuto = 0, ButtonIconsPs4, ButtonIconsXbox, ButtonIconsKeyboard, ButtonIconsCount };
-inline constexpr std::string_view ButtonIconKeys[ButtonIconsCount] = {"auto", "ps4", "xbox", "keyboard"};
+enum ButtonIcons : int { ButtonIconsAuto = 0, ButtonIconsPs4, ButtonIconsXbox, ButtonIconsSwitch, ButtonIconsKeyboard, ButtonIconsCount };
+inline constexpr std::string_view ButtonIconKeys[ButtonIconsCount] = {"auto", "ps4", "xbox", "switch", "keyboard"};
 /// Size the game renders at (key render_resolution): the PS4's 1080p, or the PS4 Pro's 2160p
 /// (PS4 Pro mode and a 3840x2160 video out, probe.c mount_boot_config_4k).
 enum RenderResolution : int { Render1080p = 0, Render4k, RenderResolutionCount };
@@ -83,12 +83,22 @@ struct Values {
     std::atomic<int> master_volume{MasterVolumeDefault};
     /// Speaker layout of the game's audio (AudioChannels), read when the game opens its ports.
     std::atomic<int> audio_channels{AudioChannelsAuto};
-    /// ButtonIcons; read once, before the game loads its UI.
-    int button_icons = ButtonIconsAuto;
+    /// ButtonIcons; polled by runtime_button_icons.c and updated live from the F10 overlay.
+    std::atomic<int> button_icons{ButtonIconsAuto};
+    /// Allow controller input and rumble while the game window is unfocused (key background_controller).
+    std::atomic<bool> background_controller{false};
     /// RenderResolution, 4k by default; read once, before the game starts.
     int startup_render_resolution = Render4k;
     /// What the Display Settings pages save for the next start.
     std::atomic<int> render_resolution{Render4k};
+
+    /// Custom note skin colors (0=Touch, 1=Slide, 2=Hold, 3=Slidehold, 4=Joint Lines).
+    static constexpr int NoteSkinCount = 5;
+    static constexpr int NoteSkinDefaultHue[NoteSkinCount] = {0, 45, 120, 195, 180};
+    static constexpr int NoteSkinDefaultSat[NoteSkinCount] = {97, 97, 97, 95, 92};
+    std::atomic<int> note_skin_hue[NoteSkinCount]{{0}, {45}, {120}, {195}, {180}};
+    std::atomic<int> note_skin_sat[NoteSkinCount]{{97}, {97}, {97}, {95}, {92}};
+    std::atomic<uint32_t> note_skin_version{1};
 };
 
 Values& Get();

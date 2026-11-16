@@ -28,7 +28,8 @@ namespace Vulkan {
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      uses_async_copies{threaded_recording} {
     // theatrhythm: THEATRHYTHM_VK_RECORD_THREAD=0 records on the calling thread.
     const char* env = std::getenv("THEATRHYTHM_VK_RECORD_THREAD");
     if (threaded_recording && !(env && env[0] == '0')) {
@@ -242,25 +243,75 @@ void Scheduler::WaitDeferredSignals() {
         return;
     }
     TheatrhythmStats::WaitTimer timer{TheatrhythmStats::host_copies_wait_ns};
+    TheatrhythmStats::Timer breakdown_timer{TheatrhythmStats::wait_deferred_signals_ns};
+    const auto t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        // Helps the copy threads the signals wait for.
+        if (recording_threaded) {
+            WaitRecordingIdle();
+        }
+        // Helps and waits (without spinning) on the copy threads the signals wait for.
         TheatrhythmCopy::WaitAsync();
+        if (deferred_signals_done->load(std::memory_order_acquire) >= issued) {
+            break;
+        }
         std::this_thread::yield();
+    }
+    if (TheatrhythmStats::enabled) {
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count();
+        if (ms >= 10.0) {
+            std::printf("Long WaitDeferredSignals: %.1f ms (issued=%llu done=%llu)\n", ms,
+                        static_cast<unsigned long long>(issued),
+                        static_cast<unsigned long long>(
+                            deferred_signals_done->load(std::memory_order_relaxed)));
+        }
     }
 }
 
 void Scheduler::WaitHostCopies() {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         TheatrhythmStats::WaitTimer timer{TheatrhythmStats::host_copies_wait_ns};
+        TheatrhythmStats::Timer breakdown_timer{TheatrhythmStats::wait_host_copies_only_ns};
         TheatrhythmStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        const auto t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
         KickRecording(true);
-        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
-            std::this_thread::yield();
+        const auto t1 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+        if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+            const auto spin_until =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(20);
+            while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued &&
+                   std::chrono::steady_clock::now() < spin_until) {
+                __builtin_ia32_pause();
+            }
+            if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued &&
+                recording_threaded) {
+                WaitRecordingIdle();
+            }
+            while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+                std::this_thread::yield();
+            }
+        }
+        if (TheatrhythmStats::enabled) {
+            const auto t2 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t2 - t0).count();
+            if (ms >= 10.0) {
+                const double kick_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                std::printf("Long WaitHostCopies: %.1f ms (kick=%.1f ms, issued=%llu done=%llu)\n",
+                            ms, kick_ms, static_cast<unsigned long long>(host_copies_issued),
+                            static_cast<unsigned long long>(
+                                host_copies_done.load(std::memory_order_relaxed)));
+            }
         }
     }
-    TheatrhythmStats::WaitTimer timer{TheatrhythmStats::copy_threads_wait_ns};
-    TheatrhythmCopy::WaitAsync();
+    if (uses_async_copies) {
+        TheatrhythmStats::WaitTimer timer{TheatrhythmStats::copy_threads_wait_ns};
+        TheatrhythmCopy::WaitAsync();
+    }
 }
 
 void Scheduler::KickRecording(bool force) {
@@ -298,14 +349,21 @@ void Scheduler::KickRecording(bool force) {
     }
 }
 
+void Scheduler::WaitRecordingIdle() {
+    if (!recording_threaded) {
+        return;
+    }
+    std::unique_lock lk{recorder_mutex};
+    recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
+}
+
 void Scheduler::SyncRecording() {
     if (!recording_threaded) {
         return;
     }
     KickRecording(true);
     TheatrhythmStats::WaitTimer timer{TheatrhythmStats::sync_recording_ns};
-    std::unique_lock lk{recorder_mutex};
-    recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
+    WaitRecordingIdle();
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken) {
@@ -340,7 +398,20 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_busy = true;
         }
         // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
+        const auto exec_t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point{};
+        const u64 hc_before = host_copies_done.load(std::memory_order_relaxed);
         chunk->Execute(current_cmdbuf);
+        if (TheatrhythmStats::enabled) {
+            const double exec_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - exec_t0)
+                    .count();
+            if (exec_ms >= 5.0) {
+                std::printf("Long ChunkExecute: %.1f ms (host_copies=%llu)\n", exec_ms,
+                            static_cast<unsigned long long>(
+                                host_copies_done.load(std::memory_order_relaxed) - hc_before));
+            }
+        }
         {
             std::scoped_lock lk{recorder_mutex};
             free_chunks.push_back(std::move(chunk));
@@ -446,7 +517,18 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    const auto mutex_t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
     std::scoped_lock lk{submit_mutex};
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::sched_submit_mutex_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - mutex_t0)
+                .count(),
+            std::memory_order_relaxed);
+    }
+    const auto prep_t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                   : std::chrono::steady_clock::time_point{};
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED
@@ -467,8 +549,20 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
     }
     SyncRecording();
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::sched_on_submit_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - prep_t0)
+                .count(),
+            std::memory_order_relaxed);
+    }
     // Guest memory copies into staging read by this submission (copy threads).
-    WaitHostCopies();
+    {
+        TheatrhythmStats::Timer wc_timer{TheatrhythmStats::sched_wait_host_copies_ns};
+        WaitHostCopies();
+    }
+    const auto sub_t0 = TheatrhythmStats::enabled ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = work_semaphore.Handle();
@@ -506,6 +600,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     // Apply pending operations
     PopPendingOperations();
+    if (TheatrhythmStats::enabled) {
+        TheatrhythmStats::sched_vk_submit_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - sub_t0)
+                .count(),
+            std::memory_order_relaxed);
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {

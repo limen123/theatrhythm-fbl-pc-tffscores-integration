@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "theatrhythm_settings.h"
+#include "theatrhythm_toggles.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -134,9 +135,15 @@ bool Swapchain::AcquireNextImage() {
     }
 
     vk::Device device = instance.GetDevice();
+#ifdef _WIN32
     vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
                                    image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+#else
+    vk::Result result =
+        device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
+                                   image_acquired[frame_index], VK_NULL_HANDLE, &image_index);
+#endif
 
     switch (result) {
     case vk::Result::eSuccess:
@@ -313,9 +320,15 @@ bool Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    // Request 6 images for Mailbox (4 otherwise) when allowed so DWM scanout + queued flip never stall vkAcquireNextImageKHR.
+    const u32 target_images = present_mode == vk::PresentModeKHR::eMailbox ? 6u : 4u;
+    image_count = std::max<u32>(capabilities.minImageCount + 1, target_images);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
+    }
+    if (TheatrhythmStats::enabled) {
+        std::printf("Swapchain: caps min=%u max=%u requested=%u\n", capabilities.minImageCount,
+                    capabilities.maxImageCount, image_count);
     }
 
     // Prefer identity transform if possible
@@ -398,6 +411,10 @@ void Swapchain::SetupImages() {
                vk::to_string(images_result));
     images = std::move(imgs);
     image_count = static_cast<u32>(images.size());
+    if (TheatrhythmStats::enabled) {
+        std::printf("Swapchain: actual images=%u mode=%s\n", image_count,
+                    vk::to_string(present_mode).c_str());
+    }
     images_view.resize(image_count);
     for (u32 i = 0; i < image_count; ++i) {
         if (images_view[i]) {

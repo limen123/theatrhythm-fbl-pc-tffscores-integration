@@ -12,6 +12,7 @@
 #include "runtime_custom_charts.h"
 #include "runtime_judgements.h"
 #include "runtime_leaderboard.h"
+#include "runtime_slidehold.h"
 #include "custom_difficulty_assets.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,11 +42,14 @@
 #include "stb_image.h"
 #pragma GCC diagnostic pop
 
+#ifndef HOOK_REGS_DEFINED
+#define HOOK_REGS_DEFINED
 /* Registers saved in hook stubs (SysV x86-64 calling convention, including XMM0..XMM3) */
 typedef struct {
     uint64_t rdi, rsi, rdx, rcx, r8, r9, rax, rdx_out;
     double xmm0, xmm1, xmm2, xmm3;
 } HookRegs;
+#endif
 typedef int (ABI *HookFn)(HookRegs *regs);
 
 static inline void set_ret_float(HookRegs *r, float v) {
@@ -513,7 +517,7 @@ static void make_sort_key(const char *title, char *out, size_t size) {
 }
 
 bool runtime_custom_charts_is_custom_id(uint32_t music_id) {
-    return music_id >= 169000000u && music_id < 170000000u;
+    return (music_id >= 90000u && music_id < 100000u) || (music_id >= 169000000u && music_id < 170000000u);
 }
 
 static CustomSong *find_song_by_id(uint32_t id) {
@@ -729,7 +733,12 @@ static void scan_custom_charts_dir(const char *root) {
             }
         }
         song.mode = (!strcmp(mode_str, "BMS")) ? 1 : 0;
-        song.music_id = fnv1a_id(song.id);
+        uint32_t parsed_id = (uint32_t)strtoul(song.id, NULL, 10);
+        if ((parsed_id >= 90000u && parsed_id < 100000u) || (parsed_id >= 169000000u && parsed_id < 170000000u)) {
+            song.music_id = parsed_id;
+        } else {
+            song.music_id = fnv1a_id(song.id);
+        }
 
         if (find_song_by_id(song.music_id)) {
             printf("CustomCharts: Skipping duplicate/colliding song id [%s] (%u)\n", song.id, song.music_id);
@@ -800,6 +809,7 @@ static void scan_custom_charts_dir(const char *root) {
                                     uint8_t *cdata = (uint8_t *)runtime_low_alloc((size_t)csize);
                                     if (cdata && fread(cdata, 1, (size_t)csize, cf) == (size_t)csize &&
                                         validate_chart(cdata, (size_t)csize, song.mode, song.duration_ms)) {
+                                        runtime_slidehold_normalize_chart(cdata, (size_t)csize);
                                         song.charts[slot].data = cdata;
                                         song.charts[slot].size = (size_t)csize;
                                         ++chart_cnt;
@@ -1813,6 +1823,7 @@ static void *create_custom_text_asset(CustomSong *song, int slot, void **out_byt
     if (out_bytes) *out_bytes = NULL;
 
     size_t size = song->charts[slot].size;
+    runtime_slidehold_normalize_chart(song->charts[slot].data, size);
     void *bytes_arr = alloc_managed_array_by_elem(s_byte_class, size);
     if (!bytes_arr) return NULL;
     uint32_t bytes_pin = gc_pin(bytes_arr, true);
@@ -2162,6 +2173,7 @@ static ABI int hook_theater_begin_init(HookRegs *r) {
 
 static ABI int hook_theater_finish(HookRegs *r) {
     s_results_page = 1;
+    runtime_slidehold_reset();
     void *theater = (void *)r->rdi;
     if (theater) {
         void *setting = (void *)load64((char *)theater + 0x98);
@@ -2221,12 +2233,26 @@ static ABI int hook_play_setting_config(HookRegs *r) {
         else snprintf(s_current_play_style, sizeof(s_current_play_style), "standard");
         printf("TFFScores: Play style configured: %s (%d)\n", s_current_play_style, play_style);
 
+        int trigger_color = *(int32_t *)((char *)setting + 0x100);
+        runtime_slidehold_set_color_type(trigger_color);
+        runtime_slidehold_reset();
+
         void *mid = (void *)load64((char *)setting + 0x18);
-        if (find_song_by_obj(mid)) {
-            for (size_t off = 0xf6; off <= 0xfc; ++off) {
+        CustomSong *song = find_song_by_obj(mid);
+        if (song) {
+            int difficulty = (int)load32((char *)setting + 0x50);
+            if (s_gameplay_chart_slot >= 4) difficulty = s_gameplay_chart_slot;
+            else if (s_pending_chart_slot >= 4) difficulty = s_pending_chart_slot;
+            if (difficulty >= 0 && difficulty < MAX_SLOTS && song->charts[difficulty].data) {
+                runtime_slidehold_normalize_chart(song->charts[difficulty].data, song->charts[difficulty].size);
+                runtime_slidehold_load_chart(song->charts[difficulty].data, song->charts[difficulty].size);
+            }
+            for (size_t off = 0xf6; off < 0xfc; ++off) {
                 *(bool *)((char *)setting + off) = false;
             }
         }
+    } else {
+        runtime_slidehold_reset();
     }
     return 0;
 }
@@ -2241,6 +2267,16 @@ static ABI int hook_fixed_trigger_judge(HookRegs *r) {
     uint32_t judge = (uint32_t)r->rdx & 0xFF;
     int32_t hit_time = (int32_t)r->rcx;
 
+    /* Manual gameplay SlideHold Start & End must be judged exclusively by our SlideHold
+     * stick tracker (is_internal_judge) or native timeout Miss (judge >= 5). Allow
+     * Auto/Demo mode unconditionally so Auto Play completes SlideHolds cleanly. */
+    if (runtime_slidehold_is_start_trigger((int32_t)index) ||
+        runtime_slidehold_is_end_trigger((int32_t)index)) {
+        if (judge < 5 && !runtime_slidehold_is_internal_judge() && !runtime_slidehold_is_auto_mode()) {
+            return 1;
+        }
+    }
+
     if (context && judge > 0 && judge <= 6) {
         void *triggers_list = *(void **)((char *)context + 0x10);
         if (triggers_list) {
@@ -2252,6 +2288,7 @@ static ABI int hook_fixed_trigger_judge(HookRegs *r) {
                     if (trigger) {
                         uint8_t already = *(uint8_t *)((char *)trigger + 0x4c);
                         if (already == 0) {
+                            runtime_slidehold_on_native_judge((int32_t)index, (uint8_t)judge, hit_time);
                             int target_time = *(int32_t *)((char *)trigger + 0x14);
                             int lane = *(int32_t *)((char *)trigger + 0x1c);
                             int offset_ms = 0;
@@ -3826,9 +3863,7 @@ static UGuiVec4 cda_shadow_vec4(int slot) {
     return cda_rgba_to_vec4(slot == 4 ? cda_beginner_shadow : cda_chaos_shadow);
 }
 
-static void *cda_create_sprite_rgba(const uint8_t *rgba, int width, int height,
-                                    UGuiRect rect, UGuiVec2 pivot, float ppu, UGuiVec4 border,
-                                    const char *name_tag) {
+static void *cda_create_texture2d_rgba(const uint8_t *rgba, int width, int height, const char *name_tag) {
     ensure_il2cpp_api();
     if (!rgba || width <= 0 || height <= 0 || !s_texture2d_class) return NULL;
 
@@ -3837,7 +3872,6 @@ static void *cda_create_sprite_rgba(const uint8_t *rgba, int width, int height,
     TexSetIntFn set_wrap = (TexSetIntFn)GUEST(0x39d3940);
     TexLoadRawFn load_raw = (TexLoadRawFn)GUEST(0x39d72c0);
     TexApplyFn apply = (TexApplyFn)GUEST(0x39d7540);
-    SpriteCreateFullFn spr_create = (SpriteCreateFullFn)GUEST(0x1dddde0);
     SetObjNameFn set_name = (SetObjNameFn)GUEST(0x1dceb60);
 
     void *tex = alloc_managed_object(s_texture2d_class);
@@ -3850,7 +3884,20 @@ static void *cda_create_sprite_rgba(const uint8_t *rgba, int width, int height,
     load_raw(tex, rgba, width * height * 4, NULL);
     apply(tex, false, true, NULL);
     protect_cached_unity_object(tex);
+    if (name_tag) {
+        set_name(tex, make_string(NULL, name_tag), NULL);
+    }
+    return tex;
+}
 
+static void *cda_create_sprite_rgba(const uint8_t *rgba, int width, int height,
+                                    UGuiRect rect, UGuiVec2 pivot, float ppu, UGuiVec4 border,
+                                    const char *name_tag) {
+    void *tex = cda_create_texture2d_rgba(rgba, width, height, NULL);
+    if (!tex) return NULL;
+
+    SpriteCreateFullFn spr_create = (SpriteCreateFullFn)GUEST(0x1dddde0);
+    SetObjNameFn set_name = (SetObjNameFn)GUEST(0x1dceb60);
     void *spr = spr_create(tex, rect, pivot, ppu, 0, 0, border, false, NULL);
     if (!spr) return NULL;
     (void)gc_pin(spr, false);
@@ -3929,6 +3976,432 @@ static void *cda_plate_sprite(int slot) {
     stbi_image_free(pixels);
     s_cda_plate_sprites[idx] = spr;
     return spr;
+}
+
+void *runtime_il2cpp_string(const char *utf8) {
+    return utf8 ? make_string(NULL, utf8) : NULL;
+}
+
+uint8_t *runtime_decode_png_rgba(const uint8_t *png, size_t png_sz, int *out_w, int *out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!png || png_sz == 0) return NULL;
+    int w = 0, h = 0, ch = 0;
+    stbi_set_flip_vertically_on_load(1);
+    uint8_t *pixels = stbi_load_from_memory(png, (int)png_sz, &w, &h, &ch, 4);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return NULL;
+    }
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return pixels;
+}
+
+void runtime_free_decoded_rgba(uint8_t *pixels) {
+    if (pixels) stbi_image_free(pixels);
+}
+
+void *runtime_create_texture2d_rgba(const uint8_t *rgba, int width, int height, const char *tag) {
+    return cda_create_texture2d_rgba(rgba, width, height, tag);
+}
+
+void *runtime_create_sprite_from_rgba_metrics(const uint8_t *rgba, int width, int height,
+                                            float rect_x, float rect_y, float rect_w, float rect_h,
+                                            float pivot_x, float pivot_y, float ppu,
+                                            float border_x, float border_y, float border_z, float border_w,
+                                            const char *tag) {
+    if (!rgba || width <= 0 || height <= 0) return NULL;
+    UGuiRect r = {rect_x, rect_y, rect_w > 0.0f ? rect_w : (float)width, rect_h > 0.0f ? rect_h : (float)height};
+    UGuiVec2 piv = {pivot_x, pivot_y};
+    UGuiVec4 bor = {border_x, border_y, border_z, border_w};
+    return cda_create_sprite_rgba(rgba, width, height, r, piv, ppu, bor, tag);
+}
+
+void *runtime_create_sprite_from_png(const uint8_t *png, size_t png_sz, float ppu, const char *tag) {
+    if (!png || png_sz == 0) return NULL;
+    int w = 0, h = 0, ch = 0;
+    stbi_set_flip_vertically_on_load(1);
+    uint8_t *pixels = stbi_load_from_memory(png, (int)png_sz, &w, &h, &ch, 4);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return NULL;
+    }
+    void *spr = cda_create_sprite_rgba(pixels, w, h,
+                                       (UGuiRect){0.0f, 0.0f, (float)w, (float)h},
+                                       (UGuiVec2){0.5f, 0.5f}, ppu > 0.0f ? ppu : 100.0f,
+                                       (UGuiVec4){0.0f, 0.0f, 0.0f, 0.0f},
+                                       tag ? tag : "SlideHoldSprite");
+    stbi_image_free(pixels);
+    return spr;
+}
+
+void *runtime_create_sprite_from_png_rect(const uint8_t *png, size_t png_sz,
+                                           int crop_x, int crop_y, int crop_w, int crop_h,
+                                           float ppu, float pivot_x, float pivot_y,
+                                           const char *tag) {
+    if (!png || png_sz == 0 || crop_w <= 0 || crop_h <= 0 || crop_x < 0 || crop_y < 0) return NULL;
+    int w = 0, h = 0, ch = 0;
+    stbi_set_flip_vertically_on_load(1);
+    uint8_t *pixels = stbi_load_from_memory(png, (int)png_sz, &w, &h, &ch, 4);
+    if (!pixels || w <= 0 || h <= 0 || crop_x + crop_w > w || crop_y + crop_h > h) {
+        if (pixels) stbi_image_free(pixels);
+        return NULL;
+    }
+
+    size_t row_bytes = (size_t)crop_w * 4u;
+    uint8_t *sub = (uint8_t *)malloc(row_bytes * (size_t)crop_h);
+    if (!sub) {
+        stbi_image_free(pixels);
+        return NULL;
+    }
+    for (int r = 0; r < crop_h; ++r) {
+        memcpy(sub + (size_t)r * row_bytes,
+               pixels + (((size_t)(crop_y + r) * (size_t)w + (size_t)crop_x) * 4u),
+               row_bytes);
+    }
+    stbi_image_free(pixels);
+
+    void *spr = cda_create_sprite_rgba(sub, crop_w, crop_h,
+                                       (UGuiRect){0.0f, 0.0f, (float)crop_w, (float)crop_h},
+                                       (UGuiVec2){pivot_x, pivot_y}, ppu > 0.0f ? ppu : 100.0f,
+                                       (UGuiVec4){0.0f, 0.0f, 0.0f, 0.0f},
+                                       tag ? tag : "SlideHoldRect");
+    free(sub);
+    return spr;
+}
+
+bool runtime_unity_object_alive(const void *obj) {
+    return unity_native_alive(obj);
+}
+
+bool runtime_list_remove_at(void *list, int32_t index) {
+    if (!list || index < 0) return false;
+    void *klass = object_class(list);
+    if (!klass) return false;
+    Il2CppMethodInfo *method = find_method(klass, "RemoveAt", 1);
+    if (!method || !method->pointer) return false;
+    typedef void (ABI *RemoveAtFn)(void *self, int32_t index, void *method);
+    ((RemoveAtFn)method->pointer)(list, index, method);
+    return true;
+}
+
+void *runtime_create_texture2d_from_png(const uint8_t *png, size_t png_sz, const char *tag) {
+    if (!png || png_sz == 0) return NULL;
+    int w = 0, h = 0, ch = 0;
+    stbi_set_flip_vertically_on_load(1);
+    uint8_t *pixels = stbi_load_from_memory(png, (int)png_sz, &w, &h, &ch, 4);
+    if (!pixels || w <= 0 || h <= 0) {
+        if (pixels) stbi_image_free(pixels);
+        return NULL;
+    }
+    void *tex = cda_create_texture2d_rgba(pixels, w, h, tag ? tag : "SlideHoldTex");
+    stbi_image_free(pixels);
+    return tex;
+}
+
+void *runtime_resolve_icall(const char *name) {
+    if (!name || !*name) return NULL;
+    ensure_il2cpp_api();
+    return il2cpp_resolve_icall_fn ? il2cpp_resolve_icall_fn(name) : NULL;
+}
+
+uint32_t runtime_gc_pin_obj(void *obj) {
+    return gc_pin(obj, false);
+}
+
+void runtime_gc_unpin_obj(uint32_t handle) {
+    gc_unpin(handle);
+}
+
+static inline bool cc_valid_ptr(const void *p) {
+    uintptr_t u = (uintptr_t)p;
+    return u >= 0x10000ULL && u <= 0x00007fffffffffffULL && (u & 1ULL) == 0;
+}
+
+static void *cda_get_comp(void *go, const char *full_name, const char *short_name);
+
+bool runtime_object_name_equals(void *obj, const char *ascii_name) {
+    if (!unity_native_alive(obj) || !ascii_name) return false;
+    typedef void *(ABI *GetObjNameFn)(void *o, void *method);
+    void *str = ((GetObjNameFn)GUEST(0x1dcea80))(obj, NULL);
+    if (!cc_valid_ptr(str)) return false;
+    int32_t slen = *(const int32_t *)((const char *)str + 0x10);
+    size_t tlen = strlen(ascii_name);
+    if (slen != (int32_t)tlen) return false;
+    const uint16_t *wchars = (const uint16_t *)((const char *)str + 0x14);
+    for (int32_t i = 0; i < slen; ++i) {
+        if (wchars[i] != (uint16_t)(unsigned char)ascii_name[i]) return false;
+    }
+    return true;
+}
+
+static void *s_sh_mat_class = NULL;
+typedef struct {
+    void *src_mat;
+    void *tex;
+    void *cloned_mat;
+} ShMatTexCache;
+static ShMatTexCache s_sh_mat_tex_cache[16];
+
+void *runtime_clone_material_with_main_tex(void *src_mat, void *tex) {
+    if (!unity_native_alive(src_mat) || !unity_native_alive(tex)) return src_mat;
+    for (int i = 0; i < 16; ++i) {
+        if (s_sh_mat_tex_cache[i].src_mat == src_mat &&
+            s_sh_mat_tex_cache[i].tex == tex &&
+            unity_native_alive(s_sh_mat_tex_cache[i].cloned_mat)) {
+            return s_sh_mat_tex_cache[i].cloned_mat;
+        }
+    }
+    ensure_il2cpp_api();
+    if (!s_sh_mat_class) {
+        s_sh_mat_class = find_il2cpp_class("UnityEngine", "Material");
+        if (!s_sh_mat_class) s_sh_mat_class = object_class(src_mat);
+    }
+    if (!s_sh_mat_class) return src_mat;
+    void *mat = alloc_managed_object(s_sh_mat_class);
+    if (!mat) return src_mat;
+    (void)gc_pin(mat, false);
+    typedef void (ABI *MatCtorFn)(void *self, void *source, void *method);
+    typedef void (ABI *MatSetTexFn)(void *self, void *val, void *method);
+    ((MatCtorFn)GUEST(0xe11330))(mat, src_mat, NULL);
+    ((MatSetTexFn)GUEST(0xe11d00))(mat, tex, NULL);
+    protect_cached_unity_object(mat);
+    for (int i = 0; i < 16; ++i) {
+        if (!unity_native_alive(s_sh_mat_tex_cache[i].cloned_mat)) {
+            s_sh_mat_tex_cache[i].src_mat = src_mat;
+            s_sh_mat_tex_cache[i].tex = tex;
+            s_sh_mat_tex_cache[i].cloned_mat = mat;
+            break;
+        }
+    }
+    return mat;
+}
+
+static void *s_sh_gradient_class = NULL;
+
+void *runtime_clone_gradient_solid_color(void *src_grad, float r, float g, float b) {
+    if (!cc_valid_ptr(src_grad)) return NULL;
+    ensure_il2cpp_api();
+    if (!s_sh_gradient_class) {
+        s_sh_gradient_class = find_il2cpp_class("UnityEngine", "Gradient");
+        if (!s_sh_gradient_class) s_sh_gradient_class = object_class(src_grad);
+    }
+    if (!s_sh_gradient_class) return NULL;
+
+    typedef void     (ABI *GradCtorFn)(void *self, void *method);
+    typedef void *   (ABI *GradGetKeysFn)(void *self, void *method);
+    typedef int32_t  (ABI *GradGetModeFn)(void *self, void *method);
+    typedef void     (ABI *GradSetModeFn)(void *self, int32_t mode, void *method);
+    typedef void     (ABI *GradSetKeysFn)(void *self, void *ck, void *ak, void *method);
+
+    void *ck = ((GradGetKeysFn)GUEST(0x39e62b0))(src_grad, NULL);
+    void *ak = ((GradGetKeysFn)GUEST(0x39e6360))(src_grad, NULL);
+    if (!cc_valid_ptr(ck) || !cc_valid_ptr(ak)) return NULL;
+
+    int32_t ck_cnt = *(const int32_t *)((const char *)ck + 0x18);
+    if (ck_cnt <= 0 || ck_cnt > 16) return NULL;
+    bool all_white = true;
+    for (int32_t i = 0; i < ck_cnt; ++i) {
+        const float *key_rgba = (const float *)((const char *)ck + 0x20 + (size_t)i * 20u);
+        if (key_rgba[0] < 0.96f || key_rgba[1] < 0.96f || key_rgba[2] < 0.96f) {
+            all_white = false;
+            break;
+        }
+    }
+    if (all_white) return NULL;
+
+    for (int32_t i = 0; i < ck_cnt; ++i) {
+        float *key_rgba = (float *)((char *)ck + 0x20 + (size_t)i * 20u);
+        key_rgba[0] = r;
+        key_rgba[1] = g;
+        key_rgba[2] = b;
+        key_rgba[3] = 1.0f;
+    }
+
+    void *dst = alloc_managed_object(s_sh_gradient_class);
+    if (!dst) return NULL;
+    ((GradCtorFn)GUEST(0x39e6090))(dst, NULL);
+    ((GradSetModeFn)GUEST(0x39e6460))(dst, ((GradGetModeFn)GUEST(0x39e6410))(src_grad, NULL), NULL);
+    ((GradSetKeysFn)GUEST(0x39e64c0))(dst, ck, ak, NULL);
+    (void)gc_pin(dst, false);
+    return dst;
+}
+
+void *runtime_get_particle_system_renderer(void *ps) {
+    if (!unity_native_alive(ps)) return NULL;
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
+    void *go = comp_get_go(ps, NULL);
+    return unity_native_alive(go) ? cda_get_comp(go, "UnityEngine.ParticleSystemRenderer", "ParticleSystemRenderer") : NULL;
+}
+
+void *runtime_get_component_by_name(void *go, const char *full_name, const char *short_name) {
+    return unity_native_alive(go) ? cda_get_comp(go, full_name, short_name) : NULL;
+}
+
+void *runtime_clone_material_raw(void *src_mat) {
+    if (!unity_native_alive(src_mat)) return NULL;
+    ensure_il2cpp_api();
+    if (!s_sh_mat_class) {
+        s_sh_mat_class = find_il2cpp_class("UnityEngine", "Material");
+        if (!s_sh_mat_class) s_sh_mat_class = object_class(src_mat);
+    }
+    if (!s_sh_mat_class) return NULL;
+    void *mat = alloc_managed_object(s_sh_mat_class);
+    if (!mat) return NULL;
+    (void)gc_pin(mat, false);
+    typedef void (ABI *MatCtorFn)(void *self, void *source, void *method);
+    ((MatCtorFn)GUEST(0xe11330))(mat, src_mat, NULL);
+    protect_cached_unity_object(mat);
+    return mat;
+}
+
+void runtime_destroy_unity_object_imm(void *obj) {
+    if (!unity_native_alive(obj)) return;
+    ensure_il2cpp_api();
+    void *obj_cls = find_il2cpp_class("UnityEngine", "Object");
+    Il2CppMethodInfo *m_destroy = obj_cls ? find_method(obj_cls, "DestroyImmediate", 1) : NULL;
+    if (m_destroy && m_destroy->pointer) {
+        typedef void (ABI *DestroyImmFn)(void *o, void *method);
+        ((DestroyImmFn)m_destroy->pointer)(obj, m_destroy);
+    }
+}
+
+uint8_t *runtime_extract_texture_rgba(void *tex, int *out_w, int *out_h) {
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (!unity_native_alive(tex)) return NULL;
+    ensure_il2cpp_api();
+    if (!s_texture2d_class) {
+        s_texture2d_class = find_il2cpp_class("UnityEngine", "Texture2D");
+    }
+    void *tex_cls = find_il2cpp_class("UnityEngine", "Texture");
+    void *rt_cls  = find_il2cpp_class("UnityEngine", "RenderTexture");
+    void *gfx_cls = find_il2cpp_class("UnityEngine", "Graphics");
+    if (!s_texture2d_class || !tex_cls || !rt_cls || !gfx_cls) return NULL;
+
+    Il2CppMethodInfo *m_get_w    = find_method(tex_cls, "get_width", 0);
+    Il2CppMethodInfo *m_get_h    = find_method(tex_cls, "get_height", 0);
+    Il2CppMethodInfo *m_get_act  = find_method(rt_cls, "get_active", 0);
+    Il2CppMethodInfo *m_set_act  = find_method(rt_cls, "set_active", 1);
+    Il2CppMethodInfo *m_get_tmp  = find_method(rt_cls, "GetTemporary", 2);
+    Il2CppMethodInfo *m_rel_tmp  = find_method(rt_cls, "ReleaseTemporary", 1);
+    Il2CppMethodInfo *m_blit     = find_method(gfx_cls, "Blit", 2);
+    Il2CppMethodInfo *m_read_pix = find_method(s_texture2d_class, "ReadPixels", 4);
+    Il2CppMethodInfo *m_get_p32  = find_method(s_texture2d_class, "GetPixels32", 0);
+    if (!m_get_w || !m_get_h || !m_get_act || !m_set_act || !m_get_tmp || !m_rel_tmp ||
+        !m_blit || !m_read_pix || !m_get_p32) {
+        return NULL;
+    }
+
+    typedef int32_t (ABI *TexIntFn)(void *self, void *m);
+    typedef void *  (ABI *RtGetActFn)(void *m);
+    typedef void    (ABI *RtSetActFn)(void *rt, void *m);
+    typedef void *  (ABI *RtGetTmpFn)(int32_t w, int32_t h, void *m);
+    typedef void    (ABI *RtRelTmpFn)(void *rt, void *m);
+    typedef void    (ABI *BlitFn)(void *src, void *dst, void *m);
+    typedef void    (ABI *ReadPixFn)(void *self, UGuiRect src, int32_t dx, int32_t dy, bool recalc, void *m);
+    typedef void *  (ABI *GetP32Fn)(void *self, void *m);
+
+    int32_t w = ((TexIntFn)m_get_w->pointer)(tex, m_get_w);
+    int32_t h = ((TexIntFn)m_get_h->pointer)(tex, m_get_h);
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return NULL;
+
+    void *prev_rt = ((RtGetActFn)m_get_act->pointer)(m_get_act);
+    void *rt = ((RtGetTmpFn)m_get_tmp->pointer)(w, h, m_get_tmp);
+    if (!unity_native_alive(rt)) return NULL;
+
+    ((BlitFn)m_blit->pointer)(tex, rt, m_blit);
+    ((RtSetActFn)m_set_act->pointer)(rt, m_set_act);
+
+    void *tmp = alloc_managed_object(s_texture2d_class);
+    uint8_t *out = NULL;
+    if (tmp) {
+        uint32_t pin = gc_pin(tmp, false);
+        TexCtorFn tex_ctor = (TexCtorFn)GUEST(0x39d63f0);
+        tex_ctor(tmp, w, h, 4 /* RGBA32 */, false, NULL);
+        UGuiRect r = {0.0f, 0.0f, (float)w, (float)h};
+        ((ReadPixFn)m_read_pix->pointer)(tmp, r, 0, 0, false, m_read_pix);
+        void *arr = ((GetP32Fn)m_get_p32->pointer)(tmp, m_get_p32);
+        if (cc_valid_ptr(arr)) {
+            int32_t len = *(const int32_t *)((const char *)arr + 0x18);
+            size_t total = (size_t)w * (size_t)h;
+            if ((size_t)len >= total) {
+                size_t bytes = total * 4u;
+                out = (uint8_t *)malloc(bytes);
+                if (out) {
+                    memcpy(out, (const char *)arr + 0x20, bytes);
+                    if (out_w) *out_w = w;
+                    if (out_h) *out_h = h;
+                }
+            }
+        }
+        runtime_destroy_unity_object_imm(tmp);
+        gc_unpin(pin);
+    }
+
+    ((RtSetActFn)m_set_act->pointer)(prev_rt, m_set_act);
+    ((RtRelTmpFn)m_rel_tmp->pointer)(rt, m_rel_tmp);
+    return out;
+}
+
+void runtime_free_extracted_rgba(uint8_t *pixels) {
+    if (pixels) free(pixels);
+}
+
+void *runtime_create_child_sprite_renderer(void *base_sr, void *parent_tr, const char *name) {
+    ensure_il2cpp_api();
+    if (!unity_native_alive(base_sr) || !unity_native_alive(parent_tr)) return NULL;
+    static void *s_go_klass = NULL;
+    if (!s_go_klass) s_go_klass = find_il2cpp_class("UnityEngine", "GameObject");
+    if (!s_go_klass) return NULL;
+
+    typedef void (ABI *GoCtorFn)(void *self, void *name_str, void *method);
+    typedef void *(ABI *GetTypeFn)(void *obj, void *method);
+    typedef void *(ABI *AddCompFn)(void *go, void *type_obj, void *method);
+    typedef void *(ABI *GoGetTrFn)(void *go, void *method);
+    typedef void (ABI *SetParentFn)(void *tr, void *parent, bool world_pos_stays, void *method);
+    typedef void *(ABI *CompGetGoFn)(void *comp, void *method);
+    typedef int32_t (ABI *GetLayerFn)(void *go, void *method);
+    typedef void (ABI *SetLayerFn)(void *go, int32_t layer, void *method);
+    typedef void *(ABI *GetMatFn)(void *rend, void *method);
+    typedef void (ABI *SetMatFn)(void *rend, void *mat, void *method);
+
+    GoCtorFn go_ctor       = (GoCtorFn)GUEST(0x1dcab80);
+    GetTypeFn get_type     = (GetTypeFn)GUEST(0x371b7d0);
+    AddCompFn add_comp     = (AddCompFn)GUEST(0x1dca3a0);
+    GoGetTrFn go_get_tr    = (GoGetTrFn)GUEST(0x1dca400);
+    SetParentFn set_parent = (SetParentFn)GUEST(0x1dd90a0);
+    CompGetGoFn comp_go    = (CompGetGoFn)GUEST(0x1dc8910);
+    GetLayerFn get_layer   = (GetLayerFn)GUEST(0x1dca450);
+    SetLayerFn set_layer   = (SetLayerFn)GUEST(0x1dca4a0);
+    GetMatFn get_mat       = (GetMatFn)GUEST(0x0e09be0);
+    SetMatFn set_mat       = (SetMatFn)GUEST(0x0e09c30);
+
+    void *sr_type = get_type(base_sr, NULL);
+    if (!sr_type) return NULL;
+
+    void *go = alloc_managed_object(s_go_klass);
+    if (!go) return NULL;
+    go_ctor(go, make_string(NULL, name ? name : "SHArrow"), NULL);
+
+    void *tr = go_get_tr(go, NULL);
+    if (!unity_native_alive(tr)) return NULL;
+    set_parent(tr, parent_tr, false, NULL);
+
+    void *base_go = comp_go(base_sr, NULL);
+    if (unity_native_alive(base_go)) {
+        set_layer(go, get_layer(base_go, NULL), NULL);
+    }
+
+    void *sr = add_comp(go, sr_type, NULL);
+    if (!unity_native_alive(sr)) return NULL;
+
+    void *mat = get_mat(base_sr, NULL);
+    if (unity_native_alive(mat)) {
+        set_mat(sr, mat, NULL);
+    }
+    return sr;
 }
 
 static void *s_cda_blue_variants[6][2];
@@ -6363,6 +6836,9 @@ static ABI int hook_trigger_data_loader_get_address(HookRegs *r) {
 }
 
 static ABI int hook_runtime_context_setup(HookRegs *r) {
+    runtime_slidehold_reset_playback();
+    runtime_slidehold_set_auto_mode((r->r8 & 0xffULL) != 0);
+
     int slot = find_chart_slot_by_bytes((const void *)r->rsi);
     if (slot >= 0 && slot < MAX_SLOTS) {
         s_gameplay_chart_slot = slot;
@@ -7409,6 +7885,16 @@ static const Hook custom_hooks[] = {
     {0x1dcd740, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_size, 0, 104},
 
     /* v1.0.4 Stage, Judgements, & Native Page 3 Results hooks */
+    {0x2719a30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_create_triggers_movenext, 0, 104},
+    {0x271f7e0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_visible, 0, 104},
+    {0x2724340, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_fade, 0, 104},
+    {0x2723d90, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_set_simple_type, 0, 104},
+    {0x2724090, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_simple_color, 0, 104},
+    {0x243df90, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_se, 0, 104},
+    {0x32d1800, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_runtime_update, 0, 104},
+    {0x32d3160, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_miss_judge, 0, 104},
+    {0x32febc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_bms_update_holding, 0, 104},
+    {0x2fec920, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_play_judge_effect, 0, 104},
     {0x339d6a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_start, 0, 104},
     {0x339cbe0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_init, 0, 104},
     {0x338c400, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_finish, 0, 104},
@@ -7565,6 +8051,7 @@ int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, un
     /* Detect game version: 1.0.4+ has UIListItem::RefreshView at 0x28c8990 */
     is_game_104 = (memcmp(module + 0x28c8990, "\x55\x48\x89\xe5\x41\x57\x41\x56", 8) == 0);
     printf("CustomCharts: detected game version %s\n", is_game_104 ? "1.0.4+" : "1.0.0");
+    if (is_game_104) runtime_slidehold_init(module);
 
     il2cpp_runtime_class_init_fn = (void (ABI *)(void *))GUEST_CALL(0x045b590, 0x045b590);
 
@@ -7601,6 +8088,9 @@ int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, un
         else if (custom_hooks[i].offset == 0x0b60660) orig_ptr = &original_series_convert;
         else if (custom_hooks[i].offset == 0x0b60ad0) orig_ptr = &original_sound_labels;
         else if (custom_hooks[i].offset == 0x1e1c250) orig_ptr = &original_get_assets;
+        else if (custom_hooks[i].offset == 0x2719a30) orig_ptr = (void **)&original_create_triggers_movenext;
+        else if (custom_hooks[i].offset == 0x32d1800) orig_ptr = (void **)&original_runtime_context_update;
+        else if (custom_hooks[i].offset == 0x2fec920) orig_ptr = (void **)&original_play_judge_effect;
         else if (custom_hooks[i].offset == 0x339cbe0 || custom_hooks[i].offset == 0x335abc0) orig_ptr = &original_theater_begin_init;
         else if (custom_hooks[i].offset == 0x12c4750 || custom_hooks[i].offset == 0x1246de0) orig_ptr = (void **)&original_need_update_best_score;
         else if (custom_hooks[i].offset == 0x16978e0) orig_ptr = &original_menu_add_song;

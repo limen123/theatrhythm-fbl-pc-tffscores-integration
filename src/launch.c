@@ -246,7 +246,7 @@ static void report_crash(const char *log_dir, unsigned long code) {
     snprintf(message, sizeof message,
              "The game closed unexpectedly (exit code 0x%08lx%s%s).\n\nIts log was kept as:\n%s\n\n"
              "Please attach that file when you report the problem at\n"
-             "https://github.com/YAPhoa/theatrhythm-fbl-pc/issues",
+             "https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/issues",
              code, meaning[0] ? ": " : "", meaning, crash);
     fprintf(stderr, "ERROR: %s\n", message);
 #ifdef _WIN32

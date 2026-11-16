@@ -300,8 +300,9 @@ private:
     struct RecentTarget {
         VAddr address;
         u32 extent;
-        u64 frame; ///< GPU frame of the last draw
-        u64 since; ///< GPU frame the current run of draws started
+        u64 frame;   ///< GPU frame of the last draw
+        u64 since;   ///< GPU frame the current run of draws started
+        u64 time_ns; ///< steady_clock nanoseconds of the last draw
     };
     std::vector<RecentTarget> recent_targets;
     u64 recent_targets_pruned = 0;

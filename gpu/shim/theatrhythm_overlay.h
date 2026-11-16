@@ -57,6 +57,7 @@ bool CapturesInput();
 
 /// Any thread: the Display Settings panel (also F10). It saves settings.ini when it closes.
 void OpenDisplaySettings();
+void OpenNoteSkins();
 bool DisplaySettingsOpen();
 
 /// Any thread: F4 was pressed since the last call (the game's "Exit the game?" window).

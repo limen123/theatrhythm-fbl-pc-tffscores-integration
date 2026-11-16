@@ -299,10 +299,12 @@ static uint32_t sample_keyboard(PadData *d, const bool *keys, uint32_t mouse) {
     return pressed;
 }
 
-/* Prompt icons for a pad: PlayStation ones when its bottom face button is Cross, else Xbox. */
+/* Prompt icons for a pad: PlayStation when South is Cross, Switch when South is B, else Xbox. */
 static int pad_icons(SDL_Gamepad *g) {
-    return SDL_GetGamepadButtonLabel(g,SDL_GAMEPAD_BUTTON_SOUTH)==SDL_GAMEPAD_BUTTON_LABEL_CROSS ?
-           BUTTON_ICONS_PS4 : BUTTON_ICONS_XBOX;
+    const SDL_GamepadButtonLabel south=SDL_GetGamepadButtonLabel(g,SDL_GAMEPAD_BUTTON_SOUTH);
+    if (south==SDL_GAMEPAD_BUTTON_LABEL_CROSS) return BUTTON_ICONS_PS4;
+    if (south==SDL_GAMEPAD_BUTTON_LABEL_B) return BUTTON_ICONS_SWITCH;
+    return BUTTON_ICONS_XBOX;
 }
 /* A stick past half way: a resting stick's drift never gets there. */
 static bool stick_pushed(const PadData *d) {
@@ -318,7 +320,7 @@ static void host_read(PadData *d, SDL_Gamepad *g, uint8_t connected_count) {
     d->orientation[3]=1.0f;
     d->connected=1; d->connected_count=connected_count ? connected_count : 1;
     if (theatrhythm_gpu_overlay_captures_input()) return; /* a dialog is open: neutral input */
-    const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    const bool *k=(SDL_WasInit(SDL_INIT_VIDEO) && SDL_GetKeyboardFocus()!=NULL) ? SDL_GetKeyboardState(NULL) : NULL;
     load_button_maps();
     if (g) {
         for (size_t i=0;i<pad_map.count;++i)
@@ -343,7 +345,16 @@ static void host_read(PadData *d, SDL_Gamepad *g, uint8_t connected_count) {
             }
         }
         /* The prompts follow the device the player last used (runtime_button_icons.c). */
-        if (d->buttons || d->touch_count || stick_pushed(d)) runtime_button_icons_input(pad_icons(g));
+        if (d->buttons || d->touch_count || stick_pushed(d)) {
+            const int icons=pad_icons(g);
+            runtime_button_icons_input(icons);
+            static int last_pad_icons=-1;
+            if (icons!=last_pad_icons) {
+                static const char *const names[BUTTON_ICONS_SETS]={"ps4","xbox","switch","keyboard"};
+                theatrhythm_gpu_set_active_button_icons(names[icons]);
+                last_pad_icons=icons;
+            }
+        }
     }
     /* The keyboard and mouse work with or without a gamepad: their buttons add to the pad's, and a
      * stick follows the keys only while one of them is held. */
@@ -359,8 +370,20 @@ static void *host_thread(void *arg) {
     uint64_t next_scan=0, rumble_sent=0;
     uint32_t rumble_serial=0;
     uint8_t connected_count=0;
+    int last_bg=-1;
+    char last_mode[16]="";
     for (;;) {
         const uint64_t start=now_us();
+        const int bg=theatrhythm_gpu_background_controller();
+        if (bg!=last_bg) {
+            SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,bg ? "1" : "0");
+            last_bg=bg;
+        }
+        const char *mode=theatrhythm_button_icons();
+        if (mode && strcmp(last_mode,mode)) {
+            snprintf(last_mode,sizeof(last_mode),"%s",mode);
+            runtime_button_icons_set_mode(mode);
+        }
         if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
         if (sdl_ready>0) g=host_gamepad(g,start,&next_scan,&connected_count);
         PadData d;
@@ -411,7 +434,7 @@ static void read_inject(void) {
     FILE *f=fopen(path,"r");
     if (!f) return;
     static const char *sticks[]={"lx=","ly=","rx=","ry="};
-    static const char *devices[BUTTON_ICONS_SETS]={"device=ps4","device=xbox","device=keyboard"};
+    static const char *devices[BUTTON_ICONS_SETS]={"device=ps4","device=xbox","device=switch","device=keyboard"};
     injected.buttons=0;
     injected.device=-1;
     for (int i=0;i<4;++i) injected.stick[i]=-1;
@@ -506,11 +529,13 @@ static void replay_sample(PadData *d) {
 enum { NO_STEP_US=80000 };
 static struct { uint64_t start; int active, held; } prompt_no;
 static void exit_prompt_no(PadData *d) {
-    const uint32_t keys=BTN_CIRCLE|BTN_OPTIONS, played=keys|BTN_LEFT|BTN_CROSS;
+    const int swap=theatrhythm_gpu_menu_confirm_swap();
+    const uint32_t cancel=swap ? BTN_CROSS : BTN_CIRCLE, confirm=swap ? BTN_CIRCLE : BTN_CROSS;
+    const uint32_t keys=cancel|BTN_OPTIONS, played=keys|BTN_LEFT|confirm;
     const int open=runtime_exit_prompt_open();
     if (prompt_no.active && open) {
         const uint64_t t=now_us()-prompt_no.start;
-        d->buttons=t<NO_STEP_US ? BTN_LEFT : t>=2*NO_STEP_US && t<3*NO_STEP_US ? BTN_CROSS : 0;
+        d->buttons=t<NO_STEP_US ? BTN_LEFT : t>=2*NO_STEP_US && t<3*NO_STEP_US ? confirm : 0;
         if (t>=4*NO_STEP_US) prompt_no.active=0; /* the window is still open: the key may try again */
         return;
     }
@@ -585,6 +610,39 @@ static ABI int32_t pad_close(int32_t handle) {
 static void (*pad_confirm_hook)(void);
 void runtime_pad_set_confirm_hook(void (*hook)(void)) {
     __atomic_store_n(&pad_confirm_hook, hook, __ATOMIC_RELEASE);
+}
+
+void runtime_pad_get_sticks(float *lx, float *ly, float *rx, float *ry) {
+    if (theatrhythm_gpu_overlay_captures_input()) {
+        if (lx) *lx = 0.0f;
+        if (ly) *ly = 0.0f;
+        if (rx) *rx = 0.0f;
+        if (ry) *ry = 0.0f;
+        return;
+    }
+    pthread_mutex_lock(&host_lock);
+    const PadData d = host_sample;
+    pthread_mutex_unlock(&host_lock);
+
+    const uint8_t raw_lx = (injected.stick[0] >= 0) ? (uint8_t)injected.stick[0] : d.left_x;
+    const uint8_t raw_ly = (injected.stick[1] >= 0) ? (uint8_t)injected.stick[1] : d.left_y;
+    const uint8_t raw_rx = (injected.stick[2] >= 0) ? (uint8_t)injected.stick[2] : d.right_x;
+    const uint8_t raw_ry = (injected.stick[3] >= 0) ? (uint8_t)injected.stick[3] : d.right_y;
+
+    float norm_lx = (float)((int)raw_lx - 128) / 127.0f;
+    float norm_ly = (float)(128 - (int)raw_ly) / 127.0f;
+    float norm_rx = (float)((int)raw_rx - 128) / 127.0f;
+    float norm_ry = (float)(128 - (int)raw_ry) / 127.0f;
+
+    if (norm_lx < -1.0f) norm_lx = -1.0f; else if (norm_lx > 1.0f) norm_lx = 1.0f;
+    if (norm_ly < -1.0f) norm_ly = -1.0f; else if (norm_ly > 1.0f) norm_ly = 1.0f;
+    if (norm_rx < -1.0f) norm_rx = -1.0f; else if (norm_rx > 1.0f) norm_rx = 1.0f;
+    if (norm_ry < -1.0f) norm_ry = -1.0f; else if (norm_ry > 1.0f) norm_ry = 1.0f;
+
+    if (lx) *lx = norm_lx;
+    if (ly) *ly = norm_ly;
+    if (rx) *rx = norm_rx;
+    if (ry) *ry = norm_ry;
 }
 
 static ABI int32_t pad_read_state(int32_t handle, PadData *data) {

@@ -41,7 +41,7 @@ int runtime_file_mount(const char *guest, const char *host) { snprintf(mount_of(
 void runtime_file_unmount(const char *guest) { mount_of(guest)[0]=0; }
 
 static const char *dir="out/button-icons-scratch", *pad_dir="out/button-icons-scratch/pad";
-static unsigned char sets[BUTTON_ICONS_SETS][TEXTURE_BYTES], pads[2][PAD_BYTES];
+static unsigned char sets[BUTTON_ICONS_SETS][TEXTURE_BYTES], pads[3][PAD_BYTES];
 static void write_in(const char *folder, const char *name, const void *data, size_t size) {
     char path[256]; snprintf(path,sizeof(path),"%s/%s",folder,name);
     FILE *f=fopen(path,"wb"); assert(f); assert(fwrite(data,1,size,f)==size); assert(!fclose(f));
@@ -50,8 +50,10 @@ static void write_file(const char *name, const void *data, size_t size) { write_
 static void expect_pad(int set) {
     char want[600]="";
     if (set==BUTTON_ICONS_XBOX) snprintf(want,sizeof(want),"%s/xbox.bundle",pad_dir);
+    else if (set==BUTTON_ICONS_SWITCH) snprintf(want,sizeof(want),"%s/switch.bundle",pad_dir);
+    const int idx=set==BUTTON_ICONS_XBOX ? 1 : set==BUTTON_ICONS_SWITCH ? 2 : 0;
     assert(!strcmp(pad_mounted[0],want) && !strcmp(pad_mounted[1],want));
-    assert(!memcmp(memory+PAD_ATLAS,pads[set==BUTTON_ICONS_XBOX],PAD_BYTES));
+    assert(!memcmp(memory+PAD_ATLAS,pads[idx],PAD_BYTES));
     assert(runtime_button_icons_pad()==set);
 }
 static void expect_mount(const char *name) {
@@ -69,22 +71,25 @@ static void use(int set) {
 
 int main(void) {
     mkdir("out",0755); mkdir(dir,0755); mkdir(pad_dir,0755);
-    /* Three sets alike except here and there, as icon sheets are (transparent areas match). */
+    /* Four sets alike except here and there, as icon sheets are (transparent areas match). */
     for (int set=0;set<BUTTON_ICONS_SETS;++set) {
         for (size_t i=0;i<TEXTURE_BYTES;++i) sets[set][i]=(unsigned char)(i*31u>>3);
         for (size_t i=4096;i<TEXTURE_BYTES;i+=4096) sets[set][i]^=(unsigned char)(set*0x55+1);
-        static const char *names[]={"ps4.texture","xbox.texture","keyboard.texture"};
+        static const char *names[BUTTON_ICONS_SETS]={"ps4.texture","xbox.texture","switch.texture","keyboard.texture"};
         write_file(names[set],sets[set],TEXTURE_BYTES);
     }
     write_file("xbox.bundle","x",1);
+    write_file("switch.bundle","s",1);
     write_file("keyboard.bundle","k",1);
-    for (int set=0;set<2;++set) {
+    for (int set=0;set<3;++set) {
         for (size_t i=0;i<PAD_BYTES;++i) pads[set][i]=(unsigned char)(i*13u>>2);
         for (size_t i=8192;i<PAD_BYTES;i+=8192) pads[set][i]^=(unsigned char)(set*0x33+7);
     }
     write_in(pad_dir,"ps4.texture",pads[0],PAD_BYTES);
     write_in(pad_dir,"xbox.texture",pads[1],PAD_BYTES);
+    write_in(pad_dir,"switch.texture",pads[2],PAD_BYTES);
     write_in(pad_dir,"xbox.bundle","p",1);
+    write_in(pad_dir,"switch.bundle","w",1);
 
     /* A fixed set only mounts its bundles (the pad has none for keyboard). */
     runtime_button_icons_configure(dir,pad_dir,"keyboard");
@@ -94,6 +99,10 @@ int main(void) {
     runtime_button_icons_configure(dir,pad_dir,"xbox");
     expect_mount("xbox");
     assert(!strcmp(pad_mounted[0],"out/button-icons-scratch/pad/xbox.bundle") && runtime_button_icons_pad()==BUTTON_ICONS_XBOX);
+    memset(mounted,0,sizeof(mounted)); memset(pad_mounted,0,sizeof(pad_mounted));
+    runtime_button_icons_configure(dir,pad_dir,"switch");
+    expect_mount("switch");
+    assert(!strcmp(pad_mounted[0],"out/button-icons-scratch/pad/switch.bundle") && runtime_button_icons_pad()==BUTTON_ICONS_SWITCH);
     memset(mounted,0,sizeof(mounted)); memset(pad_mounted,0,sizeof(pad_mounted));
     runtime_button_icons_configure(dir,pad_dir,"ps4");
     expect_mount(NULL);
@@ -141,6 +150,26 @@ int main(void) {
     use(BUTTON_ICONS_KEYBOARD);
     assert(!memcmp(memory+0x80000,sets[BUTTON_ICONS_KEYBOARD],TEXTURE_BYTES));
     assert(invalidations==4 && invalidated==GUEST+0x80000);
+
+    /* Switch set in auto mode and live fixed/auto transitions. */
+    use(BUTTON_ICONS_SWITCH);
+    assert(!memcmp(memory+0x80000,sets[BUTTON_ICONS_SWITCH],TEXTURE_BYTES));
+    expect_mount("switch");
+    expect_pad(BUTTON_ICONS_SWITCH);
+    runtime_button_icons_set_mode("xbox");
+    pthread_mutex_lock(&lock);
+    while (shown!=BUTTON_ICONS_XBOX) pthread_cond_wait(&wake,&lock);
+    pthread_mutex_unlock(&lock);
+    assert(!memcmp(memory+0x80000,sets[BUTTON_ICONS_XBOX],TEXTURE_BYTES));
+    expect_mount("xbox");
+    expect_pad(BUTTON_ICONS_XBOX);
+    runtime_button_icons_input(BUTTON_ICONS_PS4); /* ignored while fixed mode is active */
+    assert(wanted==BUTTON_ICONS_XBOX);
+    runtime_button_icons_set_mode("auto");
+    use(BUTTON_ICONS_PS4);
+    assert(!memcmp(memory+0x80000,sets[BUTTON_ICONS_PS4],TEXTURE_BYTES));
+    expect_mount(NULL);
+    expect_pad(BUTTON_ICONS_PS4);
     puts("button icons: ok");
     return 0;
 }

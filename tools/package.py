@@ -85,7 +85,8 @@ ICON = PORT / 'packaging' / 'windows' / 'theatrhythm-fbl.ico'
 # What prepare/run.py needs: the scripts, the assets they read and the template of settings.ini.
 PREPARE_FILES = ['run.py', 'settings.example.ini', *sorted(f'scripts/{p.name}' for p in (PORT / 'scripts').glob('*.py')),
                  *sorted(f'assets/button_icons/{p.name}' for p in (PORT / 'assets' / 'button_icons').glob('*.bc7')),
-                 'assets/config_icon/display.bc7', 'assets/controller_pad/xbox.bc7']
+                 *sorted(f'assets/config_icon/{p.name}' for p in (PORT / 'assets' / 'config_icon').glob('*.bc7')),
+                 *sorted(f'assets/controller_pad/{p.name}' for p in (PORT / 'assets' / 'controller_pad').glob('*.bc7'))]
 # The DLC maker's release (--dlcmaker): its program and the ffmpeg it runs.
 DLCMAKER = PORT / 'tools' / 'dlcmaker'
 DLCMAKER_EXE = DLCMAKER / 'app' / 'out' / ('theatrhythm-dlcmaker' if LINUX else 'theatrhythm-dlcmaker.exe')
@@ -105,9 +106,15 @@ eboot.bin, sce_module, sce_sys and Media. No game files are included.
 Run theatrhythm-setup.exe again to change the game or save folder. After unpacking a newer release
 over this folder, run it once more: it keeps your folders and settings.
 
-Custom songs: the DLC maker, a separate download on the releases page, turns your own music,
-charts and art into add-on packs and installs them into your save folder. How to use it:
-https://github.com/YAPhoa/theatrhythm-fbl-pc/tree/master/tools/dlcmaker
+Custom songs: create or convert charts with DupliConverter (a separate download on the releases
+page) and place song folders into CustomCharts/ next to the game or inside your save folder,
+or use the DLC maker for add-on packs.
+
+Online leaderboards & cloud saves (TFFScores): press F9 in-game (or use the F10 overlay) to log
+in to tffscores.com, automatically back up your saves, and upload Personal Best score proofs.
+
+More info & source:
+https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration
 
 settings.ini (made by the setup) holds the window, audio and control options; one in your save
 folder is read instead, and the in-game Options > Display Settings page (or F10) saves the display
@@ -133,9 +140,15 @@ eboot.bin, sce_module, sce_sys and Media. No game files are included.
 Run theatrhythm-setup again to change the game or save folder. After unpacking a newer release
 over this folder, run it once more: it keeps your folders and settings.
 
-Custom songs: the DLC maker, a separate download on the releases page, turns your own music,
-charts and art into add-on packs and installs them into your save folder. How to use it:
-https://github.com/YAPhoa/theatrhythm-fbl-pc/tree/master/tools/dlcmaker
+Custom songs: create or convert charts with DupliConverter (a separate download on the releases
+page) and place song folders into CustomCharts/ next to the game or inside your save folder,
+or use the DLC maker for add-on packs.
+
+Online leaderboards & cloud saves (TFFScores): press F9 in-game (or use the F10 overlay) to log
+in to tffscores.com, automatically back up your saves, and upload Personal Best score proofs.
+
+More info & source:
+https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration
 
 settings.ini (made by the setup) holds the window, audio and control options; one in your save
 folder is read instead, and the in-game Options > Display Settings page (or F10) saves the display
@@ -159,7 +172,7 @@ Put {exe} in the game's release folder, and it takes the game and save folders f
 there; anywhere else, pick them in its window.
 
 How to use it, the project folder and the chart format:
-https://github.com/YAPhoa/theatrhythm-fbl-pc/tree/master/tools/dlcmaker
+https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/tree/master/tools/dlcmaker
 
 It brings its own ffmpeg (FFmpeg 9.0.2 with x264, both GPL). {needs}
 Source and license (GPL-2.0-or-later): see LICENSE.txt. Third-party parts (FFmpeg, x264, dav1d,

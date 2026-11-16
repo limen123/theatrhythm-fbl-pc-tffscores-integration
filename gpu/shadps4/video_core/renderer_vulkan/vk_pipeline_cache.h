@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_async_compiler.h"
+#include "video_core/renderer_vulkan/vk_async_skip_budget.h"
 
 template <>
 struct std::hash<vk::ShaderModule> {
@@ -69,8 +70,8 @@ struct Program {
     /// theatrhythm: an async build failed; the next lookup builds it once on the GPU thread.
     bool retry_initial = false;
     std::vector<Shader::StageSpecialization> retry_permutations;
-    /// theatrhythm: GPU frame of the first draw skipped because no build could be queued.
-    u64 skipped_since = ~u64{};
+    /// theatrhythm: first skip timestamp/frame when no build could be queued.
+    AsyncSkipWindow skipped_since{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -255,7 +256,7 @@ private:
     /// theatrhythm: graphics keys whose draws are skipped: GPU frame of the first skip, and
     /// failures (1: the async build failed, the next draw builds it here; 2: that failed too).
     struct GraphicsMiss {
-        u64 since = ~u64{};
+        AsyncSkipWindow since{};
         u8 failures = 0;
     };
     tsl::robin_map<GraphicsPipelineKey, GraphicsMiss> graphics_misses;

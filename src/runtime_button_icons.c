@@ -23,14 +23,14 @@
 #define TEXTURE_ALIGN 256        /* GCN texture base addresses are in 256-byte units */
 #define MAX_COPIES 8
 static const char *const prefixes[]={"/app0/","/archive/mount/point/"}; /* both paths the game may use */
-static const char *const set_names[BUTTON_ICONS_SETS]={"ps4","xbox","keyboard"};
+static const char *const set_names[BUTTON_ICONS_SETS]={"ps4","xbox","switch","keyboard"};
 
 typedef struct {
     const char *what, *bundle;
     size_t bytes;
     int drawn[BUTTON_ICONS_SETS]; /* the set each set shows (the pad: keyboard shows ps4) */
     char folder[512];
-    int enabled;                  /* auto: every texture loaded and told apart */
+    int enabled;                  /* worker assets loaded and probes found */
     unsigned char *textures[BUTTON_ICONS_SETS];
     size_t probe_offset;          /* 8 bytes that differ between every two drawn sets */
     uint64_t probes[BUTTON_ICONS_SETS];
@@ -39,13 +39,17 @@ typedef struct {
 enum { ICONS, PAD, ATLASES };
 static Atlas atlases[ATLASES]={
     {.what="Button icons",.bundle="Media/StreamingAssets/aa/PS4/26f8caa7ece23b9c50dba3f9dd2af58f.bundle",
-     .bytes=TEXTURE_BYTES,.drawn={BUTTON_ICONS_PS4,BUTTON_ICONS_XBOX,BUTTON_ICONS_KEYBOARD}},
+     .bytes=TEXTURE_BYTES,.drawn={BUTTON_ICONS_PS4,BUTTON_ICONS_XBOX,BUTTON_ICONS_SWITCH,BUTTON_ICONS_KEYBOARD}},
     {.what="Xbox pad",.bundle="Media/StreamingAssets/aa/PS4/d9bc0bbf58d9e64cfb82c0837f3ab818.bundle",
-     .bytes=PAD_BYTES,.drawn={BUTTON_ICONS_PS4,BUTTON_ICONS_XBOX,BUTTON_ICONS_PS4}},
+     .bytes=PAD_BYTES,.drawn={BUTTON_ICONS_PS4,BUTTON_ICONS_XBOX,BUTTON_ICONS_SWITCH,BUTTON_ICONS_PS4}},
 };
 
 static int automatic;
-static int fixed_pad=BUTTON_ICONS_PS4; /* the pad set a fixed setting mounted */
+static int configured;
+static int worker_started;
+static int current_mode=-1; /* -2 unset, -1 auto, >=0 fixed set */
+static int last_auto_input=BUTTON_ICONS_PS4;
+static int fixed_pad=BUTTON_ICONS_PS4; /* the pad set a fixed setting shows */
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wake=PTHREAD_COND_INITIALIZER;
 static int wanted=BUTTON_ICONS_PS4, shown=BUTTON_ICONS_PS4; /* nothing mounted: the game's own icons */
@@ -189,42 +193,98 @@ static int mount_fixed(const Atlas *a, int set) {
     return 0;
 }
 
-void runtime_button_icons_configure(const char *icons, const char *pad, const char *mode) {
-    snprintf(atlases[ICONS].folder,sizeof(atlases[ICONS].folder),"%s",icons);
-    snprintf(atlases[PAD].folder,sizeof(atlases[PAD].folder),"%s",pad);
-    int fixed=-1;
-    for (int set=0;set<BUTTON_ICONS_SETS;++set) if (!strcmp(mode,set_names[set])) fixed=set;
-    if (fixed==BUTTON_ICONS_PS4) return;
-    if (fixed>0) {
-        mount_fixed(&atlases[ICONS],fixed);
-        if (mount_fixed(&atlases[PAD],fixed)) fixed_pad=atlases[PAD].drawn[fixed];
-        return;
-    }
-    if (strcmp(mode,"auto")) return;
+static int ensure_worker(void) {
+    if (worker_started) return 1;
     int any=0;
-    for (int i=0;i<ATLASES;++i) any|=atlases[i].enabled=load_atlas(&atlases[i]);
-    if (!any) return;
+    for (int i=0;i<ATLASES;++i) {
+        if (!atlases[i].enabled) atlases[i].enabled=load_atlas(&atlases[i]);
+        any|=atlases[i].enabled;
+    }
+    if (!any) return 0;
     pthread_t thread;
     if (pthread_create(&thread,NULL,worker,NULL)) {
         puts("Button icons: no worker thread; PS4 icons and pad");
         for (int i=0;i<ATLASES;++i) atlases[i].enabled=0;
-        return;
+        return 0;
     }
     pthread_detach(thread);
+    worker_started=1;
+    return 1;
+}
+
+static int parse_mode(const char *mode) {
+    if (!mode || !strcmp(mode,"auto")) return -1;
+    for (int set=0;set<BUTTON_ICONS_SETS;++set) if (!strcmp(mode,set_names[set])) return set;
+    return -1;
+}
+
+void runtime_button_icons_configure(const char *icons, const char *pad, const char *mode) {
+    snprintf(atlases[ICONS].folder,sizeof(atlases[ICONS].folder),"%s",icons);
+    snprintf(atlases[PAD].folder,sizeof(atlases[PAD].folder),"%s",pad);
+    configured=1;
+    const int fixed=parse_mode(mode);
+    current_mode=fixed;
+    fixed_pad=BUTTON_ICONS_PS4;
+    if (fixed==BUTTON_ICONS_PS4) {
+        mount_set(&atlases[ICONS],BUTTON_ICONS_PS4);
+        mount_set(&atlases[PAD],BUTTON_ICONS_PS4);
+        wanted=shown=BUTTON_ICONS_PS4;
+        return;
+    }
+    if (fixed>0) {
+        mount_fixed(&atlases[ICONS],fixed);
+        if (mount_fixed(&atlases[PAD],fixed)) fixed_pad=atlases[PAD].drawn[fixed];
+        else fixed_pad=BUTTON_ICONS_PS4;
+        wanted=shown=fixed;
+        return;
+    }
+    if (strcmp(mode,"auto")) return;
+    if (!ensure_worker()) return;
     __atomic_store_n(&automatic,1,__ATOMIC_RELEASE);
+    puts("Button icons: auto (follow the device last used)");
+}
+
+void runtime_button_icons_set_mode(const char *mode) {
+    if (!configured || !mode) return;
+    const int next=parse_mode(mode);
+    if (next==__atomic_load_n(&current_mode,__ATOMIC_RELAXED)) return;
+    __atomic_store_n(&current_mode,next,__ATOMIC_RELAXED);
+    if (next>=0) {
+        __atomic_store_n(&automatic,0,__ATOMIC_RELEASE);
+        if (!ensure_worker()) {
+            fixed_pad=BUTTON_ICONS_PS4;
+            mount_set(&atlases[ICONS],BUTTON_ICONS_PS4);
+            mount_set(&atlases[PAD],BUTTON_ICONS_PS4);
+            return;
+        }
+        fixed_pad=atlases[PAD].enabled ? atlases[PAD].drawn[next] : BUTTON_ICONS_PS4;
+        pthread_mutex_lock(&lock);
+        if (wanted!=next) { __atomic_store_n(&wanted,next,__ATOMIC_RELAXED); pthread_cond_signal(&wake); }
+        pthread_mutex_unlock(&lock);
+        printf("Button icons: %s\n",set_names[next]);
+        return;
+    }
+    if (!ensure_worker()) return;
+    __atomic_store_n(&automatic,1,__ATOMIC_RELEASE);
+    const int dev=__atomic_load_n(&last_auto_input,__ATOMIC_RELAXED);
+    pthread_mutex_lock(&lock);
+    if (wanted!=dev) { __atomic_store_n(&wanted,dev,__ATOMIC_RELAXED); pthread_cond_signal(&wake); }
+    pthread_mutex_unlock(&lock);
     puts("Button icons: auto (follow the device last used)");
 }
 
 /* The player used a device whose icons are `set`; called for every sample with input. */
 void runtime_button_icons_input(int set) {
-    if (!__atomic_load_n(&automatic,__ATOMIC_ACQUIRE) || set<0 || set>=BUTTON_ICONS_SETS) return;
+    if (set<0 || set>=BUTTON_ICONS_SETS) return;
+    __atomic_store_n(&last_auto_input,set,__ATOMIC_RELAXED);
+    if (!__atomic_load_n(&automatic,__ATOMIC_ACQUIRE)) return;
     if (__atomic_load_n(&wanted,__ATOMIC_RELAXED)==set) return;
     pthread_mutex_lock(&lock);
     if (wanted!=set) { __atomic_store_n(&wanted,set,__ATOMIC_RELAXED); pthread_cond_signal(&wake); }
     pthread_mutex_unlock(&lock);
 }
 
-/* The pad set the game's pad atlas shows now (BUTTON_ICONS_PS4 or _XBOX). */
+/* The pad set the game's pad atlas shows now (BUTTON_ICONS_PS4, _XBOX or _SWITCH). */
 int runtime_button_icons_pad(void) {
     if (!__atomic_load_n(&automatic,__ATOMIC_ACQUIRE)) return fixed_pad;
     if (!atlases[PAD].enabled) return BUTTON_ICONS_PS4;

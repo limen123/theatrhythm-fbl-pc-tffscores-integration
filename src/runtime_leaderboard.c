@@ -224,18 +224,8 @@ static void *lb_async_fetch_thread(void *arg) {
 void runtime_leaderboard_fetch(uint32_t music_id, int difficulty, const char *style) {
     const char *st = (style && *style) ? style : "standard";
     extern bool runtime_custom_charts_is_custom_id(uint32_t id);
-    if (runtime_custom_charts_is_custom_id(music_id)) {
-        pthread_mutex_lock(&s_lb_lock);
-        s_last_music_id = music_id;
-        s_last_difficulty = difficulty;
-        snprintf(s_last_style, sizeof(s_last_style), "%s", st);
-        s_entry_count = 0;
-        s_scroll_index = 0;
-        __atomic_add_fetch(&s_lb_revision, 1, __ATOMIC_RELEASE);
-        pthread_mutex_unlock(&s_lb_lock);
-        printf("Leaderboard: skipping TFFScores fetch for custom chart placeholder ID %u\n", music_id);
-        return;
-    }
+    bool is_custom = runtime_custom_charts_is_custom_id(music_id);
+
     pthread_mutex_lock(&s_lb_lock);
     if (s_last_music_id == music_id && s_last_difficulty == difficulty && strcmp(s_last_style, st) == 0 && s_entry_count > 0) {
         pthread_mutex_unlock(&s_lb_lock);
@@ -245,8 +235,15 @@ void runtime_leaderboard_fetch(uint32_t music_id, int difficulty, const char *st
     s_last_difficulty = difficulty;
     snprintf(s_last_style, sizeof(s_last_style), "%s", st);
 
-    /* Start with fallback entries */
-    populate_fallback_entries(music_id, difficulty, st);
+    if (is_custom) {
+        /* Custom charts start clean without fake bot fallback entries */
+        s_entry_count = 0;
+        s_scroll_index = 0;
+        __atomic_add_fetch(&s_lb_revision, 1, __ATOMIC_RELEASE);
+    } else {
+        /* Base game starts with offline fallback entries while fetching */
+        populate_fallback_entries(music_id, difficulty, st);
+    }
     pthread_mutex_unlock(&s_lb_lock);
 
     LbFetchArg *a = (LbFetchArg *)malloc(sizeof(LbFetchArg));

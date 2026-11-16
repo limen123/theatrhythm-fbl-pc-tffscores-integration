@@ -26,6 +26,7 @@ public:
     ~WindowSDL();
     s32 GetWidth() const { return width.load(std::memory_order_relaxed); }
     s32 GetHeight() const { return height.load(std::memory_order_relaxed); }
+    double GetRefreshRate() const { return refresh_rate_hz.load(std::memory_order_relaxed); }
     bool IsMinimized() const;
     SDL_Window* GetSDLWindow() const { return window; }
     WindowSystemInfo GetWindowInfo() const { return window_info; }
@@ -50,6 +51,8 @@ public:
 
 private:
     std::atomic<s32> width, height;
+    std::atomic<double> refresh_rate_hz{0.0};
+    void UpdateRefreshRate();
     std::atomic<bool> is_open{true};
     std::atomic<bool> is_minimized{false};
     std::atomic<bool> show_requested{false}, shown_done{false}, reveal_requested{false}, revealed{false};

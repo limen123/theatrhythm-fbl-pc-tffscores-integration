@@ -800,6 +800,7 @@ public:
 
     /// Waits until every recorded command is in the command buffer.
     void SyncRecording();
+    void WaitRecordingIdle();
 
     /// theatrhythm: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
     /// copy threads (TheatrhythmCopy::Async) must be done before the guest learns the GPU is past them
@@ -934,6 +935,7 @@ private:
     // theatrhythm: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+    bool uses_async_copies{false};
     std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
 };

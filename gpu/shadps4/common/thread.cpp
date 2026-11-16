@@ -3,6 +3,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -107,17 +108,56 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
     SetThreadPriority(handle, windows_priority);
 }
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+static HANDLE ThreadWaitableTimer() {
+    struct TimerHandle {
+        HANDLE handle = nullptr;
+        ~TimerHandle() {
+            if (handle) {
+                ::CloseHandle(handle);
+            }
+        }
+    };
+    thread_local TimerHandle timer{[]() -> HANDLE {
+        if (HANDLE high_res = ::CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)) {
+            return high_res;
+        }
+        return ::CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }()};
+    return timer.handle;
+}
+
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
+    if (duration.count() <= 0) {
+        if (remaining) {
+            *remaining = std::chrono::nanoseconds(0);
+        }
+        return true;
+    }
+
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
 
+    const LONGLONG ticks = duration.count() / 100;
+    if (ticks <= 0) {
+        if (remaining) {
+            *remaining = std::chrono::nanoseconds(0);
+        }
+        return true;
+    }
+
     LARGE_INTEGER interval{
-        .QuadPart = -1 * (duration.count() / 100u),
+        .QuadPart = -ticks,
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    HANDLE timer = ThreadWaitableTimer();
+    DWORD ret = WAIT_FAILED;
+    if (timer && ::SetWaitableTimer(timer, &interval, 0, nullptr, nullptr, FALSE)) {
+        ret = ::WaitForSingleObjectEx(timer, INFINITE, interruptible);
+    }
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();
@@ -149,11 +189,17 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
+    if (duration.count() <= 0) {
+        if (remaining) {
+            *remaining = std::chrono::nanoseconds(0);
+        }
+        return true;
+    }
     timespec request = {
         .tv_sec = duration.count() / 1'000'000'000,
         .tv_nsec = duration.count() % 1'000'000'000,
     };
-    timespec remain;
+    timespec remain{};
     int ret;
     while ((ret = nanosleep(&request, &remain)) < 0 && errno == EINTR) {
         if (interruptible) {
@@ -168,6 +214,61 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 }
 
 #endif
+
+void AccurateWaitUntil(const std::chrono::steady_clock::time_point deadline) {
+    using namespace std::chrono;
+#ifdef _WIN32
+    // Windows waitable timers overshoot by ~0.4-1.0 ms depending on system timer resolution;
+    // sleep short by an adaptive overshoot margin and pause-spin the final sub-millisecond tail.
+    thread_local nanoseconds sleep_margin = microseconds(1150);
+    while (true) {
+        const auto now = steady_clock::now();
+        if (now >= deadline) {
+            return;
+        }
+        const auto remaining = deadline - now;
+        const auto sleep_target = remaining - sleep_margin;
+        if (sleep_target >= microseconds(250)) {
+            AccurateSleep(sleep_target, nullptr, false);
+            const auto after = steady_clock::now();
+            const auto overshoot = duration_cast<nanoseconds>(after - now) - sleep_target;
+            if (overshoot > nanoseconds(0)) {
+                const auto safe_margin =
+                    std::clamp<nanoseconds>(overshoot + microseconds(150),
+                                            microseconds(600), microseconds(2000));
+                if (safe_margin > sleep_margin) {
+                    sleep_margin = safe_margin;
+                } else {
+                    sleep_margin -= (sleep_margin - safe_margin) / 16;
+                }
+            }
+            continue;
+        }
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+#else
+    while (true) {
+        const auto now = steady_clock::now();
+        if (now >= deadline) {
+            return;
+        }
+        const auto remaining = deadline - now;
+        if (remaining <= microseconds(150)) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+            __builtin_ia32_pause();
+#else
+            std::this_thread::yield();
+#endif
+            continue;
+        }
+        AccurateSleep(remaining - microseconds(150), nullptr, false);
+    }
+#endif
+}
 
 #ifdef _WIN32
 
@@ -230,7 +331,7 @@ AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
 void AccurateTimer::Start() {
     const auto begin_sleep = std::chrono::high_resolution_clock::now();
     if (total_wait.count() > 0) {
-        AccurateSleep(total_wait, nullptr, false);
+        AccurateWaitUntil(std::chrono::steady_clock::now() + total_wait);
     }
     start_time = std::chrono::high_resolution_clock::now();
     total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);

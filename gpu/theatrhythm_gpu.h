@@ -74,7 +74,9 @@ void theatrhythm_gpu_request_quit(void);
  * event poll). resolution: the count of sizes, and size `index` when it exists. save: settings.ini. */
 /* THEATRHYTHM_DISPLAY_RENDER_4K: render_resolution for the next start, 1 for 4k. */
 enum { THEATRHYTHM_DISPLAY_MODE, THEATRHYTHM_DISPLAY_RESOLUTION, THEATRHYTHM_DISPLAY_VSYNC, THEATRHYTHM_DISPLAY_FPS_LIMIT,
-       THEATRHYTHM_DISPLAY_RENDER_4K };
+       THEATRHYTHM_DISPLAY_RENDER_4K, THEATRHYTHM_DISPLAY_TEARING,
+       THEATRHYTHM_DISPLAY_BUTTON_ICONS, THEATRHYTHM_DISPLAY_CONFIRM_SWAP,
+       THEATRHYTHM_DISPLAY_BACKGROUND_CONTROLLER };
 int theatrhythm_display_get(int setting);
 void theatrhythm_display_set(int setting, int value);
 int theatrhythm_display_resolution(int index, int *width, int *height);
@@ -84,11 +86,16 @@ int theatrhythm_gpu_vibration_percent(void);
 /* Button remapping (settings.ini pad_map, or key_map when keyboard is 1; THEATRHYTHM_PAD_MAP and
  * THEATRHYTHM_KEY_MAP override them): "" when unset. */
 const char *theatrhythm_pad_map(int keyboard);
-/* Dialog confirm button: 0 Cross confirms, Circle cancels; 1 Circle confirms, Cross cancels. */
+/* Dialog confirm button: 0 Cross confirms, Circle cancels; 1 right button (Circle/East) confirms,
+ * down button (Cross/South) cancels. Can change at runtime from the F10 settings overlay. */
 int theatrhythm_gpu_menu_confirm_swap(void);
 /* Button icon set (settings.ini button_icons, THEATRHYTHM_BUTTON_ICONS): "auto" (the device last
- * used), "ps4" (the game's own), "xbox" or "keyboard". Valid once theatrhythm_gpu_init returned. */
+ * used), "ps4" (the game's own), "xbox", "switch" or "keyboard". Valid once theatrhythm_gpu_init returned. */
 const char *theatrhythm_button_icons(void);
+/* 1 when controller input is allowed while the game window is unfocused (THEATRHYTHM_BACKGROUND_CONTROLLER). */
+int theatrhythm_gpu_background_controller(void);
+/* Active prompt set ("ps4", "xbox", "switch", "keyboard") reported by the runtime for UI hints. */
+void theatrhythm_gpu_set_active_button_icons(const char *set_name);
 /* 1 when settings.ini render_resolution (THEATRHYTHM_RENDER_RESOLUTION) is 4k: the game runs in PS4
  * Pro mode with a 3840x2160 video out. Valid once theatrhythm_gpu_init returned. */
 int theatrhythm_render_4k(void);
@@ -121,6 +128,19 @@ void theatrhythm_gpu_request_screenshot(void);
 int theatrhythm_gpu_get_last_screenshot(char *out, size_t size, uint64_t *out_time_ms);
 /* Clears the last screenshot path so it cannot be re-consumed. */
 void theatrhythm_gpu_clear_last_screenshot(void);
+/* Custom note skin categories & Hue/Saturation settings (saved in settings.ini and live-updated by F10). */
+enum {
+    THEATRHYTHM_NOTE_TOUCH = 0,
+    THEATRHYTHM_NOTE_SLIDE = 1,
+    THEATRHYTHM_NOTE_HOLD = 2,
+    THEATRHYTHM_NOTE_SLIDEHOLD = 3,
+    THEATRHYTHM_NOTE_JOINT = 4,
+    THEATRHYTHM_NOTE_COUNT = 5,
+};
+void theatrhythm_note_skin_open(void);
+uint32_t theatrhythm_note_skin_version(void);
+void theatrhythm_note_skin_get(int category, int *hue, int *sat);
+void theatrhythm_note_skin_get_rgb(int category, float *r, float *g, float *b);
 #ifdef __cplusplus
 }
 #endif

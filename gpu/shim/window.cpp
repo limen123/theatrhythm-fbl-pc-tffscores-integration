@@ -107,6 +107,8 @@ static bool StartSize(s32& width, s32& height, SDL_DisplayID display) {
 }
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,
+                TheatrhythmSettings::Get().background_controller.load(std::memory_order_relaxed) ? "1" : "0");
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
@@ -162,7 +164,23 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
+    UpdateRefreshRate();
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+}
+
+void WindowSDL::UpdateRefreshRate() {
+    SDL_DisplayID display = window ? SDL_GetDisplayForWindow(window) : 0;
+    if (!display) display = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* mode = display ? SDL_GetCurrentDisplayMode(display) : nullptr;
+    double hz = 0.0;
+    if (mode) {
+        if (mode->refresh_rate_numerator > 0 && mode->refresh_rate_denominator > 0) {
+            hz = double(mode->refresh_rate_numerator) / mode->refresh_rate_denominator;
+        } else if (mode->refresh_rate > 0) {
+            hz = mode->refresh_rate;
+        }
+    }
+    refresh_rate_hz.store(hz, std::memory_order_relaxed);
 }
 
 // Windowed, borderless (desktop-sized, no mode change) or exclusive fullscreen at the display mode
@@ -187,6 +205,7 @@ void WindowSDL::ApplyDisplayMode(int mode) {
         SDL_SetWindowFullscreen(window, true);
     }
     SDL_SyncWindow(window);
+    UpdateRefreshRate();
     std::printf("Window: %s\n", TheatrhythmGraphics::DisplayModeNames[mode]);
 }
 
@@ -226,6 +245,7 @@ void WindowSDL::ApplyMonitor(int index) {
     SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED_DISPLAY(display), SDL_WINDOWPOS_CENTERED_DISPLAY(display));
     SDL_SyncWindow(window);
     if (display_mode != TheatrhythmGraphics::Windowed) ApplyDisplayMode(display_mode);
+    UpdateRefreshRate();
     std::printf("Window: moved to display %d\n", index);
 }
 
@@ -313,6 +333,12 @@ bool WindowSDL::PollEvents() {
         size != resolution) {
         ApplyResolution(size);
     }
+    static int last_background = -1;
+    const int background = TheatrhythmSettings::Get().background_controller.load(std::memory_order_relaxed) ? 1 : 0;
+    if (background != last_background) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, background ? "1" : "0");
+        last_background = background;
+    }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -354,8 +380,14 @@ bool WindowSDL::PollEvents() {
             SDL_GetWindowSizeInPixels(window, &w, &h);
             width = w;
             height = h;
+            UpdateRefreshRate();
             break;
         }
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_WINDOW_MOVED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            UpdateRefreshRate();
+            break;
         case SDL_EVENT_WINDOW_MINIMIZED:
         case SDL_EVENT_WINDOW_HIDDEN:
         case SDL_EVENT_WINDOW_OCCLUDED:

@@ -21,6 +21,11 @@
 
 #define USER_ID 1
 #define USER_NAME "Player"
+extern const char *runtime_tffscores_username(void);
+static const char *active_user_name(void) {
+    const char *uname = runtime_tffscores_username();
+    return (uname && *uname) ? uname : USER_NAME;
+}
 #define ORBIS_OK 0
 #define USER_INVALID_ARGUMENT ((int32_t)0x80960005)
 #define USER_NO_EVENT ((int32_t)0x80960007)
@@ -57,8 +62,9 @@ static ABI int32_t user_list(int32_t *ids) {
 }
 static ABI int32_t user_name(int32_t id,char *name,uint64_t size) {
     if (id!=USER_ID || !name) return USER_INVALID_ARGUMENT;
-    if (sizeof USER_NAME>size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
-    strcpy(name,USER_NAME); return 0;
+    const char *uname = active_user_name();
+    if (strlen(uname) + 1 > size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
+    strcpy(name, uname); return 0;
 }
 /* sceUserServiceGetUserColor(user, color): 0 blue, 1 red, 2 green, 3 pink. The one user is
  * player 1, blue (shadPS4 keeps that 1-based, as its pad code reads it, but returns it raw). */
@@ -703,7 +709,7 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     if (preset) { ime_complete(0,preset); return 0; }
     /* An empty field starts with the user name: a controller alone can accept it (the port
      * has no on-screen keyboard). */
-    const char *start=initial[0] ? initial : USER_NAME;
+    const char *start=initial[0] ? initial : active_user_name();
     if (!theatrhythm_gpu_text_input_begin(start,prompt[0] ? prompt : "Text")) ime_complete(0,start);
     else printf("Runtime: ImeDialog opened: shown on screen; keyboard Enter or Cross accepts, Esc or Circle cancels\n");
     return 0;

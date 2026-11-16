@@ -25,7 +25,8 @@ typedef struct {
 } Hook;
 
 static unsigned char *module;    /* Il2CppUserAssemblies in the image */
-static volatile int display_mode; /* the MS Settings page shows the display settings */
+enum { PAGE_NONE, PAGE_DISPLAY, PAGE_CONTROLLER, PAGE_NOTE_SKIN };
+static volatile int page_mode;   /* PAGE_NONE, PAGE_DISPLAY or PAGE_CONTROLLER */
 
 static uint64_t load(const void *p) { uint64_t v; memcpy(&v,p,8); return v; }
 static int32_t load32(const void *p) { int32_t v; memcpy(&v,p,4); return v; }
@@ -39,7 +40,7 @@ enum {
     H_BUTTON_VALUE, H_BUTTON_SET_INDEX, H_SLIDER_VALUE, H_SLIDER_SET_INDEX, H_INITIALIZE_LIST,
     H_INITIALIZE_SETTING, H_FILTER_ITEM, H_COMPARE_ITEM, H_SUBMIT, H_SLIDER_HORIZONTAL, H_SELECTOR_HORIZONTAL,
     H_CHECK_DEFAULT, H_TOP_SWITCH_IN, H_TOP_EXECUTED, H_TOP_SELECT, H_OBJECT_INFO, H_ROW_VIEW, H_HELP_ENTRY,
-    H_LANGUAGE_INPUT,
+    H_LANGUAGE_INPUT, H_MS_INPUT,
     P_REGION_CURRENT, P_REGION_WORLD, P_REGION_JAPAN, P_SET_DISPLAY_LANGUAGE, P_DESERIALIZE, P_PICKER,
     C_REFRESH_VIEW, C_PLAY_SE, C_LANGUAGE_CONTROLLER, C_LANGUAGE_CHANGED, C_GET_TRANSFORM, C_GET_PARENT,
     C_CHILD_COUNT, C_GET_CHILD, C_GET_NAME, C_GET_GAME_OBJECT, C_GET_COMPONENT, C_SPRITE_PACKED,
@@ -104,6 +105,8 @@ static const GameSite sites[SITES]={
      {"55 48 89 e5 41 57 41 56 | 41 55 41 54 53 48 83 ec 68 80 3d ?? ?? ?? ?? 00"}},
     {"Game.Scene.Config.ConfigLanguageMenuEditPartsMain::OnExecutedScenePartsMain", 0, 0, 0,
      {"55 48 89 e5 41 57 41 56 | 41 54 53 80 3d ?? ?? ?? ?? 00 49 89 f4 48 89 fb"}},
+    {"Game.Scene.Config.ConfigMusicStageEditPartsMain::OnExecutedScenePartsMain", 0, 0, 0,
+     {"55 48 89 e5 41 57 41 56 | 41 54 53 80 3d ?? ?? ?? ?? 00 48 89 f3 49 89 fe"}},
     {"Game.Localization.RegionLanguage::GetLanguageAllowedInCurrentRegion", 0, 0, 0, {REGION_LANGUAGE}},
     {"Game.Localization.RegionLanguage::getLanguageAllowedInWorldRegion", 0, 0, 0, {REGION_LANGUAGE}},
     {"Game.Localization.RegionLanguage::getLanguageAllowedInJapanRegion", 0, 0, 0, {REGION_LANGUAGE}},
@@ -195,28 +198,43 @@ enum { ROW_WINDOW, ROW_RESOLUTION, ROW_VSYNC, ROW_FPS, ROW_RENDER, ROWS };
 static const struct { const char *detail, *help; } rows[ROWS]={
     {"Common/DetailText/Config0018","Windowed, a borderless window covering the screen, or exclusive fullscreen."},
     {"Common/DetailText/Config0019","The window's size when windowed, the screen mode in fullscreen. Borderless always uses the desktop resolution."},
-    {"Common/DetailText/Config0024","Waits for the monitor: no tearing, slightly more input delay."},
-    {"Common/DetailText/Config0042","Caps how many frames are shown per second. Off follows the display."},
+    {"Common/DetailText/Config0024","Waits for the monitor: no tearing, caps FPS to refresh. Off allows tearing."},
+    {"Common/DetailText/Config0042","Caps how many frames are shown per second. Off follows the display; Unlimited removes the cap."},
     /* Timing display's row, an On/Off selector like VSync's */
     {"Common/DetailText/Config0026","4K as on PS4 Pro, filtered down to the window: sharper. 1080p as on PS4: lighter on the GPU. Applies after a restart."},
 };
+static const char *const ctrl_helps[ROWS]={
+    "Button prompts shown on screen. Auto follows the controller or keyboard you press.",
+    NULL,
+    "Standard confirms with the bottom button and cancels with the right. Nintendo swaps them.",
+    NULL,
+    "Keep accepting controller input and rumble while the game window is in the background.",
+};
 static const char *const mode_names[]={"Windowed","Borderless windowed","Fullscreen"};
-static const int fps_stops[]={0,30,60,120,144,240}; /* the slider's six stops */
-static const char *const fps_ticks[]={"Off","30","60","120","144","240"};
+static const char *const prompt_names[]={"Auto (by device)","PlayStation","Xbox","Switch","Keyboard"};
+#define PROMPT_COUNT ((int)(sizeof(prompt_names)/sizeof(*prompt_names)))
+static const int fps_stops[]={0,60,120,144,240,-1}; /* the slider's six stops (-1 = Unlimited) */
+static const char *const fps_ticks[]={"Off","60","120","144","240","Unlimited"};
 
 static unsigned char *page;            /* ConfigMusicStageEditPartsMain of the loaded Config scene */
 static unsigned char *row_item[ROWS];  /* its ConfigListItemBase rows */
-static int page_display;               /* the rows the page lists: 1 display settings */
+static int page_listed;                /* the page mode the scene last listed */
 static int resorting;                  /* OnInitializeSetting called from here */
 static int forcing;                    /* retranslate(): the rows' texts translate again */
 static void *label_text;               /* LocalizedText being translated (SetTextByTermInfo) */
 static int display_dirty;              /* settings.ini needs saving */
 static struct { unsigned char *view; float x; int moved; } marked[2]; /* row views without their marks: label x, label moved */
 
+static int row_active(int row) {
+    if (page_mode==PAGE_DISPLAY) return row>=0 && row<ROWS;
+    if (page_mode==PAGE_CONTROLLER) return row==ROW_WINDOW || row==ROW_VSYNC || row==ROW_RENDER;
+    return 0;
+}
+
 /* A new Config scene: forget the rows of the last one. */
 static void note_page(unsigned char *self) {
     if (self==page) return;
-    page=self; page_display=0;
+    page=self; page_listed=PAGE_NONE;
     memset(row_item,0,sizeof(row_item));
     memset(marked,0,sizeof(marked));
 }
@@ -299,35 +317,48 @@ static int row_of_behaviour(const void *behaviour) {
     return -1;
 }
 
-/* The value a row shows: VSync, the frame rate limit and the render resolution (1080p left, 4K
- * right) as the selected index; the pills (Window mode, Resolution) draw theirs in button_value. */
+/* The value a row shows: selectors as their selected index; pills draw theirs in button_value. */
 static void show_row(int row) {
+    if (!row_active(row)) return;
     unsigned char *item=row_item[row];
     if (!item) return;
     unsigned char *parameter=(unsigned char *)load(item+0x38); /* ConfigListItemView.ViewParameter */
-    if (row==ROW_VSYNC) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_VSYNC) ? 0 : 1);
-    else if (row==ROW_RENDER) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_RENDER_4K) ? 1 : 0);
-    else if (row==ROW_FPS) {
-        const int fps=theatrhythm_display_get(THEATRHYTHM_DISPLAY_FPS_LIMIT);
-        int at=fps<0 ? 5 : 0; /* Unlimited (set in settings.ini or the F10 panel): the last stop */
-        for (int i=1;fps>0 && i<6;++i) if (abs(fps_stops[i]-fps)<abs(fps_stops[at]-fps) || !at) at=i;
-        put32(parameter+0x14,at);
+    if (page_mode==PAGE_DISPLAY) {
+        if (row==ROW_VSYNC) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_VSYNC) ? 0 : 1);
+        else if (row==ROW_RENDER) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_RENDER_4K) ? 1 : 0);
+        else if (row==ROW_FPS) {
+            const int fps=theatrhythm_display_get(THEATRHYTHM_DISPLAY_FPS_LIMIT);
+            int at=fps<0 ? 5 : 0; /* Unlimited (-1) sits at the last stop; 0 follows display at 0 */
+            for (int i=1;fps>0 && i<6;++i) {
+                if (fps_stops[i]>0 && (!at || abs(fps_stops[i]-fps)<abs(fps_stops[at]-fps))) at=i;
+            }
+            put32(parameter+0x14,at);
+        }
+    } else if (page_mode==PAGE_CONTROLLER) {
+        if (row==ROW_VSYNC) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_CONFIRM_SWAP) ? 1 : 0);
+        else if (row==ROW_RENDER) put32(parameter+0x14,theatrhythm_display_get(THEATRHYTHM_DISPLAY_BACKGROUND_CONTROLLER) ? 0 : 1);
     }
     refresh_view(item);
 }
 
-/* The Display Settings button: a copy of Logo Usage, put in the menu's empty slot below Streaming
- * Rules. It keeps Logo Usage's number (UIObject._value), so the menu runs it as that button (its
- * description, its page); the hooks tell it apart by its object. */
+/* The Display Settings and Controller Settings buttons: copies of Logo Usage, put in the bottom row
+ * after Logo Usage. They keep Logo Usage's number (UIObject._value), so the menu runs them as that
+ * button; the hooks tell them apart by their objects. */
 #define LOGO_BUTTON 7
 #define STREAMING_BUTTON 5
-static const char button_name[]="TheatrhythmDisplaySettings";
-static unsigned char *button;          /* its UIObject in the loaded Config scene */
-static unsigned char *button_root;     /* its RectTransform (the copied button) */
-static unsigned char *logo_button;     /* Logo Usage's UIObject, which it stands in for */
-static int button_pressed;             /* the logo layer opens for it, in display mode */
-static int describing;                 /* the menu's description is the button's */
-static int monitor_icon;               /* the Config atlas holds the monitor icon (install) */
+static const char display_btn_name[]="TheatrhythmDisplaySettings";
+static const char ctrl_btn_name[]="TheatrhythmControllerSettings";
+static const char skin_btn_name[]="TheatrhythmNoteSkinSettings";
+static unsigned char *display_btn;     /* Display Settings UIObject */
+static unsigned char *display_root;    /* Display Settings RectTransform */
+static unsigned char *ctrl_btn;        /* Controller Settings UIObject */
+static unsigned char *ctrl_root;       /* Controller Settings RectTransform */
+static unsigned char *skin_btn;        /* Note Skins UIObject */
+static unsigned char *skin_root;       /* Note Skins RectTransform */
+static unsigned char *logo_button;     /* Logo Usage's UIObject, which all stand in for */
+static int pending_page;               /* PAGE_* to open when the logo layer triggers */
+static int describing;                 /* which added button's description is shown */
+static int monitor_icon;               /* the Config atlas holds the custom icons (install) */
 
 typedef struct { float x, y; } Vec2;
 typedef struct { float x, y, z; } Vec3;
@@ -363,17 +394,41 @@ static void set_move(const unsigned char *button, int direction, const void *to)
     unsigned char *array=moves(button);
     if (array) put(array+0x20+8*direction,(uint64_t)(uintptr_t)to);
 }
-/* Link the Display Settings button (`copy`, whose moves are Logo Usage's) into the grid: the empty
- * slot below Streaming Rules and right of Logo Usage, the end of the reading order. */
-static int link_button(const unsigned char *parts, unsigned char *copy) {
+/* Link Display Settings (`display`), Controller Settings (`ctrl`), and Note Skins (`skin`). */
+static int link_buttons(const unsigned char *parts, unsigned char *display, unsigned char *ctrl, unsigned char *skin) {
     unsigned char *logo=top_button(parts,LOGO_BUTTON), *streaming=top_button(parts,STREAMING_BUTTON);
     unsigned char *ms=top_button(parts,2), *first=top_button(parts,1);
-    if (!moves(copy) || !moves(logo) || !moves(streaming) || !ms || !first) return 0;
-    if (moves(copy)==moves(logo)) return 0; /* Instantiate copies arrays; never share Logo Usage's */
-    set_move(copy,UP,streaming); set_move(copy,DOWN,ms); set_move(copy,LEFT,logo); set_move(copy,RIGHT,move(logo,RIGHT));
-    set_move(logo,RIGHT,copy); set_move(streaming,DOWN,copy);
-    if (move(ms,UP)==streaming) set_move(ms,UP,copy); /* the column's wrap */
-    if (move(first,LEFT)==logo) set_move(first,LEFT,copy); /* the reading order's wrap */
+    if (!moves(display) || !moves(logo) || !moves(streaming) || !ms || !first) return 0;
+    if (moves(display)==moves(logo)) return 0; /* Instantiate copies arrays; never share Logo Usage's */
+    unsigned char *wrap_right=move(logo,RIGHT);
+    unsigned char *mid_right=move(streaming,RIGHT), *top_right=move(ms,RIGHT);
+    if (!mid_right || mid_right==logo || mid_right==streaming) mid_right=top_button(parts,6);
+    if (!top_right || top_right==first || top_right==ms) top_right=top_button(parts,3);
+    set_move(display,UP,streaming); set_move(display,DOWN,ms); set_move(display,LEFT,logo);
+    set_move(logo,RIGHT,display); set_move(streaming,DOWN,display);
+    if (move(ms,UP)==streaming) set_move(ms,UP,display); /* the column's wrap */
+    unsigned char *last=display;
+    if (ctrl && moves(ctrl) && moves(ctrl)!=moves(logo) && mid_right) {
+        set_move(display,RIGHT,ctrl);
+        set_move(ctrl,UP,mid_right); set_move(ctrl,DOWN,top_right ? top_right : move(mid_right,DOWN));
+        set_move(ctrl,LEFT,display);
+        set_move(mid_right,DOWN,ctrl);
+        if (top_right && move(top_right,UP)==mid_right) set_move(top_right,UP,ctrl);
+        last=ctrl;
+    }
+    if (skin && moves(skin) && moves(skin)!=moves(logo)) {
+        set_move(last,RIGHT,skin);
+        set_move(skin,LEFT,last);
+        set_move(skin,RIGHT,wrap_right);
+        set_move(skin,UP,logo);
+        set_move(skin,DOWN,first);
+        if (move(first,UP)==logo) set_move(first,UP,skin);
+        set_move(logo,DOWN,skin);
+        last=skin;
+    } else {
+        set_move(last,RIGHT,wrap_right);
+    }
+    if (move(first,LEFT)==logo) set_move(first,LEFT,last); /* the reading order's wrap */
     return 1;
 }
 /* The child of `container` that holds transform `t`. */
@@ -394,16 +449,16 @@ static unsigned char *image_showing(unsigned char *t, const char *sprite, int de
         if ((image=image_showing(child(t,i),sprite,depth-1))) return image;
     return NULL;
 }
-/* scripts/config_icon.py draws the monitor in an unused area of the Config atlas (PATCH, in blocks
- * counted from the bottom row) instead of over Logo Usage's icon (ICON_FROM), so the copy's icon is
- * Logo Usage's sprite moved by that many texels. */
+/* scripts/config_icon.py draws the custom icons in unused areas of the Config atlas (PATCH /
+ * CTRL_PATCH, in blocks counted from the bottom row) instead of over Logo Usage's icon (ICON_FROM),
+ * so each copied button's icon is Logo Usage's sprite moved by that many texels. */
 #define ICON_MOVE_X ((208-52)*4)
 #define ICON_MOVE_Y ((192-218)*4)
-/* The copied button below `root` shows the monitor: a sprite like Logo Usage's (size, pivot, pixels
- * per unit) over the same atlas texture at the monitor's place, Sprite.CreateSprite(texture, rect,
- * pivot, pixelsPerUnit, extrude 0, FullRect, no border, no physics shape). The copy's Image holds
- * the only reference, so the sprite goes with the scene. */
-static void show_monitor(unsigned char *root) {
+#define CTRL_ICON_MOVE_X ((208-52)*4)
+#define CTRL_ICON_MOVE_Y ((224-218)*4)
+/* The copied button below `root` shows a custom sprite at (`move_x`, `move_y`) from Logo Usage's
+ * atlas rect, preserving size, pivot and pixels per unit. */
+static void show_icon(unsigned char *root, float move_x, float move_y) {
     unsigned char *image=image_showing(root,"ConfigTop_Button_Icon_07",6);
     void *sprite=image ? (void *)load(image+0xd0) : NULL;
     if (!sprite) { printf("Display page: no Logo Usage icon in the copy; it keeps that icon\n"); return; }
@@ -416,20 +471,37 @@ static void show_monitor(unsigned char *root) {
     const Vec2 offset=((Vec2 (ABI *)(void *, void *))CODE(C_SPRITE_RECT_OFFSET))(sprite,NULL), pivot=((Vec2 (ABI *)(void *, void *))CODE(C_SPRITE_PIVOT))(sprite,NULL);
     const float units=((float (ABI *)(void *, void *))CODE(C_SPRITE_PIXELS_PER_UNIT))(sprite,NULL);
     if (whole.width<=0 || whole.height<=0) return;
-    const Rect rect={drawn.x+ICON_MOVE_X-offset.x,drawn.y+ICON_MOVE_Y-offset.y,whole.width,whole.height};
+    const Rect rect={drawn.x+move_x-offset.x,drawn.y+move_y-offset.y,whole.width,whole.height};
     const Vec2 center={pivot.x/whole.width,pivot.y/whole.height};
     const Vec4 border={0,0,0,0};
-    void *monitor=((void *(ABI *)(void *, Rect, Vec2, float, uint32_t, int32_t, Vec4, int, void *))CODE(C_CREATE_SPRITE))
+    void *icon=((void *(ABI *)(void *, Rect, Vec2, float, uint32_t, int32_t, Vec4, int, void *))CODE(C_CREATE_SPRITE))
         (texture,rect,center,units,0,0,border,0,NULL);
-    if (!monitor) { printf("Display page: cannot make the monitor icon; the copy keeps Logo Usage's\n"); return; }
-    ((void (ABI *)(void *, void *, void *))CODE(C_SET_SPRITE))(image,monitor,NULL); /* Image::set_sprite */
+    if (!icon) { printf("Display page: cannot make the custom icon; the copy keeps Logo Usage's\n"); return; }
+    ((void (ABI *)(void *, void *, void *))CODE(C_SET_SPRITE))(image,icon,NULL); /* Image::set_sprite */
+}
+static unsigned char *finish_button(unsigned char *root, unsigned char *logo, void *type, void *scene_parts,
+                                    unsigned char *col_root, unsigned char *row_root,
+                                    const char *btn_name, float move_x, float move_y) {
+    if (!root) return NULL;
+    (void)logo;
+    void *name=guest_text(object_name(row_root),btn_name);
+    if (name) ((void (ABI *)(void *, void *, void *))CODE(C_SET_NAME))(root,name,NULL); /* Object::set_name */
+    void *group=component_named(root,"CanvasGroup");
+    if (group) ((void (ABI *)(void *, float, void *))CODE(C_SET_ALPHA))(group,1.0f,NULL); /* CanvasGroup::set_alpha */
+    unsigned char *copy=((unsigned char *(ABI *)(void *, void *, int, void *))CODE(C_COMPONENT_IN_CHILDREN))(root,type,1,NULL);
+    if (!copy) return NULL;
+    Vec3 (ABI *get_position)(void *, void *)=(Vec3 (ABI *)(void *, void *))CODE(C_GET_POSITION);
+    Vec3 at=get_position(root,NULL);
+    const Vec3 column=get_position(col_root,NULL), row=get_position(row_root,NULL), now=get_position(transform(copy),NULL);
+    at.x+=column.x-now.x; at.y+=row.y-now.y;
+    ((void (ABI *)(void *, Vec3, void *))CODE(C_SET_POSITION))(root,at,NULL);
+    if (monitor_icon && (move_x!=0.0f || move_y!=0.0f)) show_icon(root,move_x,move_y);
+    ((void (ABI *)(void *, void *, void *))CODE(C_REGISTER))(scene_parts,copy,NULL);
+    return copy;
 }
 
-/* ConfigTopLayerMain::SwitchIn(this), as the Options menu shows: give its scene the Display Settings
- * button once. Logo Usage's button is copied into itself (Object.Instantiate(original, parent)), so the
- * menu's animations, which find their objects by name, fade the copy with it; the copy sits below
- * Streaming Rules, and its UIObject is registered with the buttons' UISceneParts, which also links it
- * into the cursor's moves. */
+/* ConfigTopLayerMain::SwitchIn(this), as the Options menu shows: give its scene the Display
+ * Settings, Controller Settings and Note Skins buttons once. */
 static ABI int top_switch_in(HookRegs *r) {
     const unsigned char *parts=(const unsigned char *)load((unsigned char *)r->rdi+0x48); /* _configTop */
     unsigned char *logo=parts ? top_button(parts,LOGO_BUTTON) : NULL, *streaming=parts ? top_button(parts,STREAMING_BUTTON) : NULL;
@@ -439,60 +511,85 @@ static ABI int top_switch_in(HookRegs *r) {
     unsigned char *logo_root=container ? child_holding(transform(logo),container) : NULL;
     unsigned char *streaming_root=container ? child_holding(transform(streaming),container) : NULL;
     if (!logo_root || !streaming_root) return 0;
-    for (int32_t i=0;i<child_count(logo_root);++i) { /* this scene already has it */
+    for (int32_t i=0;i<child_count(logo_root);++i) { /* this scene already has them */
         char name[48]; guest_string(object_name(child(logo_root,i)),name,sizeof(name));
-        if (!strcmp(name,button_name)) return 0;
+        if (!strcmp(name,display_btn_name)) return 0;
     }
-    button=NULL; button_root=NULL;
-    unsigned char *root=((unsigned char *(ABI *)(void *, void *, int))CODE(C_CLONE))(logo_root,logo_root,0); /* Internal_CloneSingleWithParent */
-    if (!root) return 0;
-    void *name=guest_text(object_name(logo_root),button_name);
-    if (name) ((void (ABI *)(void *, void *, void *))CODE(C_SET_NAME))(root,name,NULL); /* Object::set_name */
-    /* The button fades in through a CanvasGroup on its root, copied at alpha 0: the original's now
-     * fades the copy too. */
-    void *group=component_named(root,"CanvasGroup");
-    if (group) ((void (ABI *)(void *, float, void *))CODE(C_SET_ALPHA))(group,1.0f,NULL); /* CanvasGroup::set_alpha */
-    void *type=((void *(ABI *)(void *, void *))CODE(C_GET_TYPE))(logo,NULL); /* Object::GetType */
-    unsigned char *copy=((unsigned char *(ABI *)(void *, void *, int, void *))CODE(C_COMPONENT_IN_CHILDREN))(root,type,1,NULL); /* GetComponentInChildren */
-    void *scene_parts=((void *(ABI *)(void *, void *))CODE(C_PARENT_SCENE_PARTS))(logo,NULL); /* UIObject::get_ParentUISceneParts */
-    if (!copy || !scene_parts) return 0;
-    /* Below Streaming Rules, in Logo Usage's row. The buttons slide in from the left inside their
-     * roots, which stay put, and the copy keeps the slide's first frame: its button goes where the
-     * others come to rest, on their roots (world positions). */
-    Vec3 (ABI *get_position)(void *, void *)=(Vec3 (ABI *)(void *, void *))CODE(C_GET_POSITION); /* Transform::position */
-    Vec3 at=get_position(root,NULL);
-    const Vec3 column=get_position(streaming_root,NULL), row=get_position(logo_root,NULL), now=get_position(transform(copy),NULL);
-    at.x+=column.x-now.x; at.y+=row.y-now.y;
-    ((void (ABI *)(void *, Vec3, void *))CODE(C_SET_POSITION))(root,at,NULL);
-    if (monitor_icon) show_monitor(root);
-    ((void (ABI *)(void *, void *, void *))CODE(C_REGISTER))(scene_parts,copy,NULL); /* UISceneParts IUIObjectRegister.Register */
-    if (!link_button(parts,copy)) printf("Display page: the Display Settings button has no cursor moves\n");
-    button=copy; button_root=root; logo_button=logo;
-    printf("Display page: Display Settings button added below Streaming Rules\n");
-    retranslate(); /* its label */
+    display_btn=NULL; display_root=NULL; ctrl_btn=NULL; ctrl_root=NULL; skin_btn=NULL; skin_root=NULL;
+    /* Clone all siblings before mutating display_root so later clones inherit untouched defaults. */
+    unsigned char *droot=((unsigned char *(ABI *)(void *, void *, int))CODE(C_CLONE))(logo_root,logo_root,0);
+    unsigned char *croot=droot ? ((unsigned char *(ABI *)(void *, void *, int))CODE(C_CLONE))(droot,logo_root,0) : NULL;
+    unsigned char *sroot=croot ? ((unsigned char *(ABI *)(void *, void *, int))CODE(C_CLONE))(croot,logo_root,0) : NULL;
+    void *type=((void *(ABI *)(void *, void *))CODE(C_GET_TYPE))(logo,NULL);
+    void *scene_parts=((void *(ABI *)(void *, void *))CODE(C_PARENT_SCENE_PARTS))(logo,NULL);
+    if (!droot || !type || !scene_parts) return 0;
+    unsigned char *dcopy=finish_button(droot,logo,type,scene_parts,streaming_root,logo_root,display_btn_name,ICON_MOVE_X,ICON_MOVE_Y);
+    if (!dcopy) return 0;
+    unsigned char *mid_right=move(streaming,RIGHT);
+    if (!mid_right || mid_right==logo || mid_right==streaming) mid_right=top_button(parts,6);
+    unsigned char *mid_right_root=mid_right ? child_holding(transform(mid_right),container) : NULL;
+    unsigned char *ccopy=(croot && mid_right_root)
+        ? finish_button(croot,logo,type,scene_parts,mid_right_root,logo_root,ctrl_btn_name,CTRL_ICON_MOVE_X,CTRL_ICON_MOVE_Y)
+        : NULL;
+    unsigned char *scopy=sroot ? finish_button(sroot,logo,type,scene_parts,logo_root,logo_root,skin_btn_name,0.0f,0.0f) : NULL;
+    if (scopy) {
+        Vec3 (ABI *get_pos)(void *, void *)=(Vec3 (ABI *)(void *, void *))CODE(C_GET_POSITION);
+        Vec3 p_logo=get_pos(logo_root,NULL), p_str=get_pos(streaming_root,NULL), p_skin=get_pos(sroot,NULL);
+        p_skin.y += p_logo.y - p_str.y;
+        ((void (ABI *)(void *, Vec3, void *))CODE(C_SET_POSITION))(sroot,p_skin,NULL);
+        unsigned char *ms_btn=top_button(parts,2);
+        unsigned char *ms_root=ms_btn ? child_holding(transform(ms_btn),container) : NULL;
+        unsigned char *ms_img=ms_root ? image_showing(ms_root,"ConfigTop_Button_Icon_02",6) : NULL;
+        unsigned char *s_img=image_showing(sroot,"ConfigTop_Button_Icon_07",6);
+        void *ms_spr=ms_img ? (void *)load(ms_img+0xd0) : NULL;
+        if (s_img && ms_spr) ((void (ABI *)(void *, void *, void *))CODE(C_SET_SPRITE))(s_img,ms_spr,NULL);
+    }
+    if (!link_buttons(parts,dcopy,ccopy,scopy)) printf("Display page: the added buttons have no cursor moves\n");
+    display_btn=dcopy; display_root=droot; ctrl_btn=ccopy; ctrl_root=ccopy ? croot : NULL;
+    skin_btn=scopy; skin_root=scopy ? sroot : NULL; logo_button=logo;
+    printf("Display page: Display Settings%s%s added\n",
+           ccopy ? ", Controller Settings" : "",
+           scopy ? " and Note Skins" : "");
+    retranslate(); /* their labels */
     return 0;
 }
-static int in_button(void *component) { return button_root && component && under(transform(component),button_root); }
+static int in_button(void *component) {
+    if (!component) return 0;
+    unsigned char *t=transform(component);
+    return (display_root && under(t,display_root)) || (ctrl_root && under(t,ctrl_root))
+        || (skin_root && under(t,skin_root));
+}
+static int button_target(uint64_t obj) {
+    if (display_btn && obj==(uint64_t)(uintptr_t)display_btn) return PAGE_DISPLAY;
+    if (ctrl_btn && obj==(uint64_t)(uintptr_t)ctrl_btn) return PAGE_CONTROLLER;
+    if (skin_btn && obj==(uint64_t)(uintptr_t)skin_btn) return PAGE_NOTE_SKIN;
+    return PAGE_NONE;
+}
 
 /* ConfigTopPartsMain::OnExecutedScenePartsMain(this, source, data): a press of the button. */
-static ABI int top_executed(HookRegs *r) { button_pressed=button && r->rsi==(uint64_t)(uintptr_t)button; return 0; }
+static ABI int top_executed(HookRegs *r) { pending_page=button_target(r->rsi); return 0; }
 /* ScenePartsMain.UIObjectGroup::GetUIObjectInfo(this, uiObject): the help bar (Back, Select) of a
- * focused button. The button has no entry of its own (the group's list is full), so it gets Logo
- * Usage's. */
+ * focused button. The buttons have no entry of their own, so both get Logo Usage's. */
 static ABI int object_info(HookRegs *r) {
-    if (button && r->rsi==(uint64_t)(uintptr_t)button) r->rsi=(uint64_t)(uintptr_t)logo_button;
+    if (button_target(r->rsi)) r->rsi=(uint64_t)(uintptr_t)logo_button;
     return 0;
 }
 /* ConfigTopPartsMain::sendSelectReaction(this, uiObject): the description shown next. */
-static ABI int top_select(HookRegs *r) { describing=button && r->rsi==(uint64_t)(uintptr_t)button; return 0; }
+static ABI int top_select(HookRegs *r) { describing=button_target(r->rsi); return 0; }
 
-/* ConfigMain::switchLayer(this, layer): the Display Settings button opens the MS Settings page in
- * display mode; leaving it saves the settings and puts the game's texts back. */
+/* ConfigMain::switchLayer(this, layer): Display/Controller Settings open the MS Settings page in
+ * their own mode; leaving it saves settings.ini and puts the game's texts back. */
 static ABI int switch_layer(HookRegs *r) {
     const int layer=(int)r->rsi;
-    if (layer==LOGO_LAYER && button_pressed) { button_pressed=0; display_mode=1; r->rsi=MUSIC_STAGE_LAYER; }
-    else if (layer!=MUSIC_STAGE_LAYER && display_mode) {
-        display_mode=0; /* the rows keep their texts until the page opens as MS Settings */
+    if (layer==LOGO_LAYER && pending_page==PAGE_NOTE_SKIN) {
+        pending_page=PAGE_NONE;
+        theatrhythm_note_skin_open();
+        r->rax=0; r->rdx_out=0;
+        return 1;
+    }
+    if (layer==LOGO_LAYER && pending_page) { page_mode=pending_page; pending_page=PAGE_NONE; r->rsi=MUSIC_STAGE_LAYER; }
+    else if (layer!=MUSIC_STAGE_LAYER && page_mode) {
+        page_mode=PAGE_NONE; /* the rows keep their texts until the page opens as MS Settings */
         if (display_dirty) { display_dirty=0; theatrhythm_display_save(); }
     }
     return 0;
@@ -553,29 +650,29 @@ static void mark_row(unsigned char *view, int hide) {
 static ABI int row_view(HookRegs *r) {
     int row=-1;
     for (int i=0;i<ROWS;++i) if (row_item[i] && r->rsi==load(row_item[i]+0x38)) row=i;
-    mark_row((unsigned char *)r->rdi,display_mode && (row==ROW_WINDOW || row==ROW_RESOLUTION));
-    for (int i=0;display_mode && row==ROW_VSYNC && i<2;++i) /* its label is where the others' go */
+    mark_row((unsigned char *)r->rdi,row_active(row) && (row==ROW_WINDOW || row==ROW_RESOLUTION));
+    for (int i=0;page_mode && row==ROW_VSYNC && i<2;++i) /* its label is where the others' go */
         if (marked[i].view && !marked[i].moved) mark_row(marked[i].view,1);
     return 0;
 }
 
 /* ConfigMusicStageEditPartsMain::InitializeList(this), as the page opens: when the page last listed
- * the other set of rows, list them again (OnInitializeSetting sorts with filterItem), with the
+ * a different set of rows, list them again (OnInitializeSetting sorts with filterItem), with the
  * cursor on the first row. */
 static ABI int initialize_list(HookRegs *r) {
     unsigned char *self=(unsigned char *)r->rdi;
     note_page(self);
-    if (page_display==display_mode) {
-        if (display_mode) for (int row=0;row<ROWS;++row) show_row(row);
+    if (page_listed==page_mode) {
+        if (page_mode) for (int row=0;row<ROWS;++row) show_row(row);
         return 0;
     }
-    page_display=display_mode;
+    page_listed=page_mode;
     resorting=1;
     ((void (ABI *)(void *, void *))CODE(C_ON_INITIALIZE_SETTING))(self,NULL); /* OnInitializeSetting */
     resorting=0;
     put(self+0xa8,0); /* _selectedItem */
     retranslate();
-    if (display_mode) for (int row=0;row<ROWS;++row) show_row(row); /* after the value texts' own terms */
+    if (page_mode) for (int row=0;row<ROWS;++row) show_row(row); /* after the value texts' own terms */
     return 0;
 }
 
@@ -592,7 +689,7 @@ static ABI int initialize_setting(HookRegs *r) {
     return 1;
 }
 
-/* ConfigMusicStageEditPartsMain::filterItem(this, listItem): display mode lists only its rows. */
+/* ConfigMusicStageEditPartsMain::filterItem(this, listItem): added pages list only their rows. */
 static ABI int filter_item(HookRegs *r) {
     note_page((unsigned char *)r->rdi);
     unsigned char *item=(unsigned char *)r->rsi;
@@ -603,44 +700,69 @@ static ABI int filter_item(HookRegs *r) {
         if (!strcmp(term,rows[i].detail) && (i>ROW_RESOLUTION || !strcmp(class_name(item),"ConfigListItemButton"))) {
             row_item[i]=item; row=i;
         }
-    page_display=display_mode; /* every sort (the game's own too, as the scene is set up again) */
-    if (!display_mode) return 0;
-    r->rax=row>=0;
+    page_listed=page_mode; /* every sort (the game's own too, as the scene is set up again) */
+    if (!page_mode) return 0;
+    r->rax=row_active(row);
     return 1;
 }
 
-/* ConfigMusicStageEditPartsMain::compareItem(this, a, b): display mode orders its rows. */
+/* ConfigMusicStageEditPartsMain::compareItem(this, a, b): added pages order their rows. */
 static ABI int compare_item(HookRegs *r) {
     const int a=row_of((unsigned char *)r->rsi), b=row_of((unsigned char *)r->rdx);
-    if (!display_mode || a<0 || b<0) return 0;
+    if (!page_mode || a<0 || b<0) return 0;
     r->rax=(uint64_t)(int64_t)(a-b);
     return 1;
 }
 
-/* ConfigListItemButton::OnSubmit(this): the pills step to their next value. */
+/* ConfigListItemButton::OnSubmit(this): Display Settings pills step on Confirm; Controller
+ * Settings' Button prompts is changed with Left/Right (ms_input), so Confirm does nothing there. */
 static ABI int submit(HookRegs *r) {
     unsigned char *item=(unsigned char *)r->rdi;
-    const int row=display_mode ? row_of(item) : -1;
-    if (row!=ROW_WINDOW && row!=ROW_RESOLUTION) return 0;
-    play_se((const void *)load(item+0x58));
-    if (row==ROW_WINDOW) theatrhythm_display_set(THEATRHYTHM_DISPLAY_MODE,(theatrhythm_display_get(THEATRHYTHM_DISPLAY_MODE)+1)%3);
-    else {
-        int w,h; const int count=theatrhythm_display_resolution(-1,&w,&h);
-        if (count>0) theatrhythm_display_set(THEATRHYTHM_DISPLAY_RESOLUTION,(theatrhythm_display_get(THEATRHYTHM_DISPLAY_RESOLUTION)+1)%count);
+    const int row=page_mode ? row_of(item) : -1;
+    if (!row_active(row)) return 0;
+    if (page_mode==PAGE_DISPLAY) {
+        if (row==ROW_WINDOW) theatrhythm_display_set(THEATRHYTHM_DISPLAY_MODE,(theatrhythm_display_get(THEATRHYTHM_DISPLAY_MODE)+1)%3);
+        else if (row==ROW_RESOLUTION) {
+            int w,h; const int count=theatrhythm_display_resolution(-1,&w,&h);
+            if (count>0) theatrhythm_display_set(THEATRHYTHM_DISPLAY_RESOLUTION,(theatrhythm_display_get(THEATRHYTHM_DISPLAY_RESOLUTION)+1)%count);
+        } else return 0;
+        play_se((const void *)load(item+0x58));
+        display_dirty=1;
+        show_row(row);
+        return 1;
     }
+    return page_mode==PAGE_CONTROLLER && row==ROW_WINDOW;
+}
+
+/* ConfigMusicStageEditPartsMain::OnExecutedScenePartsMain(this, reaction) -> handled: Left
+ * (action 0) or Right (1) on Controller Settings' Button prompts cycles the prompt icon set. */
+static ABI int ms_input(HookRegs *r) {
+    if (page_mode!=PAGE_CONTROLLER) return 0;
+    unsigned char *self=(unsigned char *)r->rdi, *reaction=(unsigned char *)r->rsi;
+    const int32_t action=load32(reaction+0x20);
+    if (action!=0 && action!=1) return 0;
+    const unsigned char *list=(const unsigned char *)load(self+0x90);
+    const unsigned char *selected=list ? (const unsigned char *)load(list+0xa8) : NULL; /* SelectedItemInfo */
+    unsigned char *item=selected ? (unsigned char *)load(selected+0x20) : NULL;
+    if (!item || item!=row_item[ROW_WINDOW]) return 0;
+    const int cur=theatrhythm_display_get(THEATRHYTHM_DISPLAY_BUTTON_ICONS);
+    theatrhythm_display_set(THEATRHYTHM_DISPLAY_BUTTON_ICONS,
+        (cur+(action==1 ? 1 : PROMPT_COUNT-1))%PROMPT_COUNT);
     display_dirty=1;
-    show_row(row);
+    show_row(ROW_WINDOW);
+    play_se((const void *)load(item+0x58));
+    ((void (ABI *)(void *, int, void *))CODE(C_END_ACTION))(reaction,0,NULL); /* UIObject::EndAction */
+    r->rax=0;
     return 1;
 }
 
 /* ConfigListItemSlider/Selector::OnHorizontalInput(this, direction 0 left / 1 right) -> handled:
- * VSync and the render resolution (selectors) and the frame rate limit (a slider) change the
- * runner's settings instead of the game's (no _onChangeData). Both keep the value count at +0x50;
- * `se`: the select sound's field. */
+ * selectors and sliders change the runner's settings instead of the game's (no _onChangeData). Both
+ * keep the value count at +0x50; `se`: the select sound's field. */
 static int horizontal(HookRegs *r, size_t se) {
     unsigned char *item=(unsigned char *)r->rdi;
-    const int row=display_mode ? row_of(item) : -1;
-    if (row!=ROW_VSYNC && row!=ROW_FPS && row!=ROW_RENDER) return 0;
+    const int row=page_mode ? row_of(item) : -1;
+    if (!row_active(row) || (row!=ROW_VSYNC && row!=ROW_FPS && row!=ROW_RENDER)) return 0;
     unsigned char *parameter=(unsigned char *)load(item+0x38);
     const int old=load32(parameter+0x14), stops=load32(item+0x50);
     const int direction=(int)r->rsi;
@@ -650,9 +772,17 @@ static int horizontal(HookRegs *r, size_t se) {
     r->rax=index!=old;
     if (index==old) return 1;
     put32(parameter+0x14,index);
-    if (row==ROW_VSYNC) theatrhythm_display_set(THEATRHYTHM_DISPLAY_VSYNC,index==0);
-    else if (row==ROW_RENDER) theatrhythm_display_set(THEATRHYTHM_DISPLAY_RENDER_4K,index==1);
-    else if (index<6) theatrhythm_display_set(THEATRHYTHM_DISPLAY_FPS_LIMIT,fps_stops[index]);
+    if (page_mode==PAGE_DISPLAY) {
+        if (row==ROW_VSYNC) {
+            theatrhythm_display_set(THEATRHYTHM_DISPLAY_VSYNC,index==0);
+            if (index!=0) theatrhythm_display_set(THEATRHYTHM_DISPLAY_TEARING,1);
+        }
+        else if (row==ROW_RENDER) theatrhythm_display_set(THEATRHYTHM_DISPLAY_RENDER_4K,index==1);
+        else if (index>=0 && index<6) theatrhythm_display_set(THEATRHYTHM_DISPLAY_FPS_LIMIT,fps_stops[index]);
+    } else if (page_mode==PAGE_CONTROLLER) {
+        if (row==ROW_VSYNC) theatrhythm_display_set(THEATRHYTHM_DISPLAY_CONFIRM_SWAP,index==1);
+        else if (row==ROW_RENDER) theatrhythm_display_set(THEATRHYTHM_DISPLAY_BACKGROUND_CONTROLLER,index==0);
+    }
     refresh_view(item);
     display_dirty=1;
     play_se((const void *)load(item+se));
@@ -661,18 +791,19 @@ static int horizontal(HookRegs *r, size_t se) {
 static ABI int slider_horizontal(HookRegs *r) { return horizontal(r,0x68); }
 static ABI int selector_horizontal(HookRegs *r) { return horizontal(r,0x58); }
 
-/* ConfigMusicStageEditPartsMain::openCheckDefaultWindow(this): no Restore defaults in display mode. */
-static ABI int check_default(HookRegs *r) { (void)r; return display_mode; }
+/* ConfigMusicStageEditPartsMain::openCheckDefaultWindow(this): no Restore defaults on added pages. */
+static ABI int check_default(HookRegs *r) { (void)r; return page_mode!=PAGE_NONE; }
 /* HelpBarContent::RefleshDisplay(this, device, buttonNames, text colors) as HelpBar::Draw shows an
- * entry (_contentsData already set): in display mode Restore defaults gets no button icon, and Draw
+ * entry (_contentsData already set): on added pages Restore defaults gets no button icon, and Draw
  * hides an entry without one. */
 static ABI int help_entry(HookRegs *r) {
     unsigned char *content=(unsigned char *)r->rdi;
-    const unsigned char *data=display_mode ? (const unsigned char *)load(content+0x38) : NULL; /* _contentsData */
+    const unsigned char *data=page_mode ? (const unsigned char *)load(content+0x38) : NULL; /* _contentsData */
     char term[48];
     if (!data) return 0;
     guest_string((const void *)load(data+0x10),term,sizeof(term)); /* _term */
-    if (strcmp(term,"Common/HelpBar/Default")) return 0;
+    if (strcmp(term,"Common/HelpBar/Default") &&
+        !(page_mode==PAGE_CONTROLLER && !strcmp(term,"Common/HelpBar/DedicatedScene"))) return 0;
     void *icon=(void *)load(content+0x20); /* _imageButtonIcon */
     if (icon) ((void (ABI *)(void *, void *, void *))CODE(C_SET_SPRITE))(icon,NULL,NULL); /* Image::set_sprite */
     return 1;
@@ -684,15 +815,17 @@ static void value_text(unsigned char *behaviour, size_t field, int row) {
     unsigned char *text=(unsigned char *)load(behaviour+field);
     if (!text) return;
     char value[48];
-    if (row==ROW_WINDOW) snprintf(value,sizeof(value),"%s",mode_names[theatrhythm_display_get(THEATRHYTHM_DISPLAY_MODE)%3]);
+    if (page_mode==PAGE_CONTROLLER && row==ROW_WINDOW) {
+        const int prompt=theatrhythm_display_get(THEATRHYTHM_DISPLAY_BUTTON_ICONS);
+        snprintf(value,sizeof(value),"%s",prompt_names[prompt>=0 && prompt<PROMPT_COUNT ? prompt : 0]);
+    } else if (row==ROW_WINDOW) snprintf(value,sizeof(value),"%s",mode_names[theatrhythm_display_get(THEATRHYTHM_DISPLAY_MODE)%3]);
     else if (row==ROW_RESOLUTION) {
         int w=0,h=0;
         theatrhythm_display_resolution(theatrhythm_display_get(THEATRHYTHM_DISPLAY_RESOLUTION),&w,&h);
         snprintf(value,sizeof(value),"%d x %d",w,h);
     } else {
         const int32_t index=load32(behaviour+0x18); /* SelectedIndex */
-        const int unlimited=index==5 && theatrhythm_display_get(THEATRHYTHM_DISPLAY_FPS_LIMIT)<0;
-        snprintf(value,sizeof(value),"%s",unlimited ? "Unlimited" : fps_ticks[index>=0 && index<6 ? index : 0]);
+        snprintf(value,sizeof(value),"%s",fps_ticks[index>=0 && index<6 ? index : 0]);
     }
     void *string=guest_text((void *)load(row_item[row]+0x20),value); /* a string's class: the help term's */
     const unsigned char *klass=(const unsigned char *)load(text);
@@ -702,13 +835,14 @@ static void value_text(unsigned char *behaviour, size_t field, int row) {
  * pills show the runner's value. */
 static ABI int button_value(HookRegs *r) {
     unsigned char *behaviour=(unsigned char *)r->rdi;
-    const int row=display_mode ? row_of_behaviour(behaviour) : -1;
-    if (row!=ROW_WINDOW && row!=ROW_RESOLUTION) return 0;
+    const int row=page_mode ? row_of_behaviour(behaviour) : -1;
+    if (!row_active(row) || (row!=ROW_WINDOW && row!=ROW_RESOLUTION)) return 0;
     value_text(behaviour,0x20,row);
     return 1;
 }
 static ABI int button_set_index(HookRegs *r) {
-    if (!display_mode || row_of_behaviour((void *)r->rdi)<0) return 0;
+    const int row=page_mode ? row_of_behaviour((void *)r->rdi) : -1;
+    if (!row_active(row)) return 0;
     put32((unsigned char *)r->rdi+0x18,(int32_t)r->rsi);
     return button_value(r);
 }
@@ -716,13 +850,13 @@ static ABI int button_set_index(HookRegs *r) {
  * inlines it): the frame rate limit's box shows FPS, not the stop's number. */
 static ABI int slider_value(HookRegs *r) {
     unsigned char *behaviour=(unsigned char *)r->rdi;
-    if (!display_mode || row_of_behaviour(behaviour)!=ROW_FPS) return 0;
+    if (page_mode!=PAGE_DISPLAY || row_of_behaviour(behaviour)!=ROW_FPS) return 0;
     value_text(behaviour,0x30,ROW_FPS);
     return 1;
 }
 static ABI int slider_set_index(HookRegs *r) {
     unsigned char *behaviour=(unsigned char *)r->rdi;
-    if (!display_mode || row_of_behaviour(behaviour)!=ROW_FPS) return 0;
+    if (page_mode!=PAGE_DISPLAY || row_of_behaviour(behaviour)!=ROW_FPS) return 0;
     put32(behaviour+0x18,(int32_t)r->rsi);
     unsigned char *slider=(unsigned char *)load(behaviour+0x20); /* _slider.value = index */
     const unsigned char *klass=(const unsigned char *)load(slider);
@@ -744,31 +878,51 @@ static int on_language_changed(HookRegs *r, int set_text) {
 static ABI int on_language_changed_a(HookRegs *r) { return on_language_changed(r,H_SET_TEXT_A); }
 static ABI int on_language_changed_b(HookRegs *r) { return on_language_changed(r,H_SET_TEXT_B); }
 
-/* I2 LocalizationManager::TryGetTranslation(term, out translation, ...): the Display Settings texts. */
+/* I2 LocalizationManager::TryGetTranslation(term, out translation, ...): the Display and
+ * Controller Settings texts. */
 static ABI int translate(HookRegs *r) {
     void *component=label_text; label_text=NULL;
     char term[80]; guest_string((const void *)r->rdi,term,sizeof(term));
     const char *text=runtime_exit_prompt_translation(term); /* F4's "Exit the game?" window */
     if (text) {}
-    else if (!strcmp(term,"Scene/Config/TopButton/007") && in_button(component)) text="Display Settings";
+    else if (!strcmp(term,"Scene/Config/TopButton/007") && in_button(component))
+        text=skin_root && under(transform(component),skin_root) ? "Note Skins"
+             : ctrl_root && under(transform(component),ctrl_root) ? "Controller Settings"
+                                                                  : "Display Settings";
     else if (describing && !strcmp(term,"Common/DetailText/Config0007")) /* Logo Usage's description */
-        text="Change the window mode, resolution, VSync, frame rate limit and render resolution";
-    else if (display_mode) {
-        if (!strcmp(term,"Scene/Config/TopButton/002")) text="Display Settings";
-        else if (!strcmp(term,"Scene/Config/MsSettings/004")) /* both pills */
-            text=component && in_row(component,row_item[ROW_RESOLUTION]) ? "Resolution" : "Window mode";
-        else if (!strcmp(term,"Scene/Config/MsSettings/010")) text="VSync";
-        else if (!strcmp(term,"Scene/Config/MsSettings/017")) text="Frame rate limit";
-        else if (!strcmp(term,"Scene/Config/MsSettings/011")) text="Render resolution";
-        else if ((!strcmp(term,"Scene/Config/On") || !strcmp(term,"Scene/Config/Off")) && component &&
-                 in_row(component,row_item[ROW_RENDER])) /* the selector's two values */
-            text=term[14]=='n' ? "1080p" : "4K";
-        else if (!strncmp(term,"Scene/Config/",13) && term[13]>='1' && term[13]<='5' && !term[14]) text=fps_ticks[term[13]-'0'];
-        else if (!strcmp(term,"Common/HelpBar/DedicatedScene")) { /* the pills' "Open setting window" */
+        text=describing==PAGE_NOTE_SKIN
+            ? "Customize Touch, Slide, Hold, Slidehold and Joint Line colors (hue & saturation) and matching stage particles"
+            : describing==PAGE_CONTROLLER
+            ? "Choose button prompts, confirm / cancel layout and background controller input"
+            : "Change the window mode, resolution, VSync, frame rate limit and render resolution";
+    else if (page_mode) {
+        if (page_mode==PAGE_DISPLAY && !strcmp(term,"Common/HelpBar/DedicatedScene")) { /* the pills' "Open setting window" */
             void *swap=guest_text((const void *)r->rdi,"Common/HelpBar/SwitchSetting");
             if (swap) r->rdi=(uint64_t)(uintptr_t)swap;
             return 0;
-        } else for (int i=0;i<ROWS;++i) if (!strcmp(term,rows[i].detail)) text=rows[i].help;
+        }
+        if (!strcmp(term,"Scene/Config/TopButton/002"))
+            text=page_mode==PAGE_CONTROLLER ? "Controller Settings" : "Display Settings";
+        else if (page_mode==PAGE_DISPLAY) {
+            if (!strcmp(term,"Scene/Config/MsSettings/004")) /* both pills */
+                text=component && in_row(component,row_item[ROW_RESOLUTION]) ? "Resolution" : "Window mode";
+            else if (!strcmp(term,"Scene/Config/MsSettings/010")) text="VSync";
+            else if (!strcmp(term,"Scene/Config/MsSettings/017")) text="Frame rate limit";
+            else if (!strcmp(term,"Scene/Config/MsSettings/011")) text="Render resolution";
+            else if ((!strcmp(term,"Scene/Config/On") || !strcmp(term,"Scene/Config/Off")) && component &&
+                     in_row(component,row_item[ROW_RENDER])) /* the selector's two values */
+                text=term[14]=='n' ? "1080p" : "4K";
+            else if (!strncmp(term,"Scene/Config/",13) && term[13]>='1' && term[13]<='5' && !term[14]) text=fps_ticks[term[13]-'0'];
+            else for (int i=0;i<ROWS;++i) if (!strcmp(term,rows[i].detail)) text=rows[i].help;
+        } else if (page_mode==PAGE_CONTROLLER) {
+            if (!strcmp(term,"Scene/Config/MsSettings/004")) text="Button prompts";
+            else if (!strcmp(term,"Scene/Config/MsSettings/010")) text="Confirm / cancel layout";
+            else if (!strcmp(term,"Scene/Config/MsSettings/011")) text="Background controller";
+            else if ((!strcmp(term,"Scene/Config/On") || !strcmp(term,"Scene/Config/Off")) && component &&
+                     in_row(component,row_item[ROW_VSYNC]))
+                text=term[14]=='n' ? "Standard" : "Nintendo";
+            else for (int i=0;i<ROWS;++i) if (row_active(i) && !strcmp(term,rows[i].detail)) text=ctrl_helps[i];
+        }
     }
     void *translation=text ? guest_text((const void *)r->rdi,text) : NULL;
     if (!translation) return 0;
@@ -852,6 +1006,7 @@ static const Hook hooks[]={
     {H_ROW_VIEW, row_view, 0},                      /* ConfigListItemView::OnSetView */
     {H_HELP_ENTRY, help_entry, 6},                  /* HelpBarContent::RefleshDisplay (3 Colors) */
     {H_LANGUAGE_INPUT, language_input, 0},          /* ConfigLanguageMenuEditPartsMain::OnExecutedScenePartsMain */
+    {H_MS_INPUT, ms_input, 0},                      /* ConfigMusicStageEditPartsMain::OnExecutedScenePartsMain */
 };
 
 static unsigned char *emit(unsigned char *p, const void *bytes, size_t size) { memcpy(p,bytes,size); return p+size; }
@@ -950,7 +1105,7 @@ int runtime_display_page_install(unsigned char *image, uint64_t module_base, uns
     const int32_t rel32=(int32_t)(p-(site+5));
     p=emit_picker_stub(p);
     site[0]=0xe9; memcpy(site+1,&rel32,4); site[5]=0x90;
-    printf("Display page: Options > Display Settings and all display languages (%zu hooks, game %s)\n",
+    printf("Display page: Options > Display Settings, Controller Settings and all display languages (%zu hooks, game %s)\n",
            sizeof(hooks)/sizeof(*hooks),runtime_game_version());
     return 0;
 }

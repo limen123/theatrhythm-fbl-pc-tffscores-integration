@@ -9,6 +9,8 @@ const char *runtime_file_user_dir(void) { return user_dir; }
 int runtime_file_mount(const char *guest, const char *host) { (void)guest; (void)host; return 0; }
 void runtime_file_unmount(const char *point) { (void)point; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid) { (void)table; (void)count; (void)nid; return 0; }
+int runtime_tffscores_maybe_download_save(const char *save_host, const char *title_id) { (void)save_host; (void)title_id; return 0; }
+void runtime_tffscores_on_save_commit(const char *save_host) { (void)save_host; }
 
 static void touch(const char *path, time_t when) {
     FILE *f=fopen(path,"wb"); assert(f); fputs("x",f); fclose(f);

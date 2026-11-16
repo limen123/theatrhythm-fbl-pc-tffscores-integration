@@ -104,13 +104,41 @@ ImTextureData* splash_texture = nullptr;
 std::atomic<int> splash_state{SplashNone}, splash_lit_frames{0};
 std::atomic<s64> splash_since{0}, splash_fade_from{0};
 std::chrono::steady_clock::time_point last_present{};
-// The Display Settings panel (F10, or the Options menu's Display Settings button). The row and
-// dirty flag are guarded by imgui_mutex; the values live in TheatrhythmSettings.
+// The Settings panel (F10, or the Options menu's Display / Controller / Note Skins entries).
+// The active tab, focused row, and dirty flag are guarded by imgui_mutex; values live in TheatrhythmSettings.
 std::atomic<bool> display_open{false};
 std::atomic<bool> exit_requested{false}; // F4: the game shows "Exit the game?" (runtime_exit_prompt.c)
+enum SettingsTab : int { TabDisplay = 0, TabController, TabNoteSkins, TabCount };
+int settings_tab = TabDisplay;
 int display_row = 0;
 bool display_dirty = false;
-enum DisplayRow : int { RowMode, RowResolution, RowMonitor, RowVsync, RowFps, RowQueued, RowAnisotropy, RowRender, RowCount };
+enum DisplayRow : int {
+    RowMode = 0, RowResolution, RowMonitor, RowVsync, RowFps, RowQueued, RowAnisotropy, RowRender, DisplayRowCount
+};
+enum ControllerRow : int {
+    CtrlButtonPrompts = 0, CtrlConfirmLayout, CtrlBackgroundController, ControllerRowCount
+};
+enum NoteSkinLayout : int {
+    NoteSkinCatCount = TheatrhythmSettings::Values::NoteSkinCount,
+    NoteSkinSliderRows = NoteSkinCatCount * 2,
+    NoteSkinResetRow = NoteSkinSliderRows,
+    NoteSkinRowCount = NoteSkinResetRow + 1
+};
+struct NormRect { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; };
+NormRect tab_hit_rects[TabCount]{};
+NormRect slider_hit_rects[NoteSkinSliderRows]{};
+NormRect reset_hit_rect{};
+NormRect option_hit_rects[DisplayRowCount]{};
+int dragging_slider = -1;
+int held_dpad_x = 0, held_dpad_y = 0;
+int held_stick_x = 0, held_stick_y = 0;
+int held_key_x = 0, held_key_y = 0;
+bool held_fine = false;
+float hold_x_elapsed = 0.0f, hold_x_accum = 0.0f;
+float hold_y_elapsed = 0.0f, hold_y_accum = 0.0f;
+std::atomic<s64> input_guard_until_ms{0};
+enum ActivePadIcons : int { ActivePadPs4 = 0, ActivePadXbox, ActivePadSwitch };
+std::atomic<int> active_pad_icons{ActivePadPs4};
 
 // The colours of the game's own settings pages (Settings > MS Settings).
 namespace PageInk {
@@ -133,6 +161,31 @@ bool Swapped() {
     return TheatrhythmSettings::Get().menu_confirm_swap.load(std::memory_order_relaxed) != 0;
 }
 
+int EffectivePadIcons() {
+    switch (TheatrhythmSettings::Get().button_icons.load(std::memory_order_relaxed)) {
+    case TheatrhythmSettings::ButtonIconsPs4: return ActivePadPs4;
+    case TheatrhythmSettings::ButtonIconsXbox: return ActivePadXbox;
+    case TheatrhythmSettings::ButtonIconsSwitch: return ActivePadSwitch;
+    default: return active_pad_icons.load(std::memory_order_relaxed);
+    }
+}
+
+const char* ConfirmName() {
+    switch (EffectivePadIcons()) {
+    case ActivePadSwitch: return Swapped() ? "A" : "B";
+    case ActivePadXbox: return Swapped() ? "B" : "A";
+    default: return Swapped() ? "Circle (B)" : "Cross (A)";
+    }
+}
+
+const char* CancelName() {
+    switch (EffectivePadIcons()) {
+    case ActivePadSwitch: return Swapped() ? "B" : "A";
+    case ActivePadXbox: return Swapped() ? "A" : "B";
+    default: return Swapped() ? "Cross (A)" : "Circle (B)";
+    }
+}
+
 // The game's text dialog: what is typed, and how to finish (keyboard or controller).
 void TextEntryBox() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -153,8 +206,7 @@ void TextEntryBox() {
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Separator();
     ImGui::TextDisabled("Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel");
-    ImGui::TextDisabled(Swapped() ? "Controller: Circle (B) = OK, Cross (A) = cancel"
-                                  : "Controller: Cross (A) = OK, Circle (B) = cancel");
+    ImGui::TextDisabled("Controller: %s = OK, %s = cancel", ConfirmName(), CancelName());
     ImGui::End();
 }
 
@@ -278,8 +330,7 @@ void ChoiceBox() {
     ImGui::PopStyleVar();
     ImGui::EndChild();
     ImGui::Spacing();
-    ImGui::TextDisabled(Swapped() ? "Up/Down or D-pad: choose   Enter or Circle (B): OK   Esc or Cross (A): cancel"
-                                  : "Up/Down or D-pad: choose   Enter or Cross (A): OK   Esc or Circle (B): cancel");
+    ImGui::TextDisabled("Up/Down or D-pad: choose   Enter or %s: OK   Esc or %s: cancel", ConfirmName(), CancelName());
     ImGui::End();
 }
 
@@ -289,55 +340,145 @@ int StepValue(const std::array<T, N>& values, int current, int delta) {
     return values[(i + delta + int(N)) % int(N)];
 }
 
-// imgui_mutex held: the focused row's value one step forward (delta 1) or back (-1).
+int TabRowCount(int tab) {
+    switch (tab) {
+    case TabDisplay: return DisplayRowCount;
+    case TabController: return ControllerRowCount;
+    case TabNoteSkins: return NoteSkinRowCount;
+    default: return DisplayRowCount;
+    }
+}
+
+void ResetNoteSkinCategory(int cat) {
+    if (cat < 0 || cat >= NoteSkinCatCount) return;
+    auto& s = TheatrhythmSettings::Get();
+    s.note_skin_hue[cat].store(TheatrhythmSettings::Values::NoteSkinDefaultHue[cat], std::memory_order_relaxed);
+    s.note_skin_sat[cat].store(TheatrhythmSettings::Values::NoteSkinDefaultSat[cat], std::memory_order_relaxed);
+    s.note_skin_version.fetch_add(1, std::memory_order_release);
+    display_dirty = true;
+}
+
+void ResetAllNoteSkins() {
+    auto& s = TheatrhythmSettings::Get();
+    for (int i = 0; i < NoteSkinCatCount; ++i) {
+        s.note_skin_hue[i].store(TheatrhythmSettings::Values::NoteSkinDefaultHue[i], std::memory_order_relaxed);
+        s.note_skin_sat[i].store(TheatrhythmSettings::Values::NoteSkinDefaultSat[i], std::memory_order_relaxed);
+    }
+    s.note_skin_version.fetch_add(1, std::memory_order_release);
+    display_dirty = true;
+}
+
+void HsvToRgbF(int hue_deg, int sat_pct, float& r, float& g, float& b) {
+    const int hm = ((hue_deg % 360) + 360) % 360;
+    const float hf = float(hm) / 60.0f;
+    const float sf = float(std::clamp(sat_pct, 0, 100)) / 100.0f;
+    const int sec = int(hf);
+    const float f = hf - float(sec);
+    const float p = 1.0f - sf, q = 1.0f - sf * f, t = 1.0f - sf * (1.0f - f);
+    switch (sec % 6) {
+    case 0: r = 1.0f; g = t; b = p; break;
+    case 1: r = q; g = 1.0f; b = p; break;
+    case 2: r = p; g = 1.0f; b = t; break;
+    case 3: r = p; g = q; b = 1.0f; break;
+    case 4: r = t; g = p; b = 1.0f; break;
+    default: r = 1.0f; g = p; b = q; break;
+    }
+}
+
+ImU32 HsvImColor(int hue_deg, int sat_pct, int alpha = 255) {
+    float r = 1.0f, g = 1.0f, b = 1.0f;
+    HsvToRgbF(hue_deg, sat_pct, r, g, b);
+    return IM_COL32(int(r * 255.0f + 0.5f), int(g * 255.0f + 0.5f), int(b * 255.0f + 0.5f), alpha);
+}
+
+// imgui_mutex held: the focused row's value one step forward (delta > 0) or back (delta < 0).
 void ChangeDisplayRow(int row, int delta) {
     namespace G = TheatrhythmGraphics;
     auto& s = TheatrhythmSettings::Get();
-    switch (row) {
-    case RowMode: s.display_mode = (s.display_mode + delta + G::DisplayModeCount) % G::DisplayModeCount; break;
-    case RowResolution: { // listed largest first: right steps up to a larger size
-        const auto& sizes = s.resolutions;
-        if (sizes.empty()) return;
-        const std::pair<int, int> now{s.window_width.load(), s.window_height.load()};
-        int at = 0;
-        while (at + 1 < int(sizes.size()) && sizes[at] > now) ++at;
-        at = std::clamp(at - delta, 0, int(sizes.size()) - 1);
-        s.window_width = sizes[at].first;
-        s.window_height = sizes[at].second;
-        break;
-    }
-    case RowMonitor: { // the primary, then each listed display
-        const int count = int(s.monitors.size()) + 1;
-        int at = 0;
-        for (int i = 0; i < int(s.monitors.size()); ++i) {
-            if (s.monitors[i] == s.monitor) at = i + 1;
+    if (settings_tab == TabDisplay) {
+        switch (row) {
+        case RowMode: s.display_mode = (s.display_mode + delta + G::DisplayModeCount) % G::DisplayModeCount; break;
+        case RowResolution: { // listed largest first: right steps up to a larger size
+            const auto& sizes = s.resolutions;
+            if (sizes.empty()) return;
+            const std::pair<int, int> now{s.window_width.load(), s.window_height.load()};
+            int at = 0;
+            while (at + 1 < int(sizes.size()) && sizes[at] > now) ++at;
+            at = std::clamp(at - delta, 0, int(sizes.size()) - 1);
+            s.window_width = sizes[at].first;
+            s.window_height = sizes[at].second;
+            break;
         }
-        at = (at + delta + count) % count;
-        s.monitor = at == 0 ? G::PrimaryMonitor : s.monitors[at - 1];
-        break;
-    }
-    case RowVsync: { // On, Off, Off with tearing
-        const int at = (s.vsync ? 0 : s.tearing ? 2 : 1) + delta;
-        const int next = (at + 3) % 3;
-        s.vsync = next == 0;
-        s.tearing = next == 2;
-        break;
-    }
-    case RowFps: s.fps_limit = StepValue(G::FpsLimits, s.fps_limit, delta); break;
-    case RowQueued: s.frames_queued = StepValue(G::FramesQueued, s.frames_queued, delta); break;
-    case RowAnisotropy: s.anisotropy = StepValue(G::Anisotropies, s.anisotropy, delta); break;
-    case RowRender:
-        s.render_resolution = s.render_resolution == TheatrhythmSettings::Render4k ? TheatrhythmSettings::Render1080p
-                                                                                   : TheatrhythmSettings::Render4k;
-        break;
-    default: return;
+        case RowMonitor: { // the primary, then each listed display
+            const int count = int(s.monitors.size()) + 1;
+            int at = 0;
+            for (int i = 0; i < int(s.monitors.size()); ++i) {
+                if (s.monitors[i] == s.monitor) at = i + 1;
+            }
+            at = (at + delta + count) % count;
+            s.monitor = at == 0 ? G::PrimaryMonitor : s.monitors[at - 1];
+            break;
+        }
+        case RowVsync: { // On, Off with tearing (Immediate), Off (Mailbox)
+            const int at = (s.vsync ? 0 : s.tearing ? 1 : 2) + delta;
+            const int next = (at + 3) % 3;
+            s.vsync = next == 0;
+            s.tearing = next == 1;
+            break;
+        }
+        case RowFps: s.fps_limit = StepValue(G::FpsLimits, s.fps_limit, delta); break;
+        case RowQueued: s.frames_queued = StepValue(G::FramesQueued, s.frames_queued, delta); break;
+        case RowAnisotropy: s.anisotropy = StepValue(G::Anisotropies, s.anisotropy, delta); break;
+        case RowRender:
+            s.render_resolution = s.render_resolution == TheatrhythmSettings::Render4k ? TheatrhythmSettings::Render1080p
+                                                                                       : TheatrhythmSettings::Render4k;
+            break;
+        default: return;
+        }
+    } else if (settings_tab == TabController) {
+        switch (row) {
+        case CtrlButtonPrompts: {
+            const int cur = s.button_icons.load(std::memory_order_relaxed);
+            s.button_icons = (cur + delta + TheatrhythmSettings::ButtonIconsCount) % TheatrhythmSettings::ButtonIconsCount;
+            break;
+        }
+        case CtrlConfirmLayout:
+            s.menu_confirm_swap = s.menu_confirm_swap.load(std::memory_order_relaxed) ? 0 : 1;
+            break;
+        case CtrlBackgroundController:
+            s.background_controller = !s.background_controller.load(std::memory_order_relaxed);
+            break;
+        default: return;
+        }
+    } else if (settings_tab == TabNoteSkins) {
+        if (row == NoteSkinResetRow) {
+            ResetAllNoteSkins();
+            return;
+        }
+        if (row < 0 || row >= NoteSkinSliderRows) return;
+        const int cat = row / 2;
+        const bool is_sat = (row & 1) != 0;
+        const int step = delta;
+        if (is_sat) {
+            const int cur = s.note_skin_sat[cat].load(std::memory_order_relaxed);
+            s.note_skin_sat[cat].store(std::clamp(cur + step, 0, 100), std::memory_order_relaxed);
+        } else {
+            const int cur = s.note_skin_hue[cat].load(std::memory_order_relaxed);
+            s.note_skin_hue[cat].store(std::clamp(cur + step, 0, 360), std::memory_order_relaxed);
+        }
+        s.note_skin_version.fetch_add(1, std::memory_order_release);
     }
     display_dirty = true;
 }
 
-// imgui_mutex held. Saving happens once, on close.
+// imgui_mutex held. Saving happens once, on close. Keep game input guarded briefly on close
+// so releasing Cancel (Circle/B/Esc) never leaks through and backs out of an underlying menu.
 void CloseDisplaySettings() {
     display_open = false;
+    dragging_slider = -1;
+    held_dpad_x = held_dpad_y = held_stick_x = held_stick_y = held_key_x = held_key_y = 0;
+    held_fine = false;
+    input_guard_until_ms.store(NowMs() + 220, std::memory_order_relaxed);
     if (display_dirty) {
         display_dirty = false;
         TheatrhythmSettings::SaveDisplay();
@@ -350,62 +491,90 @@ struct DisplayRowText {
     const char* help;
 };
 
-DisplayRowText DisplayRowAt(int row) {
+DisplayRowText DisplayRowAt(int tab, int row) {
     auto& s = TheatrhythmSettings::Get();
-    switch (row) {
-    case RowMode: {
-        static const char* const names[] = {"Windowed", "Borderless windowed", "Fullscreen"};
-        return {"Window mode", names[std::clamp(s.display_mode.load(), 0, 2)],
-                "Windowed, a borderless window covering the screen, or exclusive fullscreen."};
-    }
-    case RowResolution: {
-        std::string text = std::to_string(s.window_width.load()) + " x " + std::to_string(s.window_height.load());
-        if (s.display_mode == TheatrhythmGraphics::Borderless) text += "  (desktop in borderless)";
-        return {"Resolution", text,
-                "The window's size when windowed, the screen mode in fullscreen. Borderless always uses the "
-                "desktop resolution."};
-    }
-    case RowMonitor: {
-        std::string name = "Primary display";
-        for (size_t i = 0; i < s.monitors.size() && i < s.monitor_names.size(); ++i) {
-            if (s.monitors[i] == s.monitor) name = std::to_string(s.monitors[i] + 1) + ": " + s.monitor_names[i];
+    if (tab == TabDisplay) {
+        switch (row) {
+        case RowMode: {
+            static const char* const names[] = {"Windowed", "Borderless windowed", "Fullscreen"};
+            return {"Window mode", names[std::clamp(s.display_mode.load(), 0, 2)],
+                    "Windowed, a borderless window covering the screen, or exclusive fullscreen."};
         }
-        return {"Monitor", name, "The display the game window is on."};
+        case RowResolution: {
+            std::string text = std::to_string(s.window_width.load()) + " x " + std::to_string(s.window_height.load());
+            if (s.display_mode == TheatrhythmGraphics::Borderless) text += "  (desktop in borderless)";
+            return {"Resolution", text,
+                    "The window's size when windowed, the screen mode in fullscreen. Borderless always uses the "
+                    "desktop resolution."};
+        }
+        case RowMonitor: {
+            std::string name = "Primary display";
+            for (size_t i = 0; i < s.monitors.size() && i < s.monitor_names.size(); ++i) {
+                if (s.monitors[i] == s.monitor) name = std::to_string(s.monitors[i] + 1) + ": " + s.monitor_names[i];
+            }
+            return {"Monitor", name, "The display the game window is on."};
+        }
+        case RowVsync:
+            return {"VSync", s.vsync ? "On" : s.tearing ? "Off, tearing allowed" : "Off",
+                    "On waits for the monitor: no tearing, slightly more input delay. Off, tearing allowed shows "
+                    "each frame at once: the least delay, and the only way past twice the refresh rate. Off "
+                    "(Mailbox) shows the newest frame at each refresh, still without tearing."};
+        case RowFps: {
+            const int fps = s.fps_limit;
+            std::string value = fps == TheatrhythmGraphics::FpsUnlimited
+                                    ? (s.vsync ? "Unlimited (capped by VSync)" : "Unlimited")
+                                    : (fps ? std::to_string(fps) + " FPS" : "Display rate");
+            return {"Frame rate limit",
+                    std::move(value),
+                    "Caps how often frames are shown. Display rate follows the monitor's refresh. Unlimited is as "
+                    "fast as the GPU goes; pair it with VSync off, tearing allowed."};
+        }
+        case RowQueued: {
+            const int queued = s.frames_queued;
+            return {"Frames queued", queued == 1 ? "1 (lowest latency)" : queued ? std::to_string(queued) : "Unbounded",
+                    "Frames the CPU may prepare ahead of the GPU. Fewer means lower input latency; more can smooth "
+                    "out a slow GPU."};
+        }
+        case RowAnisotropy: {
+            const int value = s.anisotropy;
+            std::string text = value ? std::to_string(value) + "x" : "Game default";
+            if (value != s.startup_anisotropy) text += "  (after restart)";
+            return {"Anisotropic filtering", text, "Sharper textures seen at an angle. Applies after a restart."};
+        }
+        case RowRender: {
+            const int value = s.render_resolution;
+            std::string text = value == TheatrhythmSettings::Render4k ? "4K (3840 x 2160)" : "1080p";
+            if (value != s.startup_render_resolution) text += "  (after restart)";
+            return {"Render resolution", text,
+                    "4K as on PS4 Pro, filtered down to the window: sharper. 1080p as on PS4: lighter on the GPU. "
+                    "Applies after a restart."};
+        }
+        default: return {"", "", ""};
+        }
     }
-    case RowVsync:
-        return {"VSync", s.vsync ? "On" : s.tearing ? "Off, tearing allowed" : "Off",
-                "On waits for the monitor: no tearing, slightly more input delay. Off shows the newest frame "
-                "at each refresh, still without tearing. Off, tearing allowed shows each frame at once: the "
-                "least delay, and the only way past twice the refresh rate."};
-    case RowFps: {
-        const int fps = s.fps_limit;
-        return {"Frame rate limit",
-                fps == TheatrhythmGraphics::FpsUnlimited ? "Unlimited" : fps ? std::to_string(fps) + " FPS" : "Display rate",
-                "Caps how often frames are shown. Display rate follows the monitor's refresh. Unlimited is as "
-                "fast as the GPU goes; pair it with VSync off, tearing allowed."};
+    if (tab == TabController) {
+        switch (row) {
+        case CtrlButtonPrompts: {
+            static const char* const names[TheatrhythmSettings::ButtonIconsCount] = {
+                "Auto (by device)", "PlayStation", "Xbox", "Switch (Xbox art)", "Keyboard"};
+            const int idx = std::clamp(s.button_icons.load(std::memory_order_relaxed), 0,
+                                       TheatrhythmSettings::ButtonIconsCount - 1);
+            return {"Button prompts", names[idx],
+                    "Button icons shown in prompts and the Live Info pad. Switch uses Xbox icons with A/B and X/Y swapped."};
+        }
+        case CtrlConfirmLayout: {
+            const bool swapped = s.menu_confirm_swap.load(std::memory_order_relaxed) != 0;
+            return {"Confirm / cancel layout",
+                    swapped ? "Nintendo (Right = OK, Down = back)" : "Standard (Down = OK, Right = back)",
+                    "Nintendo layout uses the right button to confirm and down button to cancel with any controller."};
+        }
+        case CtrlBackgroundController:
+            return {"Background controller", s.background_controller.load(std::memory_order_relaxed) ? "On" : "Off",
+                    "Keep reading controller input and vibration even when another window is focused."};
+        default: return {"", "", ""};
+        }
     }
-    case RowQueued: {
-        const int queued = s.frames_queued;
-        return {"Frames queued", queued == 1 ? "1 (lowest latency)" : queued ? std::to_string(queued) : "Unbounded",
-                "Frames the CPU may prepare ahead of the GPU. Fewer means lower input latency; more can smooth "
-                "out a slow GPU."};
-    }
-    case RowAnisotropy: {
-        const int value = s.anisotropy;
-        std::string text = value ? std::to_string(value) + "x" : "Game default";
-        if (value != s.startup_anisotropy) text += "  (after restart)";
-        return {"Anisotropic filtering", text, "Sharper textures seen at an angle. Applies after a restart."};
-    }
-    case RowRender: {
-        const int value = s.render_resolution;
-        std::string text = value == TheatrhythmSettings::Render4k ? "4K (3840 x 2160)" : "1080p";
-        if (value != s.startup_render_resolution) text += "  (after restart)";
-        return {"Render resolution", text,
-                "4K as on PS4 Pro, filtered down to the window: sharper. 1080p as on PS4: lighter on the GPU. "
-                "Applies after a restart."};
-    }
-    default: return {"", "", ""};
-    }
+    return {"", "", ""};
 }
 
 // Text as the game's pages draw it: white with a dark rim, a little heavier than the plain face.
@@ -459,8 +628,153 @@ void Gear(ImDrawList* dl, ImVec2 at, float r) {
 
 // The Display Settings page, drawn like the game's own settings pages (Settings > MS Settings):
 // a blue header with the path, then one blue row per setting with its value in a navy pill. The
+const char* LeftTabButtonName() {
+    const int icons = active_pad_icons.load(std::memory_order_relaxed);
+    return icons == ActivePadXbox ? "LB" : icons == ActivePadSwitch ? "L" : "L1";
+}
+
+const char* RightTabButtonName() {
+    const int icons = active_pad_icons.load(std::memory_order_relaxed);
+    return icons == ActivePadXbox ? "RB" : icons == ActivePadSwitch ? "R" : "R1";
+}
+
+void DrawNotePreview(ImDrawList* dl, int cat, ImVec2 center, float r, int hue, int sat) {
+    const ImU32 fill = HsvImColor(hue, sat);
+    const ImU32 white = IM_COL32(250, 252, 255, 255);
+    const ImU32 rim = IM_COL32(18, 22, 34, 240);
+    if (cat == 0) { // Touch: circle + white inner ring
+        dl->AddCircleFilled(center, r, rim);
+        dl->AddCircleFilled(center, r * 0.86f, fill);
+        dl->AddCircle(center, r * 0.48f, white, 0, r * 0.16f);
+    } else if (cat == 1) { // Slide: glowing badge + white right chevron
+        dl->AddCircleFilled(center, r, rim);
+        dl->AddCircleFilled(center, r * 0.86f, fill);
+        const ImVec2 arrow[3] = {ImVec2(center.x - r * 0.24f, center.y - r * 0.34f),
+                                 ImVec2(center.x + r * 0.32f, center.y),
+                                 ImVec2(center.x - r * 0.24f, center.y + r * 0.34f)};
+        dl->AddPolyline(arrow, 3, white, ImDrawFlags_None, std::max(2.0f, r * 0.18f));
+    } else if (cat == 2) { // Hold: trailing hold beam + start trigger
+        const ImU32 tail = HsvImColor(hue, sat, 185);
+        dl->AddRectFilled(ImVec2(center.x, center.y - r * 0.38f), ImVec2(center.x + r * 1.35f, center.y + r * 0.38f),
+                          rim, r * 0.35f);
+        dl->AddRectFilled(ImVec2(center.x, center.y - r * 0.26f), ImVec2(center.x + r * 1.28f, center.y + r * 0.26f),
+                          tail, r * 0.26f);
+        dl->AddCircleFilled(center, r * 0.92f, rim);
+        dl->AddCircleFilled(center, r * 0.78f, fill);
+        dl->AddCircleFilled(center, r * 0.30f, white);
+    } else if (cat == 3) { // Slidehold: trailing ribbon + chevron hold node
+        const ImU32 tail = HsvImColor(hue, sat, 185);
+        dl->AddRectFilled(ImVec2(center.x, center.y - r * 0.36f), ImVec2(center.x + r * 1.35f, center.y + r * 0.36f),
+                          rim, r * 0.32f);
+        dl->AddRectFilled(ImVec2(center.x, center.y - r * 0.24f), ImVec2(center.x + r * 1.28f, center.y + r * 0.24f),
+                          tail, r * 0.24f);
+        dl->AddCircleFilled(center, r * 0.92f, rim);
+        dl->AddCircleFilled(center, r * 0.78f, fill);
+        const ImVec2 arrow[3] = {ImVec2(center.x - r * 0.20f, center.y - r * 0.28f),
+                                 ImVec2(center.x + r * 0.28f, center.y),
+                                 ImVec2(center.x - r * 0.20f, center.y + r * 0.28f)};
+        dl->AddPolyline(arrow, 3, white, ImDrawFlags_None, std::max(2.0f, r * 0.16f));
+    } else { // Joint Lines: same-time connector bar + two endpoint nodes
+        const float w = r * 1.15f;
+        dl->AddRectFilled(ImVec2(center.x - w, center.y - r * 0.22f), ImVec2(center.x + w, center.y + r * 0.22f), rim,
+                          r * 0.22f);
+        dl->AddRectFilled(ImVec2(center.x - w, center.y - r * 0.14f), ImVec2(center.x + w, center.y + r * 0.14f),
+                          fill, r * 0.14f);
+        dl->AddLine(ImVec2(center.x - w * 0.85f, center.y), ImVec2(center.x + w * 0.85f, center.y),
+                    IM_COL32(255, 255, 255, 190), std::max(1.5f, r * 0.08f));
+        dl->AddCircleFilled(ImVec2(center.x - w, center.y), r * 0.34f, rim);
+        dl->AddCircleFilled(ImVec2(center.x - w, center.y), r * 0.23f, white);
+        dl->AddCircleFilled(ImVec2(center.x + w, center.y), r * 0.34f, rim);
+        dl->AddCircleFilled(ImVec2(center.x + w, center.y), r * 0.23f, white);
+    }
+}
+
+void DrawGradientSlider(ImDrawList* dl, float x0, float y0, float x1, float y1, float norm, int hue, bool is_sat,
+                        bool focused, float px) {
+    const float h = y1 - y0;
+    const float r = h * 0.35f;
+    dl->AddRectFilled(ImVec2(x0 - 2.0f * px, y0 - 2.0f * px), ImVec2(x1 + 2.0f * px, y1 + 2.0f * px),
+                      focused ? PageInk::Yellow : PageInk::Outline, r + 2.0f * px);
+    if (is_sat) {
+        const ImU32 full = HsvImColor(hue, 100);
+        dl->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, y1), IM_COL32(255, 255, 255, 255), full, full,
+                                    IM_COL32(255, 255, 255, 255));
+    } else {
+        static const ImU32 stops[7] = {IM_COL32(255, 0, 0, 255),   IM_COL32(255, 255, 0, 255),
+                                       IM_COL32(0, 255, 0, 255),   IM_COL32(0, 255, 255, 255),
+                                       IM_COL32(0, 0, 255, 255),   IM_COL32(255, 0, 255, 255),
+                                       IM_COL32(255, 0, 0, 255)};
+        const float seg_w = (x1 - x0) / 6.0f;
+        for (int i = 0; i < 6; ++i) {
+            const float sx0 = x0 + seg_w * float(i);
+            const float sx1 = i == 5 ? x1 : x0 + seg_w * float(i + 1);
+            dl->AddRectFilledMultiColor(ImVec2(sx0, y0), ImVec2(sx1, y1), stops[i], stops[i + 1], stops[i + 1],
+                                        stops[i]);
+        }
+    }
+    const float tx = x0 + std::clamp(norm, 0.0f, 1.0f) * (x1 - x0);
+    const float tw = 7.0f * px, th = h * 0.5f + 4.0f * px, cy = (y0 + y1) * 0.5f;
+    dl->AddRectFilled(ImVec2(tx - tw - 2.0f * px, cy - th - 2.0f * px),
+                      ImVec2(tx + tw + 2.0f * px, cy + th + 2.0f * px), PageInk::Outline, 4.0f * px);
+    dl->AddRectFilled(ImVec2(tx - tw, cy - th), ImVec2(tx + tw, cy + th),
+                      focused ? PageInk::Yellow : PageInk::Text, 3.0f * px);
+}
+
+void UpdateHeldInput(float dt) {
+    if (dt <= 0.0f || dt > 0.2f) dt = 1.0f / 60.0f;
+    const int dir_y = held_dpad_y ? held_dpad_y : (held_stick_y ? held_stick_y : held_key_y);
+    const int dir_x = held_dpad_x ? held_dpad_x : (held_stick_x ? held_stick_x : held_key_x);
+    if (dir_y) {
+        hold_y_elapsed += dt;
+        if (hold_y_elapsed >= 0.28f) {
+            hold_y_accum += dt;
+            while (hold_y_accum >= 0.11f) {
+                hold_y_accum -= 0.11f;
+                const int n = TabRowCount(settings_tab);
+                display_row = (display_row + dir_y + n) % n;
+            }
+        }
+    } else {
+        hold_y_elapsed = 0.0f;
+        hold_y_accum = 0.0f;
+    }
+    if (dir_x && settings_tab == TabNoteSkins && display_row >= 0 && display_row < NoteSkinSliderRows) {
+        hold_x_elapsed += dt;
+        if (hold_x_elapsed >= 0.20f) {
+            const bool is_sat = (display_row & 1) != 0;
+            const float rate = held_fine ? 18.0f : (is_sat ? (hold_x_elapsed > 0.6f ? 85.0f : 45.0f)
+                                                           : (hold_x_elapsed > 0.6f ? 170.0f : 80.0f));
+            hold_x_accum += dt * rate;
+            const int steps = int(hold_x_accum);
+            if (steps > 0) {
+                hold_x_accum -= float(steps);
+                ChangeDisplayRow(display_row, dir_x * steps);
+            }
+        }
+    } else {
+        hold_x_elapsed = 0.0f;
+        hold_x_accum = 0.0f;
+    }
+}
+
+void SetNoteSkinSliderFromNorm(int slider_row, float u) {
+    if (slider_row < 0 || slider_row >= NoteSkinSliderRows) return;
+    auto& s = TheatrhythmSettings::Get();
+    const int cat = slider_row / 2;
+    const bool is_sat = (slider_row & 1) != 0;
+    const float clamped = std::clamp(u, 0.0f, 1.0f);
+    if (is_sat) {
+        s.note_skin_sat[cat].store(std::clamp(int(std::lround(clamped * 100.0f)), 0, 100), std::memory_order_relaxed);
+    } else {
+        s.note_skin_hue[cat].store(std::clamp(int(std::lround(clamped * 360.0f)), 0, 360), std::memory_order_relaxed);
+    }
+    s.note_skin_version.fetch_add(1, std::memory_order_release);
+    display_dirty = true;
+}
+
 // focused row turns cyan on the left and the glove points at it.
 void DisplaySettingsBox() {
+    UpdateHeldInput(ImGui::GetIO().DeltaTime);
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float px = viewport->Size.y / 1080.0f;
     ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
@@ -473,6 +787,11 @@ void DisplaySettingsBox() {
     ImFont* font = ImGui::GetFont();
     const ImVec2 o = viewport->Pos, size = viewport->Size;
     const float right = o.x + size.x, bottom = o.y + size.y;
+    const float inv_w = size.x > 0.0f ? 1.0f / size.x : 0.0f;
+    const float inv_h = size.y > 0.0f ? 1.0f / size.y : 0.0f;
+    const auto to_norm = [&](float ax0, float ay0, float ax1, float ay1) -> NormRect {
+        return {(ax0 - o.x) * inv_w, (ay0 - o.y) * inv_h, (ax1 - o.x) * inv_w, (ay1 - o.y) * inv_h};
+    };
 
     dl->AddRectFilledMultiColor(o, ImVec2(right, bottom), PageInk::Page, PageInk::Page, PageInk::PageLow,
                                 PageInk::PageLow);
@@ -481,95 +800,377 @@ void DisplaySettingsBox() {
                                 PageInk::HeaderLow, PageInk::Header);
     dl->AddRectFilled(ImVec2(o.x, o.y + header_h), ImVec2(right, o.y + header_h + 4.0f * px), PageInk::HeaderRule);
     Gear(dl, ImVec2(o.x + 76.0f * px, o.y + header_h * 0.48f), 24.0f * px);
-    const float title = 54.0f * px, crumb = 36.0f * px;
+    const float title = 50.0f * px;
     PageText(dl, font, title, ImVec2(o.x + 118.0f * px, o.y + (header_h - title) * 0.5f - 2.0f * px), "Settings");
     const float title_w = font->CalcTextSizeA(title, FLT_MAX, 0.0f, "Settings").x;
     const float crumb_x = o.x + 118.0f * px + title_w + 22.0f * px, crumb_mid = o.y + header_h * 0.5f;
     dl->AddTriangleFilled(ImVec2(crumb_x, crumb_mid - 10.0f * px), ImVec2(crumb_x + 13.0f * px, crumb_mid),
                           ImVec2(crumb_x, crumb_mid + 10.0f * px), PageInk::Text);
-    PageText(dl, font, crumb, ImVec2(crumb_x + 28.0f * px, crumb_mid - crumb * 0.55f), "Display Settings");
+
+    // L / R Tab Bar inside Header
+    static const char* const tab_names[TabCount] = {"Display", "Controller", "Note Skins"};
+    const float tab_font = 28.0f * px, badge_font = 22.0f * px;
+    const float tab_h = 54.0f * px, tab_y0 = crumb_mid - tab_h * 0.5f, tab_y1 = crumb_mid + tab_h * 0.5f;
+    float tx = crumb_x + 30.0f * px;
+    const char* l_btn = LeftTabButtonName();
+    const float lbw = font->CalcTextSizeA(badge_font, FLT_MAX, 0.0f, l_btn).x + 22.0f * px;
+    dl->AddRectFilled(ImVec2(tx, crumb_mid - 19.0f * px), ImVec2(tx + lbw, crumb_mid + 19.0f * px), PageInk::Pill,
+                      8.0f * px);
+    dl->AddRect(ImVec2(tx, crumb_mid - 19.0f * px), ImVec2(tx + lbw, crumb_mid + 19.0f * px), PageInk::RowRim,
+                8.0f * px, 0, 2.0f * px);
+    PageText(dl, font, badge_font, ImVec2(tx + 11.0f * px, crumb_mid - badge_font * 0.55f), l_btn, PageInk::Yellow);
+    tx += lbw + 14.0f * px;
+    for (int t = 0; t < TabCount; ++t) {
+        const bool active = t == settings_tab;
+        const float tw = font->CalcTextSizeA(tab_font, FLT_MAX, 0.0f, tab_names[t]).x + 42.0f * px;
+        dl->AddRectFilled(ImVec2(tx, tab_y0), ImVec2(tx + tw, tab_y1), active ? PageInk::Focus : PageInk::Pill,
+                          12.0f * px);
+        dl->AddRect(ImVec2(tx, tab_y0), ImVec2(tx + tw, tab_y1), active ? PageInk::Yellow : PageInk::RowRim, 12.0f * px,
+                    0, active ? 3.0f * px : 2.0f * px);
+        PageText(dl, font, tab_font, ImVec2(tx + 21.0f * px, crumb_mid - tab_font * 0.55f), tab_names[t],
+                 active ? PageInk::Text : PageInk::Help);
+        tab_hit_rects[t] = to_norm(tx, tab_y0, tx + tw, tab_y1);
+        tx += tw + 12.0f * px;
+    }
+    const char* r_btn = RightTabButtonName();
+    const float rbw = font->CalcTextSizeA(badge_font, FLT_MAX, 0.0f, r_btn).x + 22.0f * px;
+    dl->AddRectFilled(ImVec2(tx + 2.0f * px, crumb_mid - 19.0f * px), ImVec2(tx + 2.0f * px + rbw, crumb_mid + 19.0f * px),
+                      PageInk::Pill, 8.0f * px);
+    dl->AddRect(ImVec2(tx + 2.0f * px, crumb_mid - 19.0f * px), ImVec2(tx + 2.0f * px + rbw, crumb_mid + 19.0f * px),
+                PageInk::RowRim, 8.0f * px, 0, 2.0f * px);
+    PageText(dl, font, badge_font, ImVec2(tx + 13.0f * px, crumb_mid - badge_font * 0.55f), r_btn, PageInk::Yellow);
 
     const float x0 = o.x + std::max(140.0f * px, size.x * 0.075f), x1 = right - std::max(80.0f * px, size.x * 0.042f);
-    const float row_h = 80.0f * px, gap = 18.0f * px, label = 36.0f * px, value = 34.0f * px;
-    float y = o.y + header_h + 34.0f * px;
+    float y = o.y + header_h + 26.0f * px;
     const char* help = "";
-    for (int row = 0; row < RowCount; ++row) {
-        const DisplayRowText text = DisplayRowAt(row);
-        const bool focus = row == display_row;
-        const ImVec2 a(x0, y), b(x1, y + row_h);
-        const float mid = y + row_h * 0.5f, rounding = 14.0f * px;
-        dl->AddRectFilled(a, b, PageInk::Row, rounding);
-        if (focus) {
-            const float split = x0 + (x1 - x0) * 0.44f, tip = row_h * 0.22f, inset = 5.0f * px;
-            const ImVec2 band[5] = {ImVec2(x0 + inset, y + inset), ImVec2(split, y + inset), ImVec2(split + tip, mid),
-                                    ImVec2(split, b.y - inset), ImVec2(x0 + inset, b.y - inset)};
-            dl->AddConvexPolyFilled(band, 5, PageInk::Focus);
-            const float t = 8.0f * px, span = split - x0 - 90.0f * px;
-            for (int i = 0; i < 16; ++i) { // the band's faint triangle pattern
-                const float tx = x0 + 60.0f * px + span * float((i * 37) % 100) / 100.0f;
-                const float ty = y + 12.0f * px + (row_h - 30.0f * px) * float((i * 61) % 100) / 100.0f;
-                if (i & 1) {
-                    dl->AddTriangleFilled(ImVec2(tx, ty), ImVec2(tx + t, ty), ImVec2(tx + t * 0.5f, ty + t), PageInk::FocusSpeck);
-                } else {
-                    dl->AddTriangleFilled(ImVec2(tx, ty + t), ImVec2(tx + t, ty + t), ImVec2(tx + t * 0.5f, ty), PageInk::FocusSpeck);
+    for (auto& r : option_hit_rects) r = {};
+    for (auto& r : slider_hit_rects) r = {};
+    reset_hit_rect = {};
+
+    if (settings_tab == TabNoteSkins) {
+        auto& s = TheatrhythmSettings::Get();
+        static const char* const cat_names[NoteSkinCatCount] = {"Touch", "Slide", "Hold", "Slidehold", "Joint Lines"};
+        static const char* const cat_sub[NoteSkinCatCount] = {
+            "Notes & hit burst particles", "Slide/TwinSlide & burst particles", "Holds, hold lines & ripple particles",
+            "SlideHold circles/ribbons & ripples", "Same-time connector bar"};
+        static const char* const cat_help[NoteSkinCatCount] = {
+            "Customize Touch note hue & saturation; Touch hit burst particles match this color.",
+            "Customize Slide & TwinSlide hue & saturation; Slide hit burst particles match this color.",
+            "Customize Hold notes, lines & held indicator; Hold bursts and ripples match this color.",
+            "Customize SlideHold circles, arrows, ribbons & ticks; SlideHold ripples and bursts match this color.",
+            "Customize the Joint Line bar connecting simultaneous triggers."};
+
+        const float avail = std::max(200.0f * px, bottom - y - 122.0f * px);
+        const float reset_h = std::min(56.0f * px, avail * 0.09f);
+        const float gap = std::min(10.0f * px, avail * 0.015f);
+        const float card_h = std::min(138.0f * px, (avail - reset_h - float(NoteSkinCatCount) * gap) / float(NoteSkinCatCount));
+        const float split = x0 + (x1 - x0) * 0.36f;
+
+        for (int c = 0; c < NoteSkinCatCount; ++c) {
+            const int hue = s.note_skin_hue[c].load(std::memory_order_relaxed);
+            const int sat = s.note_skin_sat[c].load(std::memory_order_relaxed);
+            const bool card_focused = (display_row / 2) == c && display_row < NoteSkinSliderRows;
+            const ImVec2 a(x0, y), b(x1, y + card_h);
+            const float rounding = 14.0f * px, card_mid = y + card_h * 0.5f;
+            dl->AddRectFilled(a, b, PageInk::Row, rounding);
+            if (card_focused) {
+                const float tip = card_h * 0.14f, inset = 4.0f * px;
+                const ImVec2 band[5] = {ImVec2(x0 + inset, y + inset), ImVec2(split, y + inset),
+                                        ImVec2(split + tip, card_mid), ImVec2(split, b.y - inset),
+                                        ImVec2(x0 + inset, b.y - inset)};
+                dl->AddConvexPolyFilled(band, 5, PageInk::Focus);
+                help = cat_help[c];
+            }
+            dl->AddRect(a, b, card_focused ? PageInk::Yellow : PageInk::RowRim, rounding, 0,
+                        card_focused ? 3.0f * px : 2.5f * px);
+
+            const float icon_r = std::min(28.0f * px, card_h * 0.24f);
+            DrawNotePreview(dl, c, ImVec2(x0 + 54.0f * px, card_mid), icon_r, hue, sat);
+            const float title_sz = std::min(34.0f * px, card_h * 0.28f);
+            const float sub_sz = std::min(20.0f * px, card_h * 0.16f);
+            const float label_x = x0 + 114.0f * px;
+            PageText(dl, font, title_sz, ImVec2(label_x, card_mid - title_sz * 0.85f), cat_names[c]);
+            PageText(dl, font, sub_sz, ImVec2(label_x, card_mid + title_sz * 0.18f), cat_sub[c], PageInk::Help);
+
+            const float sub_h = (card_h - 14.0f * px) * 0.5f;
+            const float row_sz = std::min(25.0f * px, sub_h * 0.52f);
+            const float sx0 = split + 95.0f * px;
+            const float sx1 = x1 - 160.0f * px;
+            const float val_x0 = sx1 + 22.0f * px, val_x1 = x1 - 24.0f * px;
+
+            for (int sub = 0; sub < 2; ++sub) {
+                const int r_idx = c * 2 + sub;
+                const bool focus = display_row == r_idx;
+                const float sy0 = y + 5.0f * px + float(sub) * (sub_h + 4.0f * px);
+                const float sy1 = sy0 + sub_h;
+                const float smid = (sy0 + sy1) * 0.5f;
+                if (focus) {
+                    dl->AddRectFilled(ImVec2(split + 12.0f * px, sy0), ImVec2(x1 - 6.0f * px, sy1),
+                                      IM_COL32(25, 130, 210, 95), 9.0f * px);
+                    dl->AddRect(ImVec2(split + 12.0f * px, sy0), ImVec2(x1 - 6.0f * px, sy1), PageInk::Yellow,
+                                9.0f * px, 0, 2.0f * px);
+                }
+                PageText(dl, font, row_sz, ImVec2(split + 26.0f * px, smid - row_sz * 0.55f),
+                         sub == 0 ? "Hue" : "Sat");
+                const float track_h = std::min(22.0f * px, sub_h * 0.44f);
+                const float norm = sub == 0 ? float(hue) / 360.0f : float(sat) / 100.0f;
+                DrawGradientSlider(dl, sx0, smid - track_h * 0.5f, sx1, smid + track_h * 0.5f, norm, hue, sub == 1,
+                                   focus, px);
+                slider_hit_rects[r_idx] = to_norm(sx0, sy0, sx1, sy1);
+
+                const float pill_h = std::min(34.0f * px, sub_h * 0.68f);
+                dl->AddRectFilled(ImVec2(val_x0, smid - pill_h * 0.5f), ImVec2(val_x1, smid + pill_h * 0.5f),
+                                  PageInk::Pill, pill_h * 0.5f);
+                char val_buf[24];
+                std::snprintf(val_buf, sizeof(val_buf), sub == 0 ? "%d deg" : "%d%%", sub == 0 ? hue : sat);
+                const float vw = font->CalcTextSizeA(row_sz, FLT_MAX, 0.0f, val_buf).x;
+                PageText(dl, font, row_sz, ImVec2((val_x0 + val_x1 - vw) * 0.5f, smid - row_sz * 0.55f), val_buf);
+                if (focus) {
+                    PointingHand(dl, ImVec2(split + 16.0f * px, smid + 3.0f * px), sub_h * 0.72f);
                 }
             }
-            help = text.help;
+            y += card_h + gap;
         }
-        dl->AddRect(a, b, PageInk::RowRim, rounding, 0, 3.0f * px);
-        PageText(dl, font, label, ImVec2(x0 + 36.0f * px, mid - label * 0.55f), text.label);
 
-        const float pill0 = x0 + (x1 - x0) * 0.49f, pill1 = x0 + (x1 - x0) * 0.87f, pill_h = row_h * 0.52f;
-        dl->AddRectFilled(ImVec2(pill0, mid - pill_h * 0.5f), ImVec2(pill1, mid + pill_h * 0.5f), PageInk::Pill,
-                          pill_h * 0.5f);
-        const float vw = font->CalcTextSizeA(value, FLT_MAX, 0.0f, text.value.c_str()).x;
-        PageText(dl, font, value, ImVec2((pill0 + pill1 - vw) * 0.5f, mid - value * 0.55f), text.value.c_str());
-        const float chevron = row_h * 0.42f, stroke = 4.0f * px;
-        Chevron(dl, ImVec2(x1 - 34.0f * px, mid), chevron, 1, focus ? PageInk::Yellow : PageInk::Chevron, stroke);
-        if (focus) {
-            Chevron(dl, ImVec2(pill0 - 30.0f * px, mid), chevron, -1, PageInk::Yellow, stroke);
-            PointingHand(dl, ImVec2(x0 + 8.0f * px, mid + 4.0f * px), 52.0f * px);
+        const bool reset_focus = display_row == NoteSkinResetRow;
+        const ImVec2 ra(x0, y), rb(x1, y + reset_h);
+        const float rmid = y + reset_h * 0.5f, rsz = std::min(28.0f * px, reset_h * 0.52f);
+        dl->AddRectFilled(ra, rb, reset_focus ? PageInk::Focus : PageInk::Row, 12.0f * px);
+        dl->AddRect(ra, rb, reset_focus ? PageInk::Yellow : PageInk::RowRim, 12.0f * px, 0, 2.5f * px);
+        const char* reset_lbl = "Reset all note colors to defaults";
+        const float rlw = font->CalcTextSizeA(rsz, FLT_MAX, 0.0f, reset_lbl).x;
+        PageText(dl, font, rsz, ImVec2((x0 + x1 - rlw) * 0.5f, rmid - rsz * 0.55f), reset_lbl);
+        if (reset_focus) {
+            PointingHand(dl, ImVec2(x0 + 8.0f * px, rmid + 3.0f * px), reset_h * 0.68f);
+            help = "Restore default Touch, Slide, Hold, Slidehold, and Joint Line colors.";
         }
-        y += row_h + gap;
+        reset_hit_rect = to_norm(ra.x, ra.y, rb.x, rb.y);
+        y += reset_h + gap;
+    } else {
+        const int count = TabRowCount(settings_tab);
+        const float avail = std::max(100.0f * px, bottom - y - 138.0f * px);
+        const float step = avail / float(DisplayRowCount);
+        const float row_h = std::min(80.0f * px, step * 0.83f), gap = std::min(18.0f * px, step - row_h);
+        const float label = row_h * 0.45f, value = row_h * 0.42f;
+        for (int row = 0; row < count; ++row) {
+            const DisplayRowText text = DisplayRowAt(settings_tab, row);
+            const bool focus = row == display_row;
+            const ImVec2 a(x0, y), b(x1, y + row_h);
+            const float mid = y + row_h * 0.5f, rounding = 14.0f * px;
+            dl->AddRectFilled(a, b, PageInk::Row, rounding);
+            if (focus) {
+                const float split = x0 + (x1 - x0) * 0.44f, tip = row_h * 0.22f, inset = 5.0f * px;
+                const ImVec2 band[5] = {ImVec2(x0 + inset, y + inset), ImVec2(split, y + inset),
+                                        ImVec2(split + tip, mid), ImVec2(split, b.y - inset),
+                                        ImVec2(x0 + inset, b.y - inset)};
+                dl->AddConvexPolyFilled(band, 5, PageInk::Focus);
+                const float t = 8.0f * px, span = split - x0 - 90.0f * px;
+                for (int i = 0; i < 16; ++i) { // the band's faint triangle pattern
+                    const float tx = x0 + 60.0f * px + span * float((i * 37) % 100) / 100.0f;
+                    const float ty = y + 12.0f * px + (row_h - 30.0f * px) * float((i * 61) % 100) / 100.0f;
+                    if (i & 1) {
+                        dl->AddTriangleFilled(ImVec2(tx, ty), ImVec2(tx + t, ty), ImVec2(tx + t * 0.5f, ty + t),
+                                              PageInk::FocusSpeck);
+                    } else {
+                        dl->AddTriangleFilled(ImVec2(tx, ty + t), ImVec2(tx + t, ty + t), ImVec2(tx + t * 0.5f, ty),
+                                              PageInk::FocusSpeck);
+                    }
+                }
+                help = text.help;
+            }
+            dl->AddRect(a, b, PageInk::RowRim, rounding, 0, 3.0f * px);
+            PageText(dl, font, label, ImVec2(x0 + 36.0f * px, mid - label * 0.55f), text.label);
+
+            const float pill0 = x0 + (x1 - x0) * 0.49f, pill1 = x0 + (x1 - x0) * 0.87f, pill_h = row_h * 0.52f;
+            dl->AddRectFilled(ImVec2(pill0, mid - pill_h * 0.5f), ImVec2(pill1, mid + pill_h * 0.5f), PageInk::Pill,
+                              pill_h * 0.5f);
+            const float vw = font->CalcTextSizeA(value, FLT_MAX, 0.0f, text.value.c_str()).x;
+            PageText(dl, font, value, ImVec2((pill0 + pill1 - vw) * 0.5f, mid - value * 0.55f), text.value.c_str());
+            const float chevron = row_h * 0.42f, stroke = 4.0f * px;
+            Chevron(dl, ImVec2(x1 - 34.0f * px, mid), chevron, 1, focus ? PageInk::Yellow : PageInk::Chevron, stroke);
+            if (focus) {
+                Chevron(dl, ImVec2(pill0 - 30.0f * px, mid), chevron, -1, PageInk::Yellow, stroke);
+                PointingHand(dl, ImVec2(x0 + 8.0f * px, mid + 4.0f * px), row_h * 0.65f);
+            }
+            option_hit_rects[row] = to_norm(a.x, a.y, b.x, b.y);
+            y += row_h + gap;
+        }
     }
 
-    const float help_size = 28.0f * px;
-    PageText(dl, font, help_size, ImVec2(x0 + 8.0f * px, y + 6.0f * px), help, PageInk::Help);
-    const char* keys = Swapped() ? "Up/Down: choose     Left/Right or Circle (B): change     Esc or Cross (A): back"
-                                 : "Up/Down: choose     Left/Right or Cross (A): change     Esc or Circle (B): back";
-    const float key_size = 26.0f * px, kw = font->CalcTextSizeA(key_size, FLT_MAX, 0.0f, keys).x;
-    PageText(dl, font, key_size, ImVec2(right - kw - 60.0f * px, bottom - key_size - 30.0f * px), keys, PageInk::Help);
+    const float help_size = 26.0f * px;
+    const float footer_y = std::max(y + 4.0f * px, bottom - 114.0f * px);
+    PageText(dl, font, help_size, ImVec2(x0 + 8.0f * px, footer_y), help, PageInk::Help);
+    char keys[220];
+    if (settings_tab == TabNoteSkins) {
+        std::snprintf(keys, sizeof(keys),
+                      "%s/%s or Q/E: tab   Left/Right (Shift/L2: 1): adjust   R: reset row   Esc/%s: back",
+                      LeftTabButtonName(), RightTabButtonName(), CancelName());
+    } else {
+        std::snprintf(keys, sizeof(keys), "%s/%s or Q/E: tab   Up/Down: choose   Left/Right or %s: change   Esc/%s: back",
+                      LeftTabButtonName(), RightTabButtonName(), ConfirmName(), CancelName());
+    }
+    const float key_size = 25.0f * px, kw = font->CalcTextSizeA(key_size, FLT_MAX, 0.0f, keys).x;
+    PageText(dl, font, key_size, ImVec2(right - kw - 60.0f * px, bottom - key_size - 26.0f * px), keys, PageInk::Help);
     ImGui::End();
     ImGui::PopStyleVar();
 }
 
-// The panel takes every key and button while it is open (the game sees neutral input).
+void SwitchTab(int delta) {
+    settings_tab = (settings_tab + delta + TabCount) % TabCount;
+    display_row = 0;
+    dragging_slider = -1;
+    hold_x_elapsed = hold_x_accum = 0.0f;
+}
+
+bool EventNormPos(SDL_WindowID wid, float ex, float ey, float& nu, float& nv) {
+    SDL_Window* win = SDL_GetWindowFromID(wid);
+    int ww = 0, wh = 0;
+    if (!win || !SDL_GetWindowSize(win, &ww, &wh) || ww <= 0 || wh <= 0) return false;
+    nu = ex / float(ww);
+    nv = ey / float(wh);
+    return true;
+}
+
+bool HitNorm(const NormRect& r, float u, float v) {
+    return r.x1 > r.x0 && u >= r.x0 && u <= r.x1 && v >= r.y0 && v <= r.y1;
+}
+
+// The panel takes every key, mouse click, and controller input while it is open (the game sees neutral input).
 bool HandleDisplayEvent(const SDL_Event& event) {
-    int move = 0, change = 0;
-    bool close = false;
+    int move = 0, change = 0, tab_delta = 0;
+    bool close = false, reset_row = false;
     if (event.type == SDL_EVENT_KEY_DOWN) {
         const SDL_Keycode key = event.key.key;
-        move = key == SDLK_UP || key == SDLK_W ? -1 : key == SDLK_DOWN || key == SDLK_S ? 1 : 0;
-        change = key == SDLK_LEFT || key == SDLK_A ? -1
-                 : key == SDLK_RIGHT || key == SDLK_D || key == SDLK_RETURN || key == SDLK_KP_ENTER ||
-                         key == SDLK_SPACE
-                     ? 1
-                     : 0;
-        close = !event.key.repeat && (key == SDLK_ESCAPE || key == SDLK_BACKSPACE || key == SDLK_F10);
+        held_fine = (event.key.mod & SDL_KMOD_SHIFT) != 0;
+        const int ky = (key == SDLK_UP || key == SDLK_W) ? -1 : (key == SDLK_DOWN || key == SDLK_S) ? 1 : 0;
+        const int kx = (key == SDLK_LEFT || key == SDLK_A) ? -1 : (key == SDLK_RIGHT || key == SDLK_D) ? 1 : 0;
+        if (!event.key.repeat) {
+            if (ky) held_key_y = ky;
+            if (kx) held_key_x = kx;
+            move = ky;
+            if (kx) {
+                change = settings_tab == TabNoteSkins ? kx * (held_fine ? 1 : 5) : kx;
+            } else if (key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE) {
+                change = (settings_tab == TabNoteSkins && display_row != NoteSkinResetRow) ? 0 : 1;
+            }
+            if (key == SDLK_Q || key == SDLK_LEFTBRACKET || key == SDLK_PAGEUP) tab_delta = -1;
+            else if (key == SDLK_E || key == SDLK_RIGHTBRACKET || key == SDLK_PAGEDOWN) tab_delta = 1;
+            else if (key == SDLK_TAB) tab_delta = (event.key.mod & SDL_KMOD_SHIFT) ? -1 : 1;
+            else if (key == SDLK_R && settings_tab == TabNoteSkins) reset_row = true;
+            close = key == SDLK_ESCAPE || key == SDLK_BACKSPACE || key == SDLK_F10;
+        }
+    } else if (event.type == SDL_EVENT_KEY_UP) {
+        const SDL_Keycode key = event.key.key;
+        held_fine = (event.key.mod & SDL_KMOD_SHIFT) != 0;
+        if ((key == SDLK_UP || key == SDLK_W) && held_key_y < 0) held_key_y = 0;
+        if ((key == SDLK_DOWN || key == SDLK_S) && held_key_y > 0) held_key_y = 0;
+        if ((key == SDLK_LEFT || key == SDLK_A) && held_key_x < 0) held_key_x = 0;
+        if ((key == SDLK_RIGHT || key == SDLK_D) && held_key_x > 0) held_key_x = 0;
+        return true;
     } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
         const u8 button = event.gbutton.button;
         const u8 confirm_btn = Swapped() ? SDL_GAMEPAD_BUTTON_EAST : SDL_GAMEPAD_BUTTON_SOUTH;
         const u8 cancel_btn = Swapped() ? SDL_GAMEPAD_BUTTON_SOUTH : SDL_GAMEPAD_BUTTON_EAST;
-        move = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
-        change = button == SDL_GAMEPAD_BUTTON_DPAD_LEFT ? -1
-                 : button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT || button == confirm_btn ? 1
-                                                                                      : 0;
+        const int dy = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
+        const int dx = button == SDL_GAMEPAD_BUTTON_DPAD_LEFT ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT ? 1 : 0;
+        if (dy) held_dpad_y = dy;
+        if (dx) held_dpad_x = dx;
+        move = dy;
+        if (dx) {
+            change = settings_tab == TabNoteSkins ? dx * (held_fine ? 1 : 5) : dx;
+        } else if (button == confirm_btn) {
+            change = (settings_tab == TabNoteSkins && display_row != NoteSkinResetRow) ? 0 : 1;
+        }
+        if (button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) tab_delta = -1;
+        else if (button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) tab_delta = 1;
+        else if (button == SDL_GAMEPAD_BUTTON_NORTH && settings_tab == TabNoteSkins) reset_row = true;
         close = button == cancel_btn || button == SDL_GAMEPAD_BUTTON_START;
+    } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+        const u8 button = event.gbutton.button;
+        if (button == SDL_GAMEPAD_BUTTON_DPAD_UP && held_dpad_y < 0) held_dpad_y = 0;
+        if (button == SDL_GAMEPAD_BUTTON_DPAD_DOWN && held_dpad_y > 0) held_dpad_y = 0;
+        if (button == SDL_GAMEPAD_BUTTON_DPAD_LEFT && held_dpad_x < 0) held_dpad_x = 0;
+        if (button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT && held_dpad_x > 0) held_dpad_x = 0;
+        return true;
+    } else if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+        const int val = event.gaxis.value;
+        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX) {
+            const int nx = val > 14000 ? 1 : val < -14000 ? -1 : 0;
+            if (nx != held_stick_x) {
+                held_stick_x = nx;
+                if (nx) change = settings_tab == TabNoteSkins ? nx * (held_fine ? 1 : 5) : nx;
+            }
+        } else if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
+            const int ny = val > 14000 ? 1 : val < -14000 ? -1 : 0;
+            if (ny != held_stick_y) {
+                held_stick_y = ny;
+                if (ny) move = ny;
+            }
+        } else if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+            held_fine = val > 10000;
+        }
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+        float u = 0, v = 0;
+        if (EventNormPos(event.button.windowID, event.button.x, event.button.y, u, v)) {
+            for (int t = 0; t < TabCount; ++t) {
+                if (HitNorm(tab_hit_rects[t], u, v)) {
+                    settings_tab = t;
+                    display_row = 0;
+                    dragging_slider = -1;
+                    return true;
+                }
+            }
+            if (settings_tab == TabNoteSkins) {
+                for (int r = 0; r < NoteSkinSliderRows; ++r) {
+                    if (HitNorm(slider_hit_rects[r], u, v)) {
+                        display_row = r;
+                        dragging_slider = r;
+                        const NormRect& sr = slider_hit_rects[r];
+                        SetNoteSkinSliderFromNorm(r, (u - sr.x0) / std::max(0.0001f, sr.x1 - sr.x0));
+                        return true;
+                    }
+                }
+                if (HitNorm(reset_hit_rect, u, v)) {
+                    display_row = NoteSkinResetRow;
+                    ResetAllNoteSkins();
+                    return true;
+                }
+            } else {
+                const int n = TabRowCount(settings_tab);
+                for (int r = 0; r < n; ++r) {
+                    if (HitNorm(option_hit_rects[r], u, v)) {
+                        display_row = r;
+                        const float mid = (option_hit_rects[r].x0 + option_hit_rects[r].x1) * 0.5f;
+                        ChangeDisplayRow(r, u < mid ? -1 : 1);
+                        return true;
+                    }
+                }
+            }
+        }
+        return true;
+    } else if (event.type == SDL_EVENT_MOUSE_MOTION && dragging_slider >= 0 && settings_tab == TabNoteSkins) {
+        float u = 0, v = 0;
+        if (EventNormPos(event.motion.windowID, event.motion.x, event.motion.y, u, v)) {
+            const NormRect& sr = slider_hit_rects[dragging_slider];
+            SetNoteSkinSliderFromNorm(dragging_slider, (u - sr.x0) / std::max(0.0001f, sr.x1 - sr.x0));
+        }
+        return true;
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+        dragging_slider = -1;
+        return true;
     } else {
-        return event.type == SDL_EVENT_KEY_UP || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP;
+        return false;
+    }
+    if (tab_delta) {
+        SwitchTab(tab_delta);
     }
     if (move) {
-        display_row = (display_row + move + RowCount) % RowCount;
+        const int n = TabRowCount(settings_tab);
+        display_row = (display_row + move + n) % n;
+    }
+    if (reset_row && settings_tab == TabNoteSkins) {
+        if (display_row == NoteSkinResetRow) ResetAllNoteSkins();
+        else if (display_row >= 0 && display_row < NoteSkinSliderRows) ResetNoteSkinCategory(display_row / 2);
     }
     if (change) {
         ChangeDisplayRow(display_row, change);
@@ -933,7 +1534,11 @@ bool HandleEvent(const SDL_Event& event) {
         return true;
     }
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat && !text_entry_active) {
+        settings_tab = TabDisplay;
         display_row = 0;
+        dragging_slider = -1;
+        held_dpad_x = held_dpad_y = held_stick_x = held_stick_y = held_key_x = held_key_y = 0;
+        held_fine = false;
         display_open = true;
         return true;
     }
@@ -952,9 +1557,23 @@ bool TakeExitRequest() {
 void OpenDisplaySettings() {
     std::scoped_lock lock{imgui_mutex};
     if (!display_open) {
+        settings_tab = TabDisplay;
         display_row = 0;
+        dragging_slider = -1;
+        held_dpad_x = held_dpad_y = held_stick_x = held_stick_y = held_key_x = held_key_y = 0;
+        held_fine = false;
         display_open = true;
     }
+}
+
+void OpenNoteSkins() {
+    std::scoped_lock lock{imgui_mutex};
+    settings_tab = TabNoteSkins;
+    display_row = 0;
+    dragging_slider = -1;
+    held_dpad_x = held_dpad_y = held_stick_x = held_stick_y = held_key_x = held_key_y = 0;
+    held_fine = false;
+    display_open = true;
 }
 
 bool DisplaySettingsOpen() {
@@ -1030,7 +1649,8 @@ bool Visible() {
 }
 
 bool CapturesInput() {
-    return text_entry_active || choice_active || display_open;
+    if (text_entry_active || choice_active || display_open) return true;
+    return NowMs() < input_guard_until_ms.load(std::memory_order_relaxed);
 }
 
 void BeginChoice(const std::string& title, const std::vector<std::string>& items,
@@ -1127,5 +1747,16 @@ extern "C" void theatrhythm_gpu_toast_trophy(int id, const char* title, const ch
     (void)png_size;
     if (title && title[0]) {
         TheatrhythmOverlay::ShowNotice(std::string("Trophy: ") + title, 5000);
+    }
+}
+
+extern "C" void theatrhythm_gpu_set_active_button_icons(const char* set_name) {
+    if (!set_name) return;
+    if (!std::strcmp(set_name, "switch")) {
+        TheatrhythmOverlay::active_pad_icons.store(TheatrhythmOverlay::ActivePadSwitch, std::memory_order_relaxed);
+    } else if (!std::strcmp(set_name, "xbox")) {
+        TheatrhythmOverlay::active_pad_icons.store(TheatrhythmOverlay::ActivePadXbox, std::memory_order_relaxed);
+    } else if (!std::strcmp(set_name, "ps4")) {
+        TheatrhythmOverlay::active_pad_icons.store(TheatrhythmOverlay::ActivePadPs4, std::memory_order_relaxed);
     }
 }

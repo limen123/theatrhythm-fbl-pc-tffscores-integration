@@ -1042,7 +1042,7 @@ int main(int argc, char **argv) {
 #else
     size_t redzone_area = 0;
 #endif
-    image = allocate(round_page(size) + stub_area + 24 * page_size + redzone_area);
+    image = allocate(round_page(size) + stub_area + 25 * page_size + redzone_area);
     printf("Runtime: guest image at %p (guest offsets are relative to it)\n", (void *)image);
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
@@ -1164,7 +1164,12 @@ int main(int argc, char **argv) {
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_xbox_pad_install(image, modules[m].base, pad_stub, page_size))
                 protect(pad_stub, page_size, 5);
-        unsigned char *opening_stub = pad_stub + page_size;
+        unsigned char *confirm_stub = pad_stub + page_size;
+        for (uint64_t m = 0; m < module_count; ++m)
+            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
+                !runtime_confirm_layout_install(image, modules[m].base, confirm_stub, page_size))
+                protect(confirm_stub, page_size, 5);
+        unsigned char *opening_stub = confirm_stub + page_size;
         for (uint64_t m = 0; m < module_count; ++m)
             if (theatrhythm_skip_opening() && !strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_skip_opening_install(image, modules[m].base, opening_stub, page_size))
@@ -1179,6 +1184,11 @@ int main(int argc, char **argv) {
             if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
                 !runtime_custom_charts_install(image, modules[m].base, custom_stub, 16 * page_size))
                 protect(custom_stub, 16 * page_size, 5);
+        unsigned char *note_skin_stub = custom_stub + 16 * page_size;
+        for (uint64_t m = 0; m < module_count; ++m)
+            if (!strcmp(modules[m].name, "Il2CppUserAssemblies.prx") &&
+                !runtime_note_skins_install(image, modules[m].base, note_skin_stub, page_size))
+                protect(note_skin_stub, page_size, 5);
         runtime_game_code_close();
     }
 #ifdef _WIN32
@@ -1199,7 +1209,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     /* Page tracking runs with the GPU only. */
     if (code_before) {
-        unsigned char *trampolines = stubs + stub_area + 24 * page_size;
+        unsigned char *trampolines = stubs + stub_area + 25 * page_size;
         redzone_protect(image, size, trampolines, code_before, segments, ns, modules, module_count, &main_module);
         protect(trampolines, redzone_area, 5);
         free(code_before);

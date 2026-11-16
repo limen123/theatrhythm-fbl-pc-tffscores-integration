@@ -24,7 +24,7 @@ packaging, and [Git for Windows](https://git-scm.com) for Git Bash.
 ## 2. Source
 
 ```bash
-git clone --recurse-submodules https://github.com/YAPhoa/theatrhythm-fbl-pc.git
+git clone --recurse-submodules https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration.git
 ```
 
 imgui, magic_enum, miniz, xbyak and LibAtrac9 are submodules; `build.sh` fetches them if the clone

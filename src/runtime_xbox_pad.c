@@ -170,7 +170,8 @@ static ABI void update(unsigned char *pad) {
     uint64_t layer=length(sprites);
     for (uint64_t i=0;i<length(sprites);++i) if (same(shown,element(sprites,i))) layer=i;
     const int ds4_shown=layer<length(sprites);
-    if (runtime_button_icons_pad()==BUTTON_ICONS_XBOX) {
+    const int pad_set=runtime_button_icons_pad();
+    if (pad_set==BUTTON_ICONS_XBOX || pad_set==BUTTON_ICONS_SWITCH) {
         if (!ds4_shown) return;
         void *base=xbox_base(element(sprites,layer));
         if (!base) return;

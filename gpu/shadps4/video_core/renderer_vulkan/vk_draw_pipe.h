@@ -110,12 +110,22 @@ public:
         const u32 slot = reason < NumReasons ? reason : ReasonRasterizer;
         ++drains_by_reason[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                __builtin_ia32_pause();
-            } else {
-                std::this_thread::yield();
+        bool drained = false;
+        for (u32 spins = 0; spins < 4096; ++spins) {
+            if (consumed.load(std::memory_order_acquire) == head) {
+                drained = true;
+                break;
             }
+            __builtin_ia32_pause();
+        }
+        if (!drained) {
+            drain_target.store(head, std::memory_order_release);
+            draining.store(true, std::memory_order_seq_cst);
+            for (u64 cur = consumed.load(std::memory_order_seq_cst); cur != head;
+                 cur = consumed.load(std::memory_order_seq_cst)) {
+                consumed.wait(cur, std::memory_order_seq_cst);
+            }
+            draining.store(false, std::memory_order_relaxed);
         }
         const u64 waited = __rdtsc() - start;
         drain_cycles += waited;
@@ -195,14 +205,22 @@ private:
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
                 at += Capacity - at % Capacity;
-                consumed.store(at, std::memory_order_release);
+                consumed.store(at, std::memory_order_seq_cst);
+                if (draining.load(std::memory_order_seq_cst) &&
+                    at >= drain_target.load(std::memory_order_acquire)) {
+                    consumed.notify_all();
+                }
                 continue;
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
-            consumed.store(at, std::memory_order_release);
+            consumed.store(at, std::memory_order_seq_cst);
+            if (draining.load(std::memory_order_seq_cst) &&
+                at >= drain_target.load(std::memory_order_acquire)) {
+                consumed.notify_all();
+            }
         }
     }
 
@@ -214,6 +232,8 @@ private:
     u32 pending_size = 0;
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
+    alignas(64) std::atomic<u64> drain_target{0};
+    std::atomic<bool> draining{false};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::atomic<u32> stage_b_tid{0};

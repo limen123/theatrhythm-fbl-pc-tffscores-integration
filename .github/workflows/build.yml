@@ -121,10 +121,9 @@ jobs:
           compression-level: 0
 
 
-  # Linux: built on Ubuntu 24.04 so it starts on glibc 2.39 or newer (SteamOS, Fedora/Bazzite,
-  # Debian 13, Ubuntu 24.04+). The release, debug and symbols tarballs and the DLC maker's are the
-  # run's artifacts.
+  # Linux: disabled in this Windows fork (runtime_tffscores.c uses WinHTTP/WinSock).
   linux:
+    if: false
     runs-on: ubuntu-24.04
     env:
       SDL_AUDIO_DRIVER: dummy
@@ -234,9 +233,9 @@ jobs:
             bash /w/packaging/linux/smoke-test.sh "/w/unpacked/${{ needs.linux.outputs.release }}" \
             /w/out/theatrhythm-dlcmaker.AppImage
 
-  # v* tags: the release, with what players download and nothing else (no symbols or debug builds).
+  # Manual releases include DupliConverter alongside the Windows package, so skip CI auto-publish.
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: false
     needs: [windows, linux, linux-smoke]
     runs-on: ubuntu-24.04
     permissions:

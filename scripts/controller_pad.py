@@ -23,7 +23,8 @@ import zlib
 from button_icons import forge_crc, read_bundle, write_bundle
 
 PORT = Path(__file__).resolve().parent.parent
-ASSET = PORT / 'assets' / 'controller_pad' / 'xbox.bc7'
+ASSETS = PORT / 'assets' / 'controller_pad'
+ASSET = ASSETS / 'xbox.bc7'
 PAD_BUNDLE = 'Media/StreamingAssets/aa/PS4/d9bc0bbf58d9e64cfb82c0837f3ab818.bundle'
 PAD_CRC = 523538824  # catalog.json m_Crc of PAD_BUNDLE (CUSA32853 v01.00 and v01.04)
 BLOCKS = 128  # blocks per row and column of the 512x512 atlas
@@ -107,19 +108,23 @@ def main():
     if not source.is_file():
         print(f'Xbox pad: {source} not found, keeping the DualShock 4')
         return 0
-    if not ASSET.is_file():
-        print(f'Xbox pad: {ASSET} not found, keeping the DualShock 4')
-        return 0
     original = source.read_bytes()
     try:
-        bundle = build(original, ASSET.read_bytes())
+        ps4 = texture_of(original)
     except ValueError as e:
         print(f'Xbox pad: {source}: {e}; keeping the DualShock 4')
         return 0
-    (folder / 'ps4.texture').write_bytes(texture_of(original))
-    (folder / 'xbox.texture').write_bytes(texture_of(bundle))
-    (folder / 'xbox.bundle').write_bytes(bundle)
-    print(f'Xbox pad: {folder / "xbox.bundle"} ({len(bundle)} bytes)')
+    (folder / 'ps4.texture').write_bytes(ps4)
+    for patch in sorted(ASSETS.glob('*.bc7')):
+        try:
+            bundle = build(original, patch.read_bytes())
+        except ValueError as e:
+            print(f'Xbox pad: {patch.stem}: {e}; keeping the DualShock 4')
+            continue
+        target = folder / f'{patch.stem}.bundle'
+        target.write_bytes(bundle)
+        (folder / f'{patch.stem}.texture').write_bytes(texture_of(bundle))
+        print(f'Xbox pad: {target} ({len(bundle)} bytes)')
     return 0
 
 

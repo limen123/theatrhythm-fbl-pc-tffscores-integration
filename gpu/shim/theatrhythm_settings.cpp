@@ -36,6 +36,8 @@ bool Truthy(std::string_view value) {
     return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
 }
 
+constexpr const char* kNoteSkinKeyNames[Values::NoteSkinCount] = {"touch", "slide", "hold", "slidehold", "joint"};
+
 void Set(Values& v, const std::string& key, const std::string& value) {
     const int i = std::atoi(value.c_str());
     if (key == "display_mode") {
@@ -75,11 +77,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "audio_channels") {
         v.audio_channels = ParseAudioChannels(value);
     } else if (key == "button_icons") {
-        const auto* found = std::find(std::begin(ButtonIconKeys), std::end(ButtonIconKeys), value);
+        std::string lower;
+        for (const char c : value) lower += char(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == "ps") lower = "ps4";
+        else if (lower == "nintendo") lower = "switch";
+        const auto* found = std::find(std::begin(ButtonIconKeys), std::end(ButtonIconKeys), lower);
         v.button_icons = found == std::end(ButtonIconKeys) ? ButtonIconsAuto : int(found - std::begin(ButtonIconKeys));
         if (found == std::end(ButtonIconKeys) && !value.empty()) {
-            std::printf("Settings: button_icons=%s is not auto, ps4, xbox or keyboard; using auto\n", value.c_str());
+            std::printf("Settings: button_icons=%s is not auto, ps4, xbox, switch or keyboard; using auto\n",
+                        value.c_str());
         }
+    } else if (key == "background_controller") {
+        v.background_controller = Truthy(value);
     } else if (key == "render_resolution") {
         std::string lower;
         for (const char c : value) lower += char(std::tolower(static_cast<unsigned char>(c)));
@@ -88,14 +97,30 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             std::printf("Settings: render_resolution=%s is not 1080p or 4k; using 4k\n", value.c_str());
         }
     } else {
-        std::printf("Settings: unknown key %s\n", key.c_str());
+        bool matched_note_skin = false;
+        for (int n = 0; n < Values::NoteSkinCount; ++n) {
+            const std::string prefix = std::string("note_skin_") + kNoteSkinKeyNames[n];
+            if (key == prefix + "_hue") {
+                v.note_skin_hue[n] = value.empty() ? Values::NoteSkinDefaultHue[n] : std::clamp(i, 0, 360);
+                matched_note_skin = true;
+                break;
+            }
+            if (key == prefix + "_sat") {
+                v.note_skin_sat[n] = value.empty() ? Values::NoteSkinDefaultSat[n] : std::clamp(i, 0, 100);
+                matched_note_skin = true;
+                break;
+            }
+        }
+        if (!matched_note_skin) {
+            std::printf("Settings: unknown key %s\n", key.c_str());
+        }
     }
 }
 
 std::vector<std::pair<std::string, std::string>> DisplayKeys() {
     const auto& v = Get();
     const int monitor = v.monitor;
-    return {
+    std::vector<std::pair<std::string, std::string>> out = {
         {"display_mode", std::string(TheatrhythmGraphics::DisplayModeKeys[std::clamp(v.display_mode.load(), 0, 2)])},
         {"monitor", monitor < 0 ? std::string() : std::to_string(monitor)},
         {"window", std::to_string(v.window_width.load()) + "x" + std::to_string(v.window_height.load())},
@@ -105,7 +130,16 @@ std::vector<std::pair<std::string, std::string>> DisplayKeys() {
         {"frames_queued", std::to_string(v.frames_queued.load())},
         {"anisotropy", std::to_string(v.anisotropy.load())},
         {"render_resolution", std::string(RenderResolutionKeys[std::clamp(v.render_resolution.load(), 0, RenderResolutionCount - 1)])},
+        {"menu_confirm_swap", v.menu_confirm_swap.load(std::memory_order_relaxed) ? "1" : "0"},
+        {"button_icons", std::string(ButtonIconKeys[std::clamp(v.button_icons.load(std::memory_order_relaxed), 0, ButtonIconsCount - 1)])},
+        {"background_controller", v.background_controller.load(std::memory_order_relaxed) ? "1" : "0"},
     };
+    for (int n = 0; n < Values::NoteSkinCount; ++n) {
+        const std::string prefix = std::string("note_skin_") + kNoteSkinKeyNames[n];
+        out.emplace_back(prefix + "_hue", std::to_string(v.note_skin_hue[n].load(std::memory_order_relaxed)));
+        out.emplace_back(prefix + "_sat", std::to_string(v.note_skin_sat[n].load(std::memory_order_relaxed)));
+    }
+    return out;
 }
 
 std::mutex save_mutex;
@@ -217,6 +251,7 @@ void Load() {
         {"THEATRHYTHM_MENU_CONFIRM_SWAP", "menu_confirm_swap"}, {"THEATRHYTHM_SKIP_OPENING", "skip_opening"},
         {"THEATRHYTHM_PAD_MAP", "pad_map"},       {"THEATRHYTHM_KEY_MAP", "key_map"},
         {"THEATRHYTHM_BUTTON_ICONS", "button_icons"}, {"THEATRHYTHM_RENDER_RESOLUTION", "render_resolution"},
+        {"THEATRHYTHM_BACKGROUND_CONTROLLER", "background_controller"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -246,7 +281,13 @@ extern "C" int theatrhythm_gpu_menu_confirm_swap(void) {
 }
 
 extern "C" const char* theatrhythm_button_icons(void) {
-    return TheatrhythmSettings::ButtonIconKeys[TheatrhythmSettings::Get().button_icons].data();
+    const int i = std::clamp(TheatrhythmSettings::Get().button_icons.load(std::memory_order_relaxed), 0,
+                             TheatrhythmSettings::ButtonIconsCount - 1);
+    return TheatrhythmSettings::ButtonIconKeys[i].data();
+}
+
+extern "C" int theatrhythm_gpu_background_controller(void) {
+    return TheatrhythmSettings::Get().background_controller.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 extern "C" int theatrhythm_skip_opening(void) {

@@ -119,6 +119,14 @@ inline std::atomic<std::uint64_t> gpu_idle_ns{0};
 /// for host copies before a submission or fence, and for GPU ticks.
 inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
+/// Breakdown of Presenter / SwapThread and Scheduler::SubmitExecution (THEATRHYTHM_FRAME_STATS).
+inline std::atomic<std::uint64_t> present_ready_wait_ns{0}, present_acquire_ns{0}, present_prepare_ns{0},
+    present_flush_ns{0}, present_mutex_ns{0}, present_khr_ns{0}, present_wait_fences_ns{0},
+    present_free_wait_ns{0}, present_calls{0}, draw_last_frame_calls{0},
+    sem_wait_cycles{0}, fence_wait_cycles{0}, acquire_cycles{0};
+inline std::atomic<std::uint64_t> sched_submit_mutex_ns{0}, sched_on_submit_ns{0},
+    sched_wait_host_copies_ns{0}, sched_vk_submit_ns{0}, wait_deferred_signals_ns{0},
+    wait_host_copies_only_ns{0};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

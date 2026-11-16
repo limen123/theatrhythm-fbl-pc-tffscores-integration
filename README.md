@@ -5,26 +5,24 @@
 <h1 align="center">Theatrhythm Final Bar Line on PC</h1>
 
 <p align="center">
-  An unofficial native PC runner for the PS4 version of <b>Theatrhythm Final Bar Line</b>.<br>
-  <a href="https://github.com/YAPhoa/theatrhythm-fbl-pc/releases/latest"><b>Download the latest release</b></a> ·
-  <a href="https://ko-fi.com/yohialfredo">Support me on Ko-fi</a>
+  An unofficial Windows PC runner fork for the PS4 version of <b>Theatrhythm Final Bar Line</b>, built on <a href="https://github.com/YAPhoa/theatrhythm-fbl-pc">YAPhoa/theatrhythm-fbl-pc</a> (<code>v1.0.5c</code>).<br>
+  <a href="https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/releases/latest"><b>Download the latest release</b></a>
 </p>
 
-It runs the game's own code natively on Windows and Linux, with a Vulkan renderer, keyboard and
-gamepad controls, and display settings of its own. **No game files are included:** you need a decrypted
-dump of your own copy of the game (PS4, version 1.00).
+It runs the game's own code natively on Windows with a Vulkan renderer, keyboard and
+gamepad controls, TFFScores online integration, and custom charts. **No game files are included:** you need a decrypted
+dump of your own copy of the game (PS4, version 1.00 or 1.04).
 
 ## Features
 
-- **PC display settings:** windowed, borderless or fullscreen, at your desktop's resolution.
-- **Keyboard and controller:** Xbox-style mapping for controllers, with the game's button hints
-  and its Live Info controller redrawn for keyboard and Xbox. DualSense works too.
-- **Easy setup:** point the installer at your dump, and it can add a desktop shortcut (on Linux,
-  an application menu entry).
-- **Custom songs:** [dlcmaker](tools/dlcmaker/README.md) turns your own music, charts and art into
-  add-on packs that show up in Music Stages next to the game's DLC, on battle, event or field stages.
-  It's a separate download on the releases page: `theatrhythm-dlcmaker.exe` (Windows) or
-  `theatrhythm-dlcmaker.AppImage` (Linux).
+- **TFFScores integration:** press **F9** (or use the **F10** overlay) to link your `tffscores.com` account,
+  upload Personal Best proofs automatically, back up/restore cloud saves, and view live leaderboards on Results Page 3.
+- **Custom charts & 6-difficulty support:** drop song folders exported from **DupliConverter** (available as a separate download on the releases page) into `CustomCharts/` next to the game or in your save folder, with full Beginner/Chaos slots and custom record persistence.
+- **SlideHold & custom Note Skins:** native-styled directional SlideHold notes plus live hue/saturation customization in `settings.ini` and the F10 overlay.
+- **PC display & frame pacing settings:** windowed, borderless or fullscreen at your desktop's resolution, with improved frame pacing and background controller support.
+- **Keyboard and controller:** PlayStation, Xbox, Switch-layout (Xbox-derived), and keyboard button prompts with Live Info pad art, plus an in-game Controller Settings menu and confirm/cancel layout swap.
+- **Easy setup:** point the installer at your dump, and it can add a desktop shortcut.
+- **DLC maker:** [dlcmaker](tools/dlcmaker/README.md) can also pack custom songs as PS4-style add-on folders inside your save's `addcont` directory.
 
 ## Supported languages
 
@@ -48,13 +46,10 @@ display fully.
 
 ## Download
 
-From the [latest release](https://github.com/YAPhoa/theatrhythm-fbl-pc/releases/latest):
+From the [latest release](https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/releases/latest):
 
 - **Windows:** `theatrhythm-fbl-pc-<version>-windows-x64.zip`
-- **Linux:** `theatrhythm-fbl-pc-<version>-linux-x64.tar.gz`
-
-Releases up to v1.0.5b name them `theatrhythm-fbl-pc-<version>.zip` and
-`theatrhythm-fbl-pc-<version>-linux.tar.gz`.
+- **Custom chart editor/converter:** `DupliConverter v1.3.0.zip` (optional separate download on the release page)
 
 ## Requirements
 
@@ -79,7 +74,7 @@ Releases up to v1.0.5b name them `theatrhythm-fbl-pc-<version>.zip` and
 That's far more than the game needs. It was made for a PS4, and the runner adds little on top, so
 a much more modest PC should play it fine: any reasonably recent CPU with AVX and a GPU with a
 current Vulkan 1.3 driver. Lower-end machines haven't been tested yet, so if yours works (or
-doesn't), please say so in an [issue](https://github.com/YAPhoa/theatrhythm-fbl-pc/issues).
+doesn't), please say so in an [issue](https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/issues).
 
 The Linux version is new: it has been run on Ubuntu 24.04 in WSL (software rendering, from setup
 to the game's first screen) and checked on Ubuntu, Debian, Fedora and Arch, but not yet played on a
@@ -228,13 +223,14 @@ edit `key_map` and `pad_map` in `settings.ini`, e.g. `key_map=cross=G,cross=Mous
 mention of a button replaces its defaults, the next ones add more, and `=None` unbinds it.
 
 On-screen button prompts follow the device you last used: PlayStation icons for a DualShock or
-DualSense, Xbox icons for other gamepads, and key names for the keyboard. The controller on the
-Live Info panel and in the tutorial follows too: an Xbox pad for other gamepads, the DualShock 4
-otherwise. Set `button_icons` in `settings.ini` to `ps4`, `xbox` or `keyboard` to keep one set.
+DualSense, Xbox icons for other gamepads, Switch-layout icons (Xbox art swapped for Nintendo layout)
+when selected, and key names for the keyboard. The controller on the Live Info panel and in the
+tutorial follows too. Set `button_icons` in `settings.ini` to `auto`, `ps4`, `xbox`, `switch` or
+`keyboard`.
 
 ## Issues and suggestions
 
-Found a problem? [Open an issue](https://github.com/YAPhoa/theatrhythm-fbl-pc/issues) and attach
+Found a problem? [Open an issue](https://github.com/limen123/theatrhythm-fbl-pc-tffscores-integration/issues) and attach
 `theatrhythm.log` from the `log` folder in your save folder. Any suggestion, just open an issue too.
 If the game closes by itself, it says so in a message and keeps that log as `crash-<date>-<time>.log`
 in the same folder, so starting the game again does not lose it: attach that file. Every crash keeps
@@ -250,7 +246,8 @@ push is built and tested by GitHub Actions, and tagging a version publishes a re
 
 ## Credits and license
 
-GPL-2.0-or-later, see [LICENSE](LICENSE). The loader, runtime and GPU shim are derived from
+GPL-2.0-or-later, see [LICENSE](LICENSE). Built on [YAPhoa/theatrhythm-fbl-pc](https://github.com/YAPhoa/theatrhythm-fbl-pc)
+(`v1.0.5c`). The loader, runtime and GPU shim are derived from
 SpartanPort by Felipe Prado and contributors (GPL-2.0). The video core and parts of the runtime
 follow [shadPS4](https://github.com/shadps4-emu/shadPS4). Theatrhythm Final Bar Line is a trademark
 of Square Enix. This project is not affiliated with or endorsed by Square Enix or Sony Interactive

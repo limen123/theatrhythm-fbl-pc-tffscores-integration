@@ -29,6 +29,10 @@ void SetThreadName(void* thread, const char* name);
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
 
+/// Sleeps until `deadline` using high-resolution OS wait primitives plus a short sub-millisecond
+/// tail spin for frame-pacing precision.
+void AccurateWaitUntil(std::chrono::steady_clock::time_point deadline);
+
 class AccurateTimer {
     std::chrono::nanoseconds target_interval{};
     std::chrono::nanoseconds total_wait{};

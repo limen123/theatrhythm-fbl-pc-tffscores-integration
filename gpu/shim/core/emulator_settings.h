@@ -62,9 +62,16 @@ public:
         return limit ? DisplayPeriod(limit, std::getenv("THEATRHYTHM_FPS_LIMIT") == nullptr)
                      : std::chrono::nanoseconds(0);
     }
+    static std::chrono::nanoseconds DisplayPeriodFor(double hz, double display_hz, bool snap) {
+        if (hz <= 0.0) {
+            return std::chrono::nanoseconds(0);
+        }
+        const double rate =
+            snap && display_hz > 0.5 && std::abs(display_hz - hz) < 0.5 ? display_hz : hz;
+        return std::chrono::nanoseconds(s64(1e9 / rate + 0.5));
+    }
     static std::chrono::nanoseconds DisplayPeriod(double hz, bool snap) {
-        static const double display = TheatrhythmWindowRefreshRate();
-        return std::chrono::nanoseconds(s64(1e9 / (snap && std::abs(display - hz) < 0.5 ? display : hz) + 0.5));
+        return DisplayPeriodFor(hz, TheatrhythmWindowRefreshRate(), snap);
     }
     /// Frames per second the present thread lets through; 0 = no limit. THEATRHYTHM_FPS_LIMIT overrides.
     u32 GetFrameLimit() {

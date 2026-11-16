@@ -57,7 +57,7 @@ struct AsyncShaderCompilation {
     size_t permutation{};
     bool initial{};
     Program* program{};
-    u64 since{}; ///< GPU frame it was queued in
+    AsyncSkipWindow since{}; ///< GPU frame and timestamp it was queued at
     ~AsyncShaderCompilation() {
         ir.reset();
         if (pools) {
@@ -472,16 +472,10 @@ int SkipFrames() {
 
 // theatrhythm: whether draws needing a build were skipped for the budget of GPU frames, counted
 // from `since` (set to this frame by the first skip when unset).
-bool SkipBudgetSpent(u64& since) {
-    const int budget = SkipFrames();
-    if (budget < 0) {
-        return false;
-    }
-    const u64 frame = TheatrhythmStats::gpu_frames.load(std::memory_order_relaxed);
-    if (since == ~u64{}) {
-        since = frame;
-    }
-    return frame - since >= u64(budget);
+bool SkipBudgetSpent(AsyncSkipWindow& since) {
+    return IsAsyncSkipBudgetSpent(since, SkipFrames(),
+                                  TheatrhythmStats::gpu_frames.load(std::memory_order_relaxed),
+                                  SteadyClockNowNs());
 }
 
 template <typename Job>
@@ -527,7 +521,8 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
     build->permutation = permutation;
     build->initial = initial;
     build->program = &program;
-    build->since = TheatrhythmStats::gpu_frames.load(std::memory_order_relaxed);
+    build->since = AsyncSkipWindow::Capture(
+        TheatrhythmStats::gpu_frames.load(std::memory_order_relaxed), SteadyClockNowNs());
     if (specialization) {
         build->spec = *specialization;
     }
@@ -585,7 +580,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
     }, true);
     if (queued) {
         program.pending.push_back(build);
-        program.skipped_since = ~u64{};
+        program.skipped_since.Reset();
         pending_shaders.push_back(std::move(build));
         ++compiles_started;
     }
@@ -601,7 +596,7 @@ bool PipelineCache::BuildNow(Program& program, AsyncShaderCompilation* build) {
         ++build_waits;
         PublishShaders();
     }
-    program.skipped_since = ~u64{};
+    program.skipped_since.Reset();
     return true;
 }
 
