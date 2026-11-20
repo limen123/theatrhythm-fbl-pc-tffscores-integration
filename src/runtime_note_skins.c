@@ -8,6 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #ifdef _MSC_VER
 #define ABI
@@ -51,11 +57,12 @@ enum {
 
 enum {
     NS_JUDGE_NONE      = 0,
-    NS_JUDGE_CRITICAL  = 1,
-    NS_JUDGE_GREAT     = 2,
-    NS_JUDGE_GOOD      = 3,
-    NS_JUDGE_BAD       = 4,
-    NS_JUDGE_MISS      = 5,
+    NS_JUDGE_RAINBOW   = 1,
+    NS_JUDGE_CRITICAL  = 2,
+    NS_JUDGE_GREAT     = 3,
+    NS_JUDGE_GOOD      = 4,
+    NS_JUDGE_BAD       = 5,
+    NS_JUDGE_MISS      = 6,
     NS_JUDGE_MISS_PASS = 6
 };
 
@@ -137,6 +144,7 @@ enum {
     C_MAT_GET_MAIN_TEX,
     C_MAT_SET_MAIN_TEX,
     C_SHADER_PROP_TO_ID,
+    C_GO_GET_TRANSFORM,
     C_COMP_GET_TRANSFORM,
     C_COMP_GET_GAMEOBJECT,
     C_XFORM_CHILD_COUNT,
@@ -183,6 +191,7 @@ static const GameSite kSites[NS_SITES] = {
     [C_MAT_GET_MAIN_TEX]   = {"UnityEngine.Material::get_mainTexture", 0, 0, 0, {"55 48 89 e5 41 56 53"}},
     [C_MAT_SET_MAIN_TEX]   = {"UnityEngine.Material::set_mainTexture", 0, 0, 0, {"55 48 89 e5 41 57 41 56 53 50"}},
     [C_SHADER_PROP_TO_ID]  = {"UnityEngine.Shader::PropertyToID", 0, 0, 0, {"55 48 89 e5 53 50"}},
+    [C_GO_GET_TRANSFORM]   = {"UnityEngine.GameObject::get_transform", 0, 0, 0, {"55 48 89 e5 53 50"}},
     [C_COMP_GET_TRANSFORM] = {"UnityEngine.Component::get_transform", 0, 0, 0, {"55 48 89 e5 53 50"}},
     [C_COMP_GET_GAMEOBJECT]= {"UnityEngine.Component::get_gameObject", 0, 0, 0, {"55 48 89 e5 53 50"}},
     [C_XFORM_CHILD_COUNT]  = {"UnityEngine.Transform::get_childCount", 0, 0, 0, {"55 48 89 e5 53 50"}},
@@ -198,34 +207,87 @@ static bool           s_installed = false;
 
 #define CODE(s) (s_module + s_code[s].offset)
 
-#define RVA_EFFECT_POOL_TYPEINFO 0x609a4e8ULL
-#define RVA_PS_MAIN_GET_COL_INJ  0x44c25b0ULL
-#define RVA_PS_MAIN_SET_COL_INJ  0x44c2610ULL
+static int s_is_game_104 = 0;
+static int s_active_color_type = 0;
+
+void runtime_note_skins_set_color_type(int color_type) {
+    int normalized = (color_type == 1) ? 1 : 0;
+    if (normalized == s_active_color_type) return;
+    s_active_color_type = normalized;
+    runtime_note_skins_sync_simple_colors();
+}
+
+int runtime_note_skins_get_color_type(void) {
+    return s_active_color_type;
+}
+
+static inline bool ns_should_apply(void) {
+    return s_active_color_type == 0;
+}
+
+#define RVA_EFFECT_POOL_TYPEINFO    (s_is_game_104 ? 0x609a4e8ULL : 0x6099250ULL)
+#define RVA_TRIGGER_OBJECT_TYPEINFO (s_is_game_104 ? 0x609f5e8ULL : 0ULL)
+#define RVA_IL2CPP_CLASS_INIT       (s_is_game_104 ? 0x045b590ULL : 0x04577c0ULL)
+#define RVA_TOBJ_SET_SIMPLE_COLOR   (s_is_game_104 ? 0x2724090ULL : 0ULL)
+#define RVA_PS_MAIN_GET_COL_INJ     (s_is_game_104 ? 0x44c25b0ULL : 0x44af080ULL)
+#define RVA_PS_MAIN_SET_COL_INJ     (s_is_game_104 ? 0x44c2610ULL : 0x44af0e0ULL)
+#define TOBJ_TRIG_TYPE_OFF          (s_is_game_104 ? 0xd0u : 0xb8u)
+
+static inline uint64_t ns_ptr_hash(const void *p) {
+    uint64_t x = ((uint64_t)(uintptr_t)p) >> 4;
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
 
 /* ========================================================================= */
 /* Small Safe Pointer & IL2CPP Helpers                                       */
 /* ========================================================================= */
 
 static inline bool ns_valid_ptr(const void *p) {
-    uintptr_t u = (uintptr_t)p;
-    return u >= 0x10000ULL && u <= 0x00007fffffffffffULL && (u & 1ULL) == 0;
+    return (((uintptr_t)p & 3ULL) == 0) && runtime_host_is_readable(p, 0x18) != 0;
+}
+
+static inline bool ns_mem_readable(const void *p, size_t size) {
+    if (size == 0 || (((uintptr_t)p & 3ULL) != 0)) return false;
+    return runtime_host_is_readable(p, size) != 0;
 }
 
 static void **ns_managed_ptr_seq(void *seq, int32_t *out_count) {
-    if (!ns_valid_ptr(seq)) {
+    if (!ns_mem_readable(seq, 0x20)) {
         if (out_count) *out_count = 0;
         return NULL;
     }
     void *p10 = *(void **)((char *)seq + 0x10);
     int32_t n18 = *(int32_t *)((char *)seq + 0x18);
     if (p10 == NULL) {
-        if (n18 < 0 || n18 > 65536) n18 = 0;
+        if (n18 <= 0 || n18 > 65536 || !ns_mem_readable((char *)seq + 0x20, (size_t)n18 * sizeof(void *))) {
+            if (out_count) *out_count = 0;
+            return NULL;
+        }
         if (out_count) *out_count = n18;
         return (void **)((char *)seq + 0x20);
     }
-    if (ns_valid_ptr(p10)) {
+    /* Multidimensional Il2CppArray (e.g. JudgeEffect[2,6]): bounds pointer at +0x10 points
+       immediately after the flattened inline element array at +0x20 + n18 * sizeof(void *). */
+    if (n18 > 0 && n18 <= 65536) {
+        char *elem_end = (char *)seq + 0x20 + (size_t)n18 * sizeof(void *);
+        if ((char *)p10 >= elem_end && (char *)p10 <= elem_end + 0x20 &&
+            ns_mem_readable((char *)seq + 0x20, (size_t)n18 * sizeof(void *))) {
+            if (out_count) *out_count = n18;
+            return (void **)((char *)seq + 0x20);
+        }
+    }
+    if (ns_mem_readable(p10, 0x20)) {
         int32_t cap = *(int32_t *)((char *)p10 + 0x18);
-        if (n18 < 0 || n18 > cap || cap > 65536) n18 = 0;
+        if (n18 <= 0 || cap <= 0 || n18 > cap || cap > 65536 ||
+            !ns_mem_readable((char *)p10 + 0x20, (size_t)n18 * sizeof(void *))) {
+            if (out_count) *out_count = 0;
+            return NULL;
+        }
         if (out_count) *out_count = n18;
         return (void **)((char *)p10 + 0x20);
     }
@@ -255,7 +317,7 @@ static int ns_trigger_type_to_category(uint8_t trig_type) {
 }
 
 static int ns_classify_trig_pd(void *trig_pd) {
-    if (!ns_valid_ptr(trig_pd)) return -1;
+    if (!ns_mem_readable(trig_pd, 0x20)) return -1;
     int32_t trig_idx = *(int32_t *)((char *)trig_pd + 0x10);
     int sh = runtime_slidehold_classify_trigger(trig_idx);
     if (sh >= 0) return sh;
@@ -369,7 +431,9 @@ void *runtime_note_skins_create_recolored_sprite(const uint8_t *png, size_t png_
         }
     }
 
-    runtime_note_skins_recolor_rgba(src, out_w, out_h, category);
+    if (ns_should_apply()) {
+        runtime_note_skins_recolor_rgba(src, out_w, out_h, category);
+    }
     void *spr = runtime_create_sprite_from_rgba_metrics(
         src, out_w, out_h,
         0.0f, 0.0f, (float)out_w, (float)out_h,
@@ -431,7 +495,7 @@ static void tick_deferred_destroys(void) {
 /* GPU Texture Readback Cache & White-Luminance Particle Normalization       */
 /* ========================================================================= */
 
-#define MAX_TEX_READBACK 64
+#define MAX_TEX_READBACK 512
 typedef struct {
     void    *tex;
     uint32_t pin;
@@ -466,10 +530,18 @@ static bool analyze_buffer_chromatic(const uint8_t *rgba, int w, int h) {
     return chrom_px * 40u >= lit_px || chrom_px >= 24;
 }
 
+static bool is_generated_white_tex(void *tex) {
+    if (!ns_valid_ptr(tex)) return false;
+    for (size_t i = 0; i < MAX_TEX_READBACK; ++i) {
+        if (s_tex_cache[i].white_tex == tex) return true;
+    }
+    return runtime_object_name_equals(tex, "NoteSkin/NeutralParticleTex");
+}
+
 static TexReadbackEntry *get_tex_readback(void *tex) {
     if (!runtime_unity_object_alive(tex)) return NULL;
     for (size_t i = 0; i < MAX_TEX_READBACK; ++i) {
-        if (s_tex_cache[i].tex == tex && s_tex_cache[i].rgba && runtime_unity_object_alive(tex)) {
+        if (s_tex_cache[i].tex == tex && s_tex_cache[i].rgba) {
             return &s_tex_cache[i];
         }
     }
@@ -507,7 +579,19 @@ static TexReadbackEntry *get_tex_readback(void *tex) {
     return e;
 }
 
+static void rgba_to_white_luminance(const uint8_t *src, uint8_t *dst, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t *s = src + i * 4u;
+        uint8_t l = s[0] > s[1] ? (s[0] > s[2] ? s[0] : s[2]) : (s[1] > s[2] ? s[1] : s[2]);
+        dst[i * 4u + 0] = l;
+        dst[i * 4u + 1] = l;
+        dst[i * 4u + 2] = l;
+        dst[i * 4u + 3] = s[3];
+    }
+}
+
 static void *get_neutral_white_tex(void *src_tex) {
+    if (is_generated_white_tex(src_tex)) return NULL;
     TexReadbackEntry *e = get_tex_readback(src_tex);
     if (!e || !e->is_chromatic) return NULL;
     if (e->white_tex && runtime_unity_object_alive(e->white_tex)) {
@@ -517,14 +601,7 @@ static void *get_neutral_white_tex(void *src_tex) {
     size_t n = (size_t)e->w * (size_t)e->h;
     uint8_t *lum = (uint8_t *)malloc(n * 4u);
     if (!lum) return NULL;
-    for (size_t i = 0; i < n; ++i) {
-        const uint8_t *s = e->rgba + i * 4u;
-        uint8_t l = s[0] > s[1] ? (s[0] > s[2] ? s[0] : s[2]) : (s[1] > s[2] ? s[1] : s[2]);
-        lum[i * 4u + 0] = l;
-        lum[i * 4u + 1] = l;
-        lum[i * 4u + 2] = l;
-        lum[i * 4u + 3] = s[3];
-    }
+    rgba_to_white_luminance(e->rgba, lum, n);
 
     void *wtex = runtime_create_texture2d_rgba(lum, e->w, e->h, "NoteSkin/NeutralParticleTex");
     free(lum);
@@ -553,13 +630,14 @@ static void (ABI *fn_mat_get_col_inj)(void *mat, int32_t prop_id, NSColor *out) 
 static void (ABI *fn_mat_set_col_inj)(void *mat, int32_t prop_id, const NSColor *in) = NULL;
 
 static bool    s_icalls_probed = false;
-static int32_t s_prop_tint = 0;
-static int32_t s_prop_color = 0;
+static int32_t s_prop_tint_color = 0;
+static int32_t s_prop_color      = 0;
 static int32_t s_prop_base_color = 0;
 
 static void ensure_particle_icalls(void) {
     if (s_icalls_probed) return;
     s_icalls_probed = true;
+
     fn_ps_main_get_col_inj = (void (ABI *)(void **, NSMinMaxGradient *))
         runtime_resolve_icall("UnityEngine.ParticleSystem/MainModule::get_startColor_Injected");
     fn_ps_main_set_col_inj = (void (ABI *)(void **, const NSMinMaxGradient *))
@@ -569,95 +647,119 @@ static void ensure_particle_icalls(void) {
 
     fn_ps_col_get_enabled = (bool (ABI *)(void **))
         runtime_resolve_icall("UnityEngine.ParticleSystem/ColorOverLifetimeModule::get_enabled_Injected");
-    fn_ps_col_get_color   = (void (ABI *)(void **, NSMinMaxGradient *))
+    fn_ps_col_get_color = (void (ABI *)(void **, NSMinMaxGradient *))
         runtime_resolve_icall("UnityEngine.ParticleSystem/ColorOverLifetimeModule::get_color_Injected");
-    fn_ps_col_set_color   = (void (ABI *)(void **, const NSMinMaxGradient *))
+    fn_ps_col_set_color = (void (ABI *)(void **, const NSMinMaxGradient *))
         runtime_resolve_icall("UnityEngine.ParticleSystem/ColorOverLifetimeModule::set_color_Injected");
 
-    fn_mat_has_prop    = (bool (ABI *)(void *, int32_t))runtime_resolve_icall("UnityEngine.Material::HasProperty(System.Int32)");
+    fn_mat_has_prop = (bool (ABI *)(void *, int32_t))
+        runtime_resolve_icall("UnityEngine.Material::HasProperty(System.Int32)");
     if (!fn_mat_has_prop) {
-        fn_mat_has_prop = (bool (ABI *)(void *, int32_t))runtime_resolve_icall("UnityEngine.Material::HasProperty");
+        fn_mat_has_prop = (bool (ABI *)(void *, int32_t))
+            runtime_resolve_icall("UnityEngine.Material::HasProperty");
     }
-    fn_mat_get_col_inj = (void (ABI *)(void *, int32_t, NSColor *))runtime_resolve_icall("UnityEngine.Material::GetColorImpl_Injected");
-    fn_mat_set_col_inj = (void (ABI *)(void *, int32_t, const NSColor *))runtime_resolve_icall("UnityEngine.Material::SetColorImpl_Injected");
+    fn_mat_get_col_inj = (void (ABI *)(void *, int32_t, NSColor *))
+        runtime_resolve_icall("UnityEngine.Material::GetColorImpl_Injected");
+    fn_mat_set_col_inj = (void (ABI *)(void *, int32_t, const NSColor *))
+        runtime_resolve_icall("UnityEngine.Material::SetColorImpl_Injected");
 
     typedef int32_t (ABI *PropIdFn)(void *str, void *m);
     PropIdFn prop_to_id = (PropIdFn)CODE(C_SHADER_PROP_TO_ID);
-    void *s_tint  = runtime_il2cpp_string("_TintColor");
-    void *s_color = runtime_il2cpp_string("_Color");
-    void *s_base  = runtime_il2cpp_string("_BaseColor");
-    if (s_tint)  s_prop_tint       = prop_to_id(s_tint, NULL);
-    if (s_color) s_prop_color      = prop_to_id(s_color, NULL);
-    if (s_base)  s_prop_base_color = prop_to_id(s_base, NULL);
+    void *s_tint = runtime_il2cpp_string("_TintColor");
+    void *s_col  = runtime_il2cpp_string("_Color");
+    void *s_base = runtime_il2cpp_string("_BaseColor");
+    if (s_tint) s_prop_tint_color = prop_to_id(s_tint, NULL);
+    if (s_col)  s_prop_color      = prop_to_id(s_col, NULL);
+    if (s_base) s_prop_base_color = prop_to_id(s_base, NULL);
 }
 
-#define MAX_MAT_CACHE 64
+#define MAX_MAT_CACHE 512
 typedef struct {
     void    *orig_mat;
     uint32_t orig_pin;
     void    *neutral_mat;
     uint32_t neutral_pin;
     bool     checked;
+    bool     non_chromatic;
 } MatNeutralEntry;
 
 static MatNeutralEntry s_mat_cache[MAX_MAT_CACHE];
 static size_t s_mat_evict = 0;
 
-static void neutralize_mat_color_prop(void *mat, int32_t prop_id, bool *io_changed) {
-    if (!mat || !prop_id || !fn_mat_has_prop || !fn_mat_get_col_inj || !fn_mat_set_col_inj) return;
-    if (!fn_mat_has_prop(mat, prop_id)) return;
-    NSColor c = {1, 1, 1, 1};
-    fn_mat_get_col_inj(mat, prop_id, &c);
+static bool color_is_chromatic(NSColor c) {
     float mx = fmaxf(c.r, fmaxf(c.g, c.b));
     float mn = fminf(c.r, fminf(c.g, c.b));
-    if (mx > 0.05f && (mx - mn) > 0.08f * mx) {
-        NSColor white = {1.0f, 1.0f, 1.0f, c.a};
-        fn_mat_set_col_inj(mat, prop_id, &white);
-        *io_changed = true;
-    }
+    return mx > 0.05f && (mx - mn) > 0.08f * mx;
+}
+
+static void clear_mat_entry(MatNeutralEntry *m) {
+    if (!m) return;
+    if (m->orig_pin) runtime_gc_unpin_obj(m->orig_pin);
+    if (m->neutral_pin) runtime_gc_unpin_obj(m->neutral_pin);
+    memset(m, 0, sizeof(*m));
 }
 
 static void *get_neutral_material(void *orig_mat) {
     if (!runtime_unity_object_alive(orig_mat)) return orig_mat;
     for (size_t i = 0; i < MAX_MAT_CACHE; ++i) {
-        if (s_mat_cache[i].orig_mat == orig_mat && runtime_unity_object_alive(orig_mat)) {
-            return s_mat_cache[i].neutral_mat ? s_mat_cache[i].neutral_mat : orig_mat;
+        if (s_mat_cache[i].orig_mat == orig_mat && s_mat_cache[i].checked) {
+            if (s_mat_cache[i].non_chromatic) return orig_mat;
+            if (runtime_unity_object_alive(s_mat_cache[i].neutral_mat)) {
+                return s_mat_cache[i].neutral_mat;
+            }
+            clear_mat_entry(&s_mat_cache[i]);
+            break;
+        }
+        if (s_mat_cache[i].neutral_mat == orig_mat) {
+            return orig_mat;
         }
     }
 
     ensure_particle_icalls();
-
     typedef void * (ABI *MatGetTexFn)(void *mat, void *m);
-    typedef void   (ABI *MatSetTexFn)(void *mat, void *tex, void *m);
-    void *main_tex = ((MatGetTexFn)CODE(C_MAT_GET_MAIN_TEX))(orig_mat, NULL);
-    void *white_tex = runtime_unity_object_alive(main_tex) ? get_neutral_white_tex(main_tex) : NULL;
+    typedef void   (ABI *MatSetTexFn)(void *mat, void *t, void *m);
 
-    bool need_tint_neutral = false;
-    const int32_t props[3] = {s_prop_tint, s_prop_color, s_prop_base_color};
-    for (int i = 0; i < 3; ++i) {
-        if (!props[i] || !fn_mat_has_prop || !fn_mat_get_col_inj) continue;
-        if (!fn_mat_has_prop(orig_mat, props[i])) continue;
-        NSColor c = {1, 1, 1, 1};
-        fn_mat_get_col_inj(orig_mat, props[i], &c);
-        float mx = fmaxf(c.r, fmaxf(c.g, c.b));
-        float mn = fminf(c.r, fminf(c.g, c.b));
-        if (mx > 0.05f && (mx - mn) > 0.08f * mx) {
-            need_tint_neutral = true;
-            break;
+    void *main_tex = ((MatGetTexFn)CODE(C_MAT_GET_MAIN_TEX))(orig_mat, NULL);
+    void *wtex = runtime_unity_object_alive(main_tex) ? get_neutral_white_tex(main_tex) : NULL;
+
+    int32_t props[3] = { s_prop_tint_color, s_prop_color, s_prop_base_color };
+    bool need_col_neutral = false;
+    if (fn_mat_has_prop && fn_mat_get_col_inj) {
+        for (int i = 0; i < 3; ++i) {
+            if (!props[i] || !fn_mat_has_prop(orig_mat, props[i])) continue;
+            NSColor c = {1, 1, 1, 1};
+            fn_mat_get_col_inj(orig_mat, props[i], &c);
+            if (color_is_chromatic(c)) {
+                need_col_neutral = true;
+                break;
+            }
         }
     }
 
     void *neutral_mat = NULL;
-    if (white_tex || need_tint_neutral) {
+    if (wtex || need_col_neutral) {
         void *cloned = runtime_clone_material_raw(orig_mat);
         if (runtime_unity_object_alive(cloned)) {
-            if (white_tex) {
-                ((MatSetTexFn)CODE(C_MAT_SET_MAIN_TEX))(cloned, white_tex, NULL);
+            if (wtex) {
+                ((MatSetTexFn)CODE(C_MAT_SET_MAIN_TEX))(cloned, wtex, NULL);
             }
-            bool touched = false;
-            for (int i = 0; i < 3; ++i) neutralize_mat_color_prop(cloned, props[i], &touched);
+            if (need_col_neutral && fn_mat_has_prop && fn_mat_get_col_inj && fn_mat_set_col_inj) {
+                for (int i = 0; i < 3; ++i) {
+                    if (!props[i] || !fn_mat_has_prop(cloned, props[i])) continue;
+                    NSColor c = {1, 1, 1, 1};
+                    fn_mat_get_col_inj(cloned, props[i], &c);
+                    if (color_is_chromatic(c)) {
+                        NSColor white = {1.0f, 1.0f, 1.0f, c.a};
+                        fn_mat_set_col_inj(cloned, props[i], &white);
+                    }
+                }
+            }
             neutral_mat = cloned;
         }
+    }
+
+    if ((wtex || need_col_neutral) && !neutral_mat) {
+        return orig_mat;
     }
 
     size_t slot = MAX_MAT_CACHE;
@@ -672,22 +774,24 @@ static void *get_neutral_material(void *orig_mat) {
         s_mat_evict = (s_mat_evict + 1) % MAX_MAT_CACHE;
     }
     MatNeutralEntry *m = &s_mat_cache[slot];
-    if (m->orig_pin) runtime_gc_unpin_obj(m->orig_pin);
-    if (m->neutral_pin) runtime_gc_unpin_obj(m->neutral_pin);
-    memset(m, 0, sizeof(*m));
+    clear_mat_entry(m);
     m->orig_mat = orig_mat;
     m->orig_pin = runtime_gc_pin_obj(orig_mat);
     if (neutral_mat) {
         m->neutral_mat = neutral_mat;
         m->neutral_pin = runtime_gc_pin_obj(neutral_mat);
+    } else {
+        m->non_chromatic = true;
     }
     m->checked = true;
     return neutral_mat ? neutral_mat : orig_mat;
 }
 
-#define MAX_PS_CACHE 512
+#define MAX_PS_CACHE 8192
+#define PS_HASH_CAP  16384
 typedef struct {
     void            *ps;
+    bool             persistent;
     bool             is_root;
     bool             has_last_rgb;
     float            last_r, last_g, last_b;
@@ -704,10 +808,41 @@ typedef struct {
 } PSCacheEntry;
 
 static PSCacheEntry s_ps_cache[MAX_PS_CACHE];
-static size_t s_ps_evict = 0;
+static size_t       s_ps_evict = 0;
+static int32_t      s_ps_hash[PS_HASH_CAP];
+static bool         s_ps_hash_inited = false;
+static size_t       s_ps_tombstones = 0;
 
-static void clear_ps_entry(PSCacheEntry *e) {
-    if (!e) return;
+static void rebuild_ps_hash(void) {
+    for (size_t i = 0; i < PS_HASH_CAP; ++i) s_ps_hash[i] = -1;
+    s_ps_tombstones = 0;
+    s_ps_hash_inited = true;
+    const size_t mask = PS_HASH_CAP - 1u;
+    for (size_t idx = 0; idx < MAX_PS_CACHE; ++idx) {
+        void *ps = s_ps_cache[idx].ps;
+        if (!ps) continue;
+        size_t pos = (size_t)ns_ptr_hash(ps) & mask;
+        while (s_ps_hash[pos] >= 0) pos = (pos + 1u) & mask;
+        s_ps_hash[pos] = (int32_t)idx;
+    }
+}
+
+static void clear_ps_entry_at(size_t idx) {
+    PSCacheEntry *e = &s_ps_cache[idx];
+    if (e->ps && s_ps_hash_inited) {
+        const size_t mask = PS_HASH_CAP - 1u;
+        size_t pos = (size_t)ns_ptr_hash(e->ps) & mask;
+        for (size_t probe = 0; probe < PS_HASH_CAP; ++probe) {
+            int32_t h = s_ps_hash[pos];
+            if (h == -1) break;
+            if (h == (int32_t)idx) {
+                s_ps_hash[pos] = -2;
+                ++s_ps_tombstones;
+                break;
+            }
+            pos = (pos + 1u) & mask;
+        }
+    }
     if (e->pin_white_col_min) runtime_gc_unpin_obj(e->pin_white_col_min);
     if (e->pin_white_col_max) runtime_gc_unpin_obj(e->pin_white_col_max);
     memset(e, 0, sizeof(*e));
@@ -717,32 +852,78 @@ static bool ns_color_near_white(NSColor c) {
     return fabsf(c.r - 1.0f) < 0.04f && fabsf(c.g - 1.0f) < 0.04f && fabsf(c.b - 1.0f) < 0.04f;
 }
 
-static PSCacheEntry *get_ps_entry(void *ps) {
-    if (!runtime_unity_object_alive(ps)) return NULL;
+static PSCacheEntry *get_ps_entry(void *ps, bool persistent) {
+    if (!ns_valid_ptr(ps)) return NULL;
     ensure_particle_icalls();
     if (!fn_ps_main_get_col_inj || !fn_ps_main_set_col_inj) return NULL;
+    if (!s_ps_hash_inited) rebuild_ps_hash();
 
-    PSCacheEntry *free_slot = NULL;
-    for (size_t i = 0; i < MAX_PS_CACHE; ++i) {
-        if (s_ps_cache[i].ps == ps) {
-            if (runtime_unity_object_alive(ps)) return &s_ps_cache[i];
-            clear_ps_entry(&s_ps_cache[i]);
-            free_slot = &s_ps_cache[i];
+    const size_t mask = PS_HASH_CAP - 1u;
+    size_t pos = (size_t)ns_ptr_hash(ps) & mask;
+    size_t first_tomb = PS_HASH_CAP;
+    for (size_t probe = 0; probe < PS_HASH_CAP; ++probe) {
+        int32_t h = s_ps_hash[pos];
+        if (h == -1) break;
+        if (h == -2) {
+            if (first_tomb >= PS_HASH_CAP) first_tomb = pos;
+        } else if (s_ps_cache[h].ps == ps) {
+            if (runtime_unity_object_alive(ps)) {
+                if (persistent) s_ps_cache[h].persistent = true;
+                return &s_ps_cache[h];
+            }
+            clear_ps_entry_at((size_t)h);
+            first_tomb = pos;
             break;
         }
-        if (!free_slot && (!s_ps_cache[i].ps || !runtime_unity_object_alive(s_ps_cache[i].ps))) {
-            if (s_ps_cache[i].ps) clear_ps_entry(&s_ps_cache[i]);
-            free_slot = &s_ps_cache[i];
+        pos = (pos + 1u) & mask;
+    }
+    if (!runtime_unity_object_alive(ps)) return NULL;
+
+    size_t free_idx = MAX_PS_CACHE;
+    for (size_t i = 0; i < MAX_PS_CACHE; ++i) {
+        if (!s_ps_cache[i].ps) {
+            free_idx = i;
+            break;
         }
     }
-    if (!free_slot) {
-        free_slot = &s_ps_cache[s_ps_evict];
-        s_ps_evict = (s_ps_evict + 1) % MAX_PS_CACHE;
-        clear_ps_entry(free_slot);
+    if (free_idx >= MAX_PS_CACHE) {
+        for (size_t i = 0; i < MAX_PS_CACHE; ++i) {
+            if (!runtime_unity_object_alive(s_ps_cache[i].ps)) {
+                clear_ps_entry_at(i);
+                free_idx = i;
+                break;
+            }
+        }
+    }
+    if (free_idx >= MAX_PS_CACHE) {
+        for (size_t probe = 0; probe < MAX_PS_CACHE; ++probe) {
+            size_t idx = (s_ps_evict + probe) % MAX_PS_CACHE;
+            if (!s_ps_cache[idx].persistent) {
+                s_ps_evict = (idx + 1u) % MAX_PS_CACHE;
+                clear_ps_entry_at(idx);
+                free_idx = idx;
+                break;
+            }
+        }
+    }
+    if (free_idx >= MAX_PS_CACHE) {
+        size_t idx = s_ps_evict;
+        s_ps_evict = (s_ps_evict + 1u) % MAX_PS_CACHE;
+        clear_ps_entry_at(idx);
+        free_idx = idx;
     }
 
+    PSCacheEntry *free_slot = &s_ps_cache[free_idx];
     memset(free_slot, 0, sizeof(*free_slot));
     free_slot->ps = ps;
+    free_slot->persistent = persistent;
+    if (s_ps_tombstones > PS_HASH_CAP / 4u) {
+        rebuild_ps_hash();
+    } else {
+        size_t ins_pos = (first_tomb < PS_HASH_CAP) ? first_tomb : pos;
+        if (s_ps_hash[ins_pos] == -2) --s_ps_tombstones;
+        s_ps_hash[ins_pos] = (int32_t)free_idx;
+    }
     if (runtime_object_name_equals(ps, "root")) {
         free_slot->is_root = true;
         return free_slot;
@@ -755,28 +936,31 @@ static PSCacheEntry *get_ps_entry(void *ps) {
     free_slot->orig_main_mode = orig_main.m_Mode;
     float a_min = (orig_main.m_Mode == 2) ? orig_main.m_ColorMin.a : orig_main.m_ColorMax.a;
     float a_max = orig_main.m_ColorMax.a;
-    if (orig_main.m_Mode == 1 || orig_main.m_Mode == 3 || a_max <= 0.001f) {
+    if (orig_main.m_Mode == 1 || orig_main.m_Mode == 3 || orig_main.m_Mode == 4 || a_max <= 0.001f) {
         a_min = 1.0f;
         a_max = 1.0f;
     }
     free_slot->orig_alpha_min = a_min;
     free_slot->orig_alpha_max = a_max;
 
-    /* Neutralize chromatic ColorOverLifetime gradients once to (1,1,1,orig_alpha) so startColor controls hue cleanly. */
-    if (fn_ps_col_get_enabled && fn_ps_col_get_color && fn_ps_col_set_color && fn_ps_col_get_enabled(&ps)) {
+    /* Neutralize ColorOverLifetime once so startColor controls hue while preserving alpha fade curves. */
+    if (fn_ps_col_get_enabled && fn_ps_col_get_color && fn_ps_col_set_color &&
+        fn_ps_col_get_enabled(&ps)) {
         NSMinMaxGradient orig_col;
         memset(&orig_col, 0, sizeof(orig_col));
         fn_ps_col_get_color(&ps, &orig_col);
         NSMinMaxGradient wcol = orig_col;
         bool touched = false;
+
         if (orig_col.m_Mode == 0 && !ns_color_near_white(orig_col.m_ColorMax)) {
             wcol.m_ColorMax = (NSColor){1.0f, 1.0f, 1.0f, orig_col.m_ColorMax.a};
             touched = true;
-        } else if (orig_col.m_Mode == 2 && (!ns_color_near_white(orig_col.m_ColorMin) || !ns_color_near_white(orig_col.m_ColorMax))) {
+        } else if (orig_col.m_Mode == 2 &&
+                   (!ns_color_near_white(orig_col.m_ColorMin) || !ns_color_near_white(orig_col.m_ColorMax))) {
             wcol.m_ColorMin = (NSColor){1.0f, 1.0f, 1.0f, orig_col.m_ColorMin.a};
             wcol.m_ColorMax = (NSColor){1.0f, 1.0f, 1.0f, orig_col.m_ColorMax.a};
             touched = true;
-        } else if (orig_col.m_Mode == 1 || orig_col.m_Mode == 3) {
+        } else if (orig_col.m_Mode == 1 || orig_col.m_Mode == 3 || orig_col.m_Mode == 4) {
             if (ns_valid_ptr(orig_col.m_GradientMax)) {
                 void *gmax = runtime_clone_gradient_solid_color(orig_col.m_GradientMax, 1.0f, 1.0f, 1.0f);
                 if (ns_valid_ptr(gmax)) {
@@ -795,13 +979,13 @@ static PSCacheEntry *get_ps_entry(void *ps) {
             }
         }
         if (touched) {
-            free_slot->col_neutralized = true;
             free_slot->white_col = wcol;
+            free_slot->col_neutralized = true;
             fn_ps_col_set_color(&ps, &free_slot->white_col);
         }
     }
 
-    /* Neutralize chromatic mainTexture / material tint once to white luminance. */
+    /* Neutralize chromatic particle material once to white luminance. */
     typedef void * (ABI *GetSharedMatFn)(void *r, void *m);
     typedef void   (ABI *SetSharedMatFn)(void *r, void *mat, void *m);
     void *psr = runtime_get_particle_system_renderer(ps);
@@ -819,9 +1003,8 @@ static PSCacheEntry *get_ps_entry(void *ps) {
     return free_slot;
 }
 
-static void apply_rgb_to_ps(void *ps, float r, float g, float b) {
-    PSCacheEntry *e = get_ps_entry(ps);
-    if (!e || e->is_root) return;
+static void apply_rgb_to_ps_entry(PSCacheEntry *e, float r, float g, float b) {
+    if (!e || e->is_root || !e->ps || !fn_ps_main_set_col_inj) return;
 
     if (e->has_last_rgb &&
         fabsf(e->last_r - r) < 0.004f &&
@@ -830,14 +1013,7 @@ static void apply_rgb_to_ps(void *ps, float r, float g, float b) {
         return;
     }
 
-    if (e->mat_prepared && runtime_unity_object_alive(e->psr) && runtime_unity_object_alive(e->neutral_mat)) {
-        typedef void (ABI *SetSharedMatFn)(void *rend, void *mat, void *m);
-        ((SetSharedMatFn)CODE(C_REND_SET_SHARED_MAT))(e->psr, e->neutral_mat, NULL);
-    }
-    if (e->col_neutralized && fn_ps_col_set_color) {
-        fn_ps_col_set_color(&ps, &e->white_col);
-    }
-
+    void *ps = e->ps;
     NSMinMaxGradient mg;
     memset(&mg, 0, sizeof(mg));
     if (e->orig_main_mode == 2) {
@@ -857,13 +1033,26 @@ static void apply_rgb_to_ps(void *ps, float r, float g, float b) {
     }
     fn_ps_main_set_col_inj(&ps, &mg);
 
+    if (e->col_neutralized && fn_ps_col_set_color) {
+        fn_ps_col_set_color(&ps, &e->white_col);
+    }
+    if (e->mat_prepared && runtime_unity_object_alive(e->psr) && runtime_unity_object_alive(e->neutral_mat)) {
+        typedef void (ABI *SetSharedMatFn)(void *r, void *mat, void *m);
+        ((SetSharedMatFn)CODE(C_REND_SET_SHARED_MAT))(e->psr, e->neutral_mat, NULL);
+    }
+
     e->last_r = r;
     e->last_g = g;
     e->last_b = b;
     e->has_last_rgb = true;
 }
 
+static void apply_rgb_to_ps(void *ps, float r, float g, float b) {
+    apply_rgb_to_ps_entry(get_ps_entry(ps, false), r, g, b);
+}
+
 void runtime_note_skins_apply_ps_list_rgb(void *ps_list, float r, float g, float b) {
+    if (!ns_should_apply()) return;
     int32_t count = 0;
     void **items = ns_managed_ptr_seq(ps_list, &count);
     if (!items || count <= 0) return;
@@ -873,24 +1062,75 @@ void runtime_note_skins_apply_ps_list_rgb(void *ps_list, float r, float g, float
 }
 
 /* ========================================================================= */
-/* Emitter Component Cache (collects ParticleSystems once per pooled object) */
+/* Emitter Component Cache (ParticleSystems + SpriteRenderers)               */
 /* ========================================================================= */
 
-#define MAX_EMITTER_CACHE 256
-#define MAX_PS_PER_EMITTER 24
-#define MAX_SR_PER_EMITTER 8
+#define MAX_EMITTER_CACHE 4096
+#define EMITTER_HASH_CAP  8192
+#define MAX_PS_PER_EMITTER 32
+#define MAX_SR_PER_EMITTER 16
 
 typedef struct {
-    void *owner;
-    void *ps_list_hint;
-    int   ps_count;
-    void *ps[MAX_PS_PER_EMITTER];
-    int   sr_count;
-    void *sr[MAX_SR_PER_EMITTER];
+    void         *owner;
+    void         *ps_list_hint;
+    void         *root_xform;
+    bool          persistent;
+    bool          empty;
+    bool          has_applied;
+    int           last_category;
+    float         last_r, last_g, last_b;
+    void         *last_tag;
+    int           ps_count;
+    void         *ps[MAX_PS_PER_EMITTER];
+    PSCacheEntry *ps_entries[MAX_PS_PER_EMITTER];
+    int           sr_count;
+    void         *sr[MAX_SR_PER_EMITTER];
 } EmitterCacheEntry;
 
 static EmitterCacheEntry s_emitter_cache[MAX_EMITTER_CACHE];
-static size_t s_emitter_evict = 0;
+static size_t            s_emitter_evict = 0;
+static int32_t           s_emitter_hash[EMITTER_HASH_CAP];
+static bool              s_emitter_hash_inited = false;
+static size_t            s_emitter_tombstones = 0;
+
+static void rebuild_emitter_hash(void) {
+    for (size_t i = 0; i < EMITTER_HASH_CAP; ++i) s_emitter_hash[i] = -1;
+    s_emitter_tombstones = 0;
+    s_emitter_hash_inited = true;
+    const size_t mask = EMITTER_HASH_CAP - 1u;
+    for (size_t idx = 0; idx < MAX_EMITTER_CACHE; ++idx) {
+        void *owner = s_emitter_cache[idx].owner;
+        if (!owner) continue;
+        size_t pos = (size_t)ns_ptr_hash(owner) & mask;
+        while (s_emitter_hash[pos] >= 0) pos = (pos + 1u) & mask;
+        s_emitter_hash[pos] = (int32_t)idx;
+    }
+}
+
+static void clear_emitter_entry_at(size_t idx) {
+    EmitterCacheEntry *e = &s_emitter_cache[idx];
+    if (e->owner && s_emitter_hash_inited) {
+        const size_t mask = EMITTER_HASH_CAP - 1u;
+        size_t pos = (size_t)ns_ptr_hash(e->owner) & mask;
+        for (size_t probe = 0; probe < EMITTER_HASH_CAP; ++probe) {
+            int32_t h = s_emitter_hash[pos];
+            if (h == -1) break;
+            if (h == (int32_t)idx) {
+                s_emitter_hash[pos] = -2;
+                ++s_emitter_tombstones;
+                break;
+            }
+            pos = (pos + 1u) & mask;
+        }
+    }
+    memset(e, 0, sizeof(*e));
+}
+
+static void reset_emitter_cache(void) {
+    memset(s_emitter_cache, 0, sizeof(s_emitter_cache));
+    s_emitter_evict = 0;
+    rebuild_emitter_hash();
+}
 
 static void add_unique_ptr(void **arr, int *cnt, int max_cnt, void *val) {
     if (!runtime_unity_object_alive(val) || *cnt >= max_cnt) return;
@@ -923,36 +1163,136 @@ static void collect_transform_components(void *xform, int depth, EmitterCacheEnt
     }
 }
 
-static void apply_category_to_emitter(void *owner, void *root_xform, void *ps_list, int category) {
+static void prepare_emitter_sr_assets(EmitterCacheEntry *entry) {
+    ensure_particle_icalls();
+    typedef void * (ABI *GetSharedMatFn)(void *r, void *m);
+    typedef void   (ABI *SetSharedMatFn)(void *r, void *mat, void *m);
+
+    for (int i = 0; i < entry->ps_count; ++i) {
+        entry->ps_entries[i] = get_ps_entry(entry->ps[i], entry->persistent);
+    }
+
+    for (int i = 0; i < entry->sr_count; ++i) {
+        void *sr = entry->sr[i];
+        if (!runtime_unity_object_alive(sr)) continue;
+
+        void *orig_mat = ((GetSharedMatFn)CODE(C_REND_GET_SHARED_MAT))(sr, NULL);
+        void *nmat = runtime_unity_object_alive(orig_mat) ? get_neutral_material(orig_mat) : NULL;
+        if (runtime_unity_object_alive(nmat) && nmat != orig_mat) {
+            ((SetSharedMatFn)CODE(C_REND_SET_SHARED_MAT))(sr, nmat, NULL);
+        }
+    }
+}
+
+static size_t find_emitter_hash_pos(const void *owner, size_t *out_first_tomb, int32_t *out_idx) {
+    if (!s_emitter_hash_inited) rebuild_emitter_hash();
+    const size_t mask = EMITTER_HASH_CAP - 1u;
+    size_t pos = (size_t)ns_ptr_hash(owner) & mask;
+    size_t first_tomb = EMITTER_HASH_CAP;
+    for (size_t probe = 0; probe < EMITTER_HASH_CAP; ++probe) {
+        int32_t h = s_emitter_hash[pos];
+        if (h == -1) break;
+        if (h == -2) {
+            if (first_tomb >= EMITTER_HASH_CAP) first_tomb = pos;
+        } else if (s_emitter_cache[h].owner == owner) {
+            if (out_first_tomb) *out_first_tomb = first_tomb;
+            if (out_idx) *out_idx = h;
+            return pos;
+        }
+        pos = (pos + 1u) & mask;
+    }
+    if (out_first_tomb) *out_first_tomb = first_tomb;
+    if (out_idx) *out_idx = -1;
+    return pos;
+}
+
+static void clear_emitter_hold_tag(void *owner) {
+    if (!owner) return;
+    int32_t idx = -1;
+    find_emitter_hash_pos(owner, NULL, &idx);
+    if (idx >= 0) {
+        s_emitter_cache[idx].last_tag = NULL;
+    }
+}
+
+static void apply_category_to_emitter_tagged(void *owner, void *root_xform, void *ps_list,
+                                             int category, void *tag, bool force, bool persistent) {
+    if (!ns_should_apply()) return;
     if (category < 0 || category >= THEATRHYTHM_NOTE_COUNT) return;
     if (!ns_valid_ptr(owner)) return;
 
+    float r, g, b;
+    theatrhythm_note_skin_get_rgb(category, &r, &g, &b);
+
+    size_t first_tomb = EMITTER_HASH_CAP;
+    int32_t existing_idx = -1;
+    size_t pos = find_emitter_hash_pos(owner, &first_tomb, &existing_idx);
+
     EmitterCacheEntry *entry = NULL;
-    EmitterCacheEntry *free_slot = NULL;
-    for (size_t i = 0; i < MAX_EMITTER_CACHE; ++i) {
-        if (s_emitter_cache[i].owner == owner) {
-            /* Validate first object is still alive before reusing pooled cache entry. */
-            if (!ns_valid_ptr(root_xform) || runtime_unity_object_alive(root_xform)) {
-                entry = &s_emitter_cache[i];
-                break;
+    size_t alloc_idx = MAX_EMITTER_CACHE;
+    if (existing_idx >= 0) {
+        EmitterCacheEntry *c = &s_emitter_cache[existing_idx];
+        if (c->ps_list_hint == ps_list && c->root_xform == root_xform) {
+            if (persistent) c->persistent = true;
+            if (c->empty) {
+                return;
             }
-            memset(&s_emitter_cache[i], 0, sizeof(s_emitter_cache[i]));
-            free_slot = &s_emitter_cache[i];
-            break;
-        }
-        if (!free_slot && !s_emitter_cache[i].owner) {
-            free_slot = &s_emitter_cache[i];
+            if (!force && c->has_applied &&
+                c->last_category == category &&
+                fabsf(c->last_r - r) < 0.004f &&
+                fabsf(c->last_g - g) < 0.004f &&
+                fabsf(c->last_b - b) < 0.004f) {
+                c->last_tag = tag;
+                return;
+            }
+            entry = c;
+        } else {
+            clear_emitter_entry_at((size_t)existing_idx);
+            alloc_idx = (size_t)existing_idx;
+            first_tomb = pos;
         }
     }
 
     if (!entry) {
-        if (!free_slot) {
-            free_slot = &s_emitter_cache[s_emitter_evict];
-            s_emitter_evict = (s_emitter_evict + 1) % MAX_EMITTER_CACHE;
+        if (alloc_idx >= MAX_EMITTER_CACHE) {
+            for (size_t i = 0; i < MAX_EMITTER_CACHE; ++i) {
+                if (!s_emitter_cache[i].owner) {
+                    alloc_idx = i;
+                    break;
+                }
+            }
         }
+        if (alloc_idx >= MAX_EMITTER_CACHE) {
+            for (size_t probe = 0; probe < MAX_EMITTER_CACHE; ++probe) {
+                size_t idx = (s_emitter_evict + probe) % MAX_EMITTER_CACHE;
+                if (!s_emitter_cache[idx].persistent) {
+                    s_emitter_evict = (idx + 1u) % MAX_EMITTER_CACHE;
+                    clear_emitter_entry_at(idx);
+                    alloc_idx = idx;
+                    break;
+                }
+            }
+        }
+        if (alloc_idx >= MAX_EMITTER_CACHE) {
+            size_t idx = s_emitter_evict;
+            s_emitter_evict = (s_emitter_evict + 1u) % MAX_EMITTER_CACHE;
+            clear_emitter_entry_at(idx);
+            alloc_idx = idx;
+        }
+
+        EmitterCacheEntry *free_slot = &s_emitter_cache[alloc_idx];
         memset(free_slot, 0, sizeof(*free_slot));
         free_slot->owner = owner;
         free_slot->ps_list_hint = ps_list;
+        free_slot->root_xform = root_xform;
+        free_slot->persistent = persistent;
+        if (s_emitter_tombstones > EMITTER_HASH_CAP / 4u) {
+            rebuild_emitter_hash();
+        } else {
+            size_t ins_pos = (first_tomb < EMITTER_HASH_CAP) ? first_tomb : pos;
+            if (s_emitter_hash[ins_pos] == -2) --s_emitter_tombstones;
+            s_emitter_hash[ins_pos] = (int32_t)alloc_idx;
+        }
 
         if (ns_valid_ptr(ps_list)) {
             int32_t cnt = 0;
@@ -966,48 +1306,78 @@ static void apply_category_to_emitter(void *owner, void *root_xform, void *ps_li
         if (runtime_unity_object_alive(root_xform)) {
             collect_transform_components(root_xform, 0, free_slot);
         }
+        if (free_slot->ps_count == 0 && free_slot->sr_count == 0) {
+            free_slot->empty = true;
+            return;
+        }
+        prepare_emitter_sr_assets(free_slot);
         entry = free_slot;
+    } else if (force) {
+        prepare_emitter_sr_assets(entry);
     }
 
-    float r, g, b;
-    theatrhythm_note_skin_get_rgb(category, &r, &g, &b);
     for (int i = 0; i < entry->ps_count; ++i) {
-        apply_rgb_to_ps(entry->ps[i], r, g, b);
+        PSCacheEntry *pe = entry->ps_entries[i];
+        if (!pe || pe->ps != entry->ps[i]) {
+            pe = get_ps_entry(entry->ps[i], entry->persistent);
+            entry->ps_entries[i] = pe;
+        }
+        apply_rgb_to_ps_entry(pe, r, g, b);
     }
     if (entry->sr_count > 0) {
         typedef void (ABI *SrSetColFn)(void *sr, NSColor col, void *m);
         SrSetColFn set_col = (SrSetColFn)CODE(C_SR_SET_COLOR);
         NSColor col = {r, g, b, 1.0f};
         for (int i = 0; i < entry->sr_count; ++i) {
-            if (runtime_unity_object_alive(entry->sr[i])) {
-                set_col(entry->sr[i], col, NULL);
-            }
+            if (!entry->sr[i]) continue;
+            set_col(entry->sr[i], col, NULL);
         }
     }
+    entry->has_applied = true;
+    entry->last_category = category;
+    entry->last_r = r;
+    entry->last_g = g;
+    entry->last_b = b;
+    entry->last_tag = tag;
+    entry->root_xform = root_xform;
+}
+
+static void apply_category_to_emitter(void *owner, void *root_xform, void *ps_list,
+                                      int category, bool persistent) {
+    apply_category_to_emitter_tagged(owner, root_xform, ps_list, category, NULL, false, persistent);
 }
 
 static void apply_category_to_effect_player(void *ep, int category) {
-    if (!ns_valid_ptr(ep)) return;
+    if (!ns_mem_readable(ep, 0x30)) return;
+    /* JudgeEffect/EffectPlayer stores Transform* at +0x10 (+0x18 is GameObject*) and List<ParticleSystem> at +0x28. */
     void *xform   = *(void **)((char *)ep + 0x10);
     void *ps_list = *(void **)((char *)ep + 0x28);
-    apply_category_to_emitter(ep, xform, ps_list, category);
+    apply_category_to_emitter_tagged(ep, xform, ps_list, category, NULL, false, true);
+}
+
+static void apply_category_to_loop_emitter_opts(void *le, int category, void *tag, bool force) {
+    if (!ns_mem_readable(le, 0x28)) return;
+    void *xform   = *(void **)((char *)le + 0x18);
+    void *ps_list = *(void **)((char *)le + 0x20);
+    apply_category_to_emitter_tagged(le, xform, ps_list, category, tag, force, true);
 }
 
 static void apply_category_to_loop_emitter(void *le, int category) {
-    if (!ns_valid_ptr(le)) return;
-    void *xform   = *(void **)((char *)le + 0x18);
-    void *ps_list = *(void **)((char *)le + 0x20);
-    apply_category_to_emitter(le, xform, ps_list, category);
+    apply_category_to_loop_emitter_opts(le, category, NULL, false);
+}
+
+static void apply_category_to_loop_emitter_hold(void *le, int category, void *hold_tag) {
+    apply_category_to_loop_emitter_opts(le, category, hold_tag, false);
 }
 
 static void *select_next_ep(void *judge_effect) {
-    if (!ns_valid_ptr(judge_effect)) return NULL;
+    if (!ns_mem_readable(judge_effect, 0x20)) return NULL;
     int32_t cnt = 0;
     void **eps = ns_managed_ptr_seq(*(void **)((char *)judge_effect + 0x18), &cnt);
     if (!eps || cnt <= 0) return NULL;
     for (int32_t i = 0; i < cnt; ++i) {
         void *ep = eps[i];
-        if (ns_valid_ptr(ep) && *(uint8_t *)((char *)ep + 0x38) == 0) {
+        if (ns_mem_readable(ep, 0x39) && *(uint8_t *)((char *)ep + 0x38) == 0) {
             return ep;
         }
     }
@@ -1015,7 +1385,7 @@ static void *select_next_ep(void *judge_effect) {
     float best_elapsed = -1e9f;
     for (int32_t i = 0; i < cnt; ++i) {
         void *ep = eps[i];
-        if (!ns_valid_ptr(ep)) continue;
+        if (!ns_mem_readable(ep, 0x38)) continue;
         float elapsed = *(float *)((char *)ep + 0x30) - *(float *)((char *)ep + 0x34);
         if (!best_ep || elapsed > best_elapsed) {
             best_ep = ep;
@@ -1025,27 +1395,8 @@ static void *select_next_ep(void *judge_effect) {
     return best_ep;
 }
 
-static void apply_category_to_idle_or_next_ep(void *judge_effect, int category) {
-    if (!ns_valid_ptr(judge_effect)) return;
-    int32_t cnt = 0;
-    void **eps = ns_managed_ptr_seq(*(void **)((char *)judge_effect + 0x18), &cnt);
-    if (!eps || cnt <= 0) return;
-
-    bool any_idle = false;
-    for (int32_t i = 0; i < cnt; ++i) {
-        void *ep = eps[i];
-        if (ns_valid_ptr(ep) && *(uint8_t *)((char *)ep + 0x38) == 0) {
-            apply_category_to_effect_player(ep, category);
-            any_idle = true;
-        }
-    }
-    if (!any_idle) {
-        apply_category_to_effect_player(select_next_ep(judge_effect), category);
-    }
-}
-
 static void apply_category_to_two_eps(void *judge_effect, int category) {
-    if (!ns_valid_ptr(judge_effect)) return;
+    if (!ns_mem_readable(judge_effect, 0x20)) return;
     int32_t cnt = 0;
     void **eps = ns_managed_ptr_seq(*(void **)((char *)judge_effect + 0x18), &cnt);
     if (!eps || cnt <= 0) return;
@@ -1053,7 +1404,7 @@ static void apply_category_to_two_eps(void *judge_effect, int category) {
     int applied = 0;
     for (int32_t i = 0; i < cnt && applied < 2; ++i) {
         void *ep = eps[i];
-        if (ns_valid_ptr(ep) && *(uint8_t *)((char *)ep + 0x38) == 0) {
+        if (ns_mem_readable(ep, 0x39) && *(uint8_t *)((char *)ep + 0x38) == 0) {
             apply_category_to_effect_player(ep, category);
             ++applied;
         }
@@ -1317,7 +1668,7 @@ static void rebuild_hold_line_tex(void *ts) {
 }
 
 static void sync_trigger_sprite_object(void *ts) {
-    if (!runtime_unity_object_alive(ts)) return;
+    if (!ns_mem_readable(ts, 0x68)) return;
 
     for (int i = 0; i < SLOT_SPRITE_COUNT; ++i) {
         void *cur = *(void **)((char *)ts + kSlotOffset[i]);
@@ -1363,48 +1714,138 @@ static void refresh_xform_sprite_renderers(void *xform, int depth) {
     }
 }
 
+static int slot_for_trig_type(uint8_t trig_type) {
+    switch (trig_type) {
+    case NS_TRIG_TOUCH:         return SLOT_TOUCH;
+    case NS_TRIG_SLIDE:         return SLOT_SLIDE;
+    case NS_TRIG_LINHOLD_START:
+    case NS_TRIG_CRVHOLD_START: return SLOT_HOLD_START;
+    case NS_TRIG_LINHOLD_PASS:
+    case NS_TRIG_CRVHOLD_PASS:  return SLOT_HOLD_PASS;
+    case NS_TRIG_LINHOLD_END_T:
+    case NS_TRIG_CRVHOLD_END_T: return SLOT_HOLD_END_TOUCH;
+    case NS_TRIG_LINHOLD_END_S:
+    case NS_TRIG_CRVHOLD_END_S: return SLOT_HOLD_END_SLIDE;
+    default:                    return -1;
+    }
+}
+
+static void    *s_simple_colors_synced_arr  = NULL;
+static int      s_simple_colors_synced_type = -1;
+static uint32_t s_simple_colors_synced_ver  = 0;
+
+void runtime_note_skins_sync_simple_colors(void) {
+    if (!s_installed || !s_module || !s_is_game_104 || RVA_TRIGGER_OBJECT_TYPEINFO == 0ULL) return;
+    void **p_ti = (void **)(s_module + RVA_TRIGGER_OBJECT_TYPEINFO);
+    if (!ns_mem_readable(p_ti, sizeof(void *))) return;
+    void *klass = *p_ti;
+    if (!ns_mem_readable(klass, 0xe8)) return;
+    if (*(int32_t *)((char *)klass + 0xe0) == 0) {
+        typedef void (ABI *ClassInitFn)(void *);
+        ((ClassInitFn)(s_module + RVA_IL2CPP_CLASS_INIT))(klass);
+    }
+    void *static_fields = *(void **)((char *)klass + 0xb8);
+    if (!ns_mem_readable(static_fields, 0x18)) return;
+    void *arr = *(void **)((char *)static_fields + 0x10);
+    if (!ns_mem_readable(arr, 0x60)) return;
+
+    uint32_t skin_ver = theatrhythm_note_skin_version();
+    if (arr == s_simple_colors_synced_arr &&
+        s_active_color_type == s_simple_colors_synced_type &&
+        skin_ver == s_simple_colors_synced_ver) {
+        return;
+    }
+
+    float *touch_col = (float *)((char *)arr + 0x20);
+    float *hold_col  = (float *)((char *)arr + 0x30);
+    if (ns_should_apply()) {
+        int th = 0, ts = 100, hh = 120, hs = 100;
+        theatrhythm_note_skin_get(THEATRHYTHM_NOTE_TOUCH, &th, &ts);
+        theatrhythm_note_skin_get(THEATRHYTHM_NOTE_HOLD,  &hh, &hs);
+        float tr, tg, tb, hr, hg, hb;
+        /* Preserve vanilla Simple Mode value/saturation envelope:
+         * Touch default {0.9607843, 0.18039216, 0.18039216} (H=0, S=0.8125, V=0.9607843)
+         * Hold  default {0.0,       0.79607844, 0.0       } (H=120, S=1.0,  V=0.79607844) */
+        ns_hsv_to_rgb((float)th, ns_clamp01((float)ts / 100.0f) * 0.8125f, 0.9607843f, &tr, &tg, &tb);
+        ns_hsv_to_rgb((float)hh, ns_clamp01((float)hs / 100.0f),           0.79607844f, &hr, &hg, &hb);
+        touch_col[0] = tr; touch_col[1] = tg; touch_col[2] = tb; touch_col[3] = 1.0f;
+        hold_col[0]  = hr; hold_col[1]  = hg; hold_col[2]  = hb; hold_col[3]  = 1.0f;
+    } else {
+        touch_col[0] = 0.9607843f; touch_col[1] = 0.18039216f; touch_col[2] = 0.18039216f; touch_col[3] = 1.0f;
+        hold_col[0]  = 0.0f;       hold_col[1]  = 0.79607844f; hold_col[2]  = 0.0f;        hold_col[3]  = 1.0f;
+    }
+    s_simple_colors_synced_arr  = arr;
+    s_simple_colors_synced_type = s_active_color_type;
+    s_simple_colors_synced_ver  = skin_ver;
+}
+
+void runtime_note_skins_on_set_simple_type(void *tobj) {
+    if (!s_installed || !s_is_game_104 || !ns_should_apply()) return;
+    if (!ns_mem_readable(tobj, TOBJ_TRIG_TYPE_OFF + 1u)) return;
+    if (runtime_slidehold_is_registered_trigger_obj(tobj)) return;
+
+    void *simple_arr = *(void **)((char *)tobj + 0x68);
+    if (!ns_mem_readable(simple_arr, 0x28) || *(void **)((char *)simple_arr + 0x10) != NULL) return;
+    int32_t sc = *(int32_t *)((char *)simple_arr + 0x18);
+    if (sc < 1 || sc > 4 || !ns_mem_readable((char *)simple_arr + 0x20, (size_t)sc * sizeof(void *))) return;
+
+    uint8_t trig_type = *(uint8_t *)((char *)tobj + TOBJ_TRIG_TYPE_OFF);
+    void **slots = (void **)((char *)simple_arr + 0x20);
+    for (int32_t k = 0; k < sc; ++k) {
+        int sidx = find_slot_for_sprite(slots[k]);
+        if (sidx < 0) {
+            if (k == 0) {
+                sidx = slot_for_trig_type(trig_type);
+            } else if (k == 1 && (trig_type == NS_TRIG_LINHOLD_START || trig_type == NS_TRIG_CRVHOLD_START)) {
+                /* CreateTriggers (0x271a5da) assigns TriggerSprite+0x40 (HoldEndTouch) into _simpleSprites[1]. */
+                sidx = SLOT_HOLD_END_TOUCH;
+            }
+        }
+        if (sidx >= 0 && runtime_unity_object_alive(s_slots[sidx].active_spr)) {
+            slots[k] = s_slots[sidx].active_spr;
+        }
+    }
+}
+
 static void refresh_stage_visuals(void *mst) {
-    if (!runtime_unity_object_alive(mst)) return;
+    if (!runtime_unity_object_alive(mst) || !ns_mem_readable(mst, 0x98)) return;
+    runtime_note_skins_sync_simple_colors();
+
     void *ts = *(void **)((char *)mst + 0x40);
-    if (runtime_unity_object_alive(ts)) {
+    if (ns_mem_readable(ts, 0x68)) {
         sync_trigger_sprite_object(ts);
     }
 
     typedef void (ABI *JointSetFn)(void *jl, void *spr, void *m);
     typedef void (ABI *LHoldSetFn)(void *lh, void *spr, void *m);
     typedef void (ABI *CHoldSetFn)(void *ch, void *tex, void *m);
+    typedef void (ABI *SetSimpleColFn)(void *tobj, int32_t color_type);
 
     /* Update live TriggerObjects (excluding registered SlideHold notes, updated separately below). */
     int32_t trig_cnt = 0;
     void **trigs = ns_managed_ptr_seq(*(void **)((char *)mst + 0x70), &trig_cnt);
     for (int32_t i = 0; i < trig_cnt; ++i) {
         void *tobj = trigs[i];
-        if (!runtime_unity_object_alive(tobj)) continue;
+        if (!runtime_unity_object_alive(tobj) || !ns_mem_readable(tobj, 0x40)) continue;
         if (runtime_slidehold_is_registered_trigger_obj(tobj)) continue;
 
+        runtime_note_skins_on_set_simple_type(tobj);
         refresh_sr_by_known_slot(*(void **)((char *)tobj + 0x38));
+
+        if (s_is_game_104 && RVA_TOBJ_SET_SIMPLE_COLOR != 0ULL &&
+            ns_mem_readable(tobj, 0x64) && *(int32_t *)((char *)tobj + 0x60) == 1) {
+            /* Re-apply _simpleColors[0, kind] into tobj->_baseColor and _spriteRenderer.color. */
+            ((SetSimpleColFn)(s_module + RVA_TOBJ_SET_SIMPLE_COLOR))(tobj, 0);
+        }
+
         void *twin_sub = *(void **)((char *)tobj + 0x30);
-        if (runtime_unity_object_alive(twin_sub)) {
+        if (runtime_unity_object_alive(twin_sub) && ns_mem_readable(twin_sub, 0x108)) {
             refresh_sr_by_known_slot(*(void **)((char *)twin_sub + 0xf8));
             int32_t arrow_cnt = 0;
             void **arrows = ns_managed_ptr_seq(*(void **)((char *)twin_sub + 0x100), &arrow_cnt);
             for (int32_t a = 0; a < arrow_cnt; ++a) refresh_sr_by_known_slot(arrows[a]);
         } else {
             refresh_xform_sprite_renderers(*(void **)((char *)tobj + 0x28), 0);
-        }
-
-        void *simple_arr = *(void **)((char *)tobj + 0x68);
-        if (ns_valid_ptr(simple_arr)) {
-            int32_t sc = *(int32_t *)((char *)simple_arr + 0x18);
-            if (sc >= 1 && sc <= 4) {
-                void **slots = (void **)((char *)simple_arr + 0x20);
-                for (int32_t k = 0; k < sc; ++k) {
-                    int sidx = find_slot_for_sprite(slots[k]);
-                    if (sidx >= 0 && runtime_unity_object_alive(s_slots[sidx].active_spr)) {
-                        slots[k] = s_slots[sidx].active_spr;
-                    }
-                }
-            }
         }
     }
 
@@ -1427,7 +1868,7 @@ static void refresh_stage_visuals(void *mst) {
         void **lhs = ns_managed_ptr_seq(*(void **)((char *)mst + 0x88), &lh_cnt);
         for (int32_t i = 0; i < lh_cnt; ++i) {
             void *lh = lhs[i];
-            if (!runtime_unity_object_alive(lh)) continue;
+            if (!runtime_unity_object_alive(lh) || !ns_mem_readable(lh, 0x28)) continue;
             void *sr = *(void **)((char *)lh + 0x20);
             if (runtime_unity_object_alive(sr)) {
                 typedef void * (ABI *SrGetSprFn)(void *s, void *m);
@@ -1456,6 +1897,7 @@ static void refresh_stage_visuals(void *mst) {
 }
 
 void *runtime_note_skins_active_hold_start_sprite(void) {
+    if (!ns_should_apply()) return NULL;
     return runtime_unity_object_alive(s_slots[SLOT_HOLD_START].active_spr)
          ? s_slots[SLOT_HOLD_START].active_spr : NULL;
 }
@@ -1464,8 +1906,252 @@ void *runtime_note_skins_active_hold_start_sprite(void) {
 /* Cross-Module Hit & Hold Particle Callbacks                                */
 /* ========================================================================= */
 
+static void    *s_warmed_pool = NULL;
+static int32_t  s_warmed_type_idx = -1;
+static bool     s_warmed_is_ems = false;
+static uint32_t s_warmed_skin_ver = 0;
+
+static void    *s_active_tlc = NULL;
+static void    *s_warmed_tlc = NULL;
+static uint32_t s_warmed_tlc_skin_ver = 0;
+
+static void *resolve_loaded_effect_pool(int32_t *out_type_idx, bool *out_is_ems) {
+    if (!s_module) return NULL;
+    void **p_ti = (void **)(s_module + RVA_EFFECT_POOL_TYPEINFO);
+    if (!ns_mem_readable(p_ti, sizeof(void *))) return NULL;
+    void *klass = *p_ti;
+    if (!ns_mem_readable(klass, 0xe8) || *(int32_t *)((char *)klass + 0xe0) == 0) return NULL;
+    void *static_fields = *(void **)((char *)klass + 0xb8);
+    if (!ns_mem_readable(static_fields, 0x18)) return NULL;
+    void *pool = *(void **)((char *)static_fields + 0x10);
+    if (!ns_mem_readable(pool, 0x140) || *(uint8_t *)((char *)pool + 0x138) == 0) return NULL;
+    int32_t type_idx = *(int32_t *)((char *)pool + 0x128);
+    if (type_idx == 0 || type_idx == 1) {
+        runtime_note_skins_set_color_type(type_idx);
+        runtime_slidehold_set_color_type(type_idx);
+    }
+    if (out_type_idx) *out_type_idx = type_idx;
+    if (out_is_ems)   *out_is_ems   = (*(uint8_t *)((char *)pool + 0x12c) != 0);
+    return pool;
+}
+
+static int32_t resolve_judge_idx(const void *controller, uint8_t judge) {
+    if (!ns_mem_readable(controller, 0x46)) return -1;
+    bool timing_adj = (*(const uint8_t *)((const char *)controller + 0x45) != 0);
+    int32_t judge_idx = timing_adj ? ((judge == NS_JUDGE_MISS_PASS) ? 5 : 0) : ((int32_t)judge - 1);
+    return (judge_idx >= 0 && judge_idx <= 5) ? judge_idx : -1;
+}
+
+static void *get_pool_je_slot(void *arr_obj, int32_t idx) {
+    int32_t arr_cnt = 0;
+    void **items = ns_managed_ptr_seq(arr_obj, &arr_cnt);
+    return (items && idx >= 0 && idx < arr_cnt) ? items[idx] : NULL;
+}
+
+static void *get_pool_strided_slot(void *arr_obj, int32_t type_idx, int32_t sub_idx) {
+    int32_t arr_cnt = 0;
+    void **items = ns_managed_ptr_seq(arr_obj, &arr_cnt);
+    if (!items || arr_cnt < 2) return NULL;
+    int32_t stride = arr_cnt / 2;
+    if (sub_idx < 0 || sub_idx >= stride) return NULL;
+    int32_t slot = stride * type_idx + sub_idx;
+    return (slot >= 0 && slot < arr_cnt) ? items[slot] : NULL;
+}
+
+static void prewarm_judge_effect(void *judge_effect, int default_cat) {
+    if (!ns_mem_readable(judge_effect, 0x20)) return;
+    int32_t cnt = 0;
+    void **eps = ns_managed_ptr_seq(*(void **)((char *)judge_effect + 0x18), &cnt);
+    if (!eps || cnt <= 0) return;
+    for (int32_t i = 0; i < cnt; ++i) {
+        apply_category_to_effect_player(eps[i], default_cat);
+    }
+}
+
+static void prewarm_pool_stride_array(void *arr_obj, int32_t type_idx, int default_cat) {
+    int32_t arr_cnt = 0;
+    void **items = ns_managed_ptr_seq(arr_obj, &arr_cnt);
+    if (!items || arr_cnt < 2) return;
+    int32_t stride = arr_cnt / 2;
+    int32_t base = stride * type_idx;
+    if (base < 0 || base >= arr_cnt) return;
+    for (int32_t j = 0; j < stride && (base + j) < arr_cnt; ++j) {
+        prewarm_judge_effect(items[base + j], default_cat);
+    }
+}
+
+static bool prewarm_fms_lane_emitters(void *lane) {
+    if (!ns_mem_readable(lane, 0xe0)) return false;
+    bool warmed = false;
+    void *single = *(void **)((char *)lane + 0x28);
+    if (single) { prewarm_judge_effect(single, THEATRHYTHM_NOTE_TOUCH); warmed = true; }
+
+    static const size_t kJeArrOffs[3] = { 0x30, 0x40, 0x48 };
+    for (int k = 0; k < 3; ++k) {
+        int32_t cnt = 0;
+        void **arr = ns_managed_ptr_seq(*(void **)((char *)lane + kJeArrOffs[k]), &cnt);
+        for (int32_t i = 0; i < cnt; ++i) {
+            prewarm_judge_effect(arr[i], THEATRHYTHM_NOTE_TOUCH);
+            warmed = true;
+        }
+    }
+
+    static const size_t kLeArrOffs[2] = { 0xa0, 0xd8 };
+    for (int k = 0; k < 2; ++k) {
+        int32_t cnt = 0;
+        void **les = ns_managed_ptr_seq(*(void **)((char *)lane + kLeArrOffs[k]), &cnt);
+        for (int32_t i = 0; i < cnt; ++i) {
+            apply_category_to_loop_emitter(les[i], THEATRHYTHM_NOTE_HOLD);
+            warmed = true;
+        }
+    }
+    return warmed;
+}
+
+static void prewarm_lanes_if_ready(void) {
+    if (!s_installed || !ns_should_apply() || !ns_mem_readable(s_active_tlc, 0x38)) return;
+    uint32_t skin_ver = theatrhythm_note_skin_version();
+    if (s_active_tlc == s_warmed_tlc && skin_ver == s_warmed_tlc_skin_ver) return;
+
+    int32_t mode = *(int32_t *)((char *)s_active_tlc + 0x18);
+    bool warmed_any = false;
+    if (mode == 1) {
+        void *ctrl = *(void **)((char *)s_active_tlc + 0x20);
+        if (ns_mem_readable(ctrl, 0x20)) {
+            int32_t cnt = 0;
+            void **lanes = ns_managed_ptr_seq(*(void **)((char *)ctrl + 0x18), &cnt);
+            for (int32_t i = 0; i < cnt; ++i) {
+                void *lane = lanes[i];
+                if (!ns_mem_readable(lane, 0x98)) continue;
+                void *je0 = *(void **)((char *)lane + 0x20);
+                if (je0) { prewarm_judge_effect(je0, THEATRHYTHM_NOTE_TOUCH); warmed_any = true; }
+                int32_t je_cnt = 0;
+                void **jes = ns_managed_ptr_seq(*(void **)((char *)lane + 0x28), &je_cnt);
+                for (int32_t j = 0; j < je_cnt; ++j) {
+                    prewarm_judge_effect(jes[j], THEATRHYTHM_NOTE_TOUCH);
+                    warmed_any = true;
+                }
+                void *le_hold = *(void **)((char *)lane + 0x80);
+                if (le_hold) { apply_category_to_loop_emitter(le_hold, THEATRHYTHM_NOTE_HOLD); warmed_any = true; }
+                void *le_hit = *(void **)((char *)lane + 0x90);
+                if (le_hit) { apply_category_to_loop_emitter(le_hit, THEATRHYTHM_NOTE_TOUCH); warmed_any = true; }
+            }
+        }
+    } else if (mode == 2) {
+        void *ctrl = *(void **)((char *)s_active_tlc + 0x28);
+        if (ns_mem_readable(ctrl, 0x60)) {
+            if (prewarm_fms_lane_emitters(*(void **)((char *)ctrl + 0x18))) warmed_any = true;
+            int32_t cnt = 0;
+            void **lanes = ns_managed_ptr_seq(*(void **)((char *)ctrl + 0x58), &cnt);
+            for (int32_t i = 0; i < cnt; ++i) {
+                if (prewarm_fms_lane_emitters(lanes[i])) warmed_any = true;
+            }
+        }
+    } else if (mode == 3) {
+        void *ctrl = *(void **)((char *)s_active_tlc + 0x30);
+        if (ns_mem_readable(ctrl, 0x28)) {
+            int32_t cnt = 0;
+            void **lanes = ns_managed_ptr_seq(*(void **)((char *)ctrl + 0x20), &cnt);
+            for (int32_t i = 0; i < cnt; ++i) {
+                void *lane = lanes[i];
+                if (!ns_mem_readable(lane, 0x80)) continue;
+                void *je0 = *(void **)((char *)lane + 0x20);
+                if (je0) { prewarm_judge_effect(je0, THEATRHYTHM_NOTE_TOUCH); warmed_any = true; }
+                void *le_hold = *(void **)((char *)lane + 0x78);
+                if (le_hold) { apply_category_to_loop_emitter(le_hold, THEATRHYTHM_NOTE_HOLD); warmed_any = true; }
+            }
+        }
+    }
+
+    if (warmed_any) {
+        s_warmed_tlc = s_active_tlc;
+        s_warmed_tlc_skin_ver = skin_ver;
+    }
+}
+
+static void prewarm_effect_pool_if_ready(void) {
+    prewarm_lanes_if_ready();
+    int32_t type_idx = 0;
+    bool is_ems = false;
+    void *pool = resolve_loaded_effect_pool(&type_idx, &is_ems);
+    if (!pool || type_idx != 0 || !ns_should_apply()) return;
+    uint32_t skin_ver = theatrhythm_note_skin_version();
+    if (pool == s_warmed_pool && type_idx == s_warmed_type_idx &&
+        is_ems == s_warmed_is_ems && skin_ver == s_warmed_skin_ver) {
+        return;
+    }
+
+    s_warmed_pool = pool;
+    s_warmed_type_idx = type_idx;
+    s_warmed_is_ems = is_ems;
+    s_warmed_skin_ver = skin_ver;
+
+    /* Pre-warm all active JudgeEffect.EffectPlayers on stage load or skin change so PlayJudgeEffect never
+       runs first-time Graphics.Blit + ReadPixels texture extraction or Material cloning mid-song. */
+    static const int kOuterCat[3] = {
+        THEATRHYTHM_NOTE_TOUCH, THEATRHYTHM_NOTE_SLIDE, THEATRHYTHM_NOTE_HOLD
+    };
+    void *outer_obj = *(void **)((char *)pool + (is_ems ? 0xf8 : 0xc8));
+    for (int32_t o = 0; o < 3; ++o) {
+        prewarm_pool_stride_array(get_pool_je_slot(outer_obj, o), type_idx, kOuterCat[o]);
+    }
+
+    static const struct {
+        size_t norm_off;
+        size_t ems_off;
+        int    cat;
+        bool   strided;
+    } kPoolSlots[] = {
+        { 0xd0, 0x100, THEATRHYTHM_NOTE_SLIDE, true  }, /* SlideLine (2 x 6) */
+        { 0xd8, 0x108, THEATRHYTHM_NOTE_HOLD,  true  }, /* HoldSlideLine (2 x 6) */
+        { 0xe0, 0x110, THEATRHYTHM_NOTE_TOUCH, true  }, /* LastTrigger (2 x 2) */
+        { 0xe8, 0x118, THEATRHYTHM_NOTE_TOUCH, false }, /* CriticalHit (2) */
+        { 0xf0, 0x120, THEATRHYTHM_NOTE_HOLD,  false }, /* HoldMidpoint (2) */
+    };
+    for (size_t i = 0; i < sizeof(kPoolSlots) / sizeof(kPoolSlots[0]); ++i) {
+        size_t off = is_ems ? kPoolSlots[i].ems_off : kPoolSlots[i].norm_off;
+        void *arr = *(void **)((char *)pool + off);
+        if (kPoolSlots[i].strided) {
+            prewarm_pool_stride_array(arr, type_idx, kPoolSlots[i].cat);
+        } else {
+            prewarm_judge_effect(get_pool_je_slot(arr, type_idx), kPoolSlots[i].cat);
+        }
+    }
+}
+
+#define NS_LANE_HOLD_CACHE_CAP 8
+typedef struct {
+    void    *hold_sr;
+    void    *last_trig_pd;
+    void    *last_spr;
+    uint32_t last_skin_ver;
+} NSLaneHoldCache;
+static NSLaneHoldCache s_ns_lane_hold_cache[NS_LANE_HOLD_CACHE_CAP];
+
+static void reset_stage_instance_caches(void) {
+    for (size_t i = 0; i < MAX_PS_CACHE; ++i) {
+        clear_ps_entry_at(i);
+    }
+    s_ps_evict = 0;
+    rebuild_ps_hash();
+    reset_emitter_cache();
+    memset(s_ns_lane_hold_cache, 0, sizeof(s_ns_lane_hold_cache));
+    s_warmed_pool = NULL;
+    s_warmed_type_idx = -1;
+    s_warmed_is_ems = false;
+    s_warmed_skin_ver = 0;
+    s_warmed_tlc = NULL;
+    s_warmed_tlc_skin_ver = 0;
+}
+
 void runtime_note_skins_on_play_judge_effect(void *controller, void *trig_pd) {
-    if (!s_installed || !s_module || !ns_valid_ptr(controller) || !ns_valid_ptr(trig_pd)) return;
+    if (!s_installed || !s_module ||
+        !ns_mem_readable(controller, 0x46) || !ns_mem_readable(trig_pd, 0x50)) return;
+
+    int32_t type_idx = 0;
+    bool is_ems = false;
+    void *pool = resolve_loaded_effect_pool(&type_idx, &is_ems);
+    if (!pool || type_idx != 0 || !ns_should_apply()) return;
 
     uint8_t trig_type = *(uint8_t *)((char *)trig_pd + 0x18);
     uint8_t judge     = *(uint8_t *)((char *)trig_pd + 0x4c);
@@ -1473,24 +2159,12 @@ void runtime_note_skins_on_play_judge_effect(void *controller, void *trig_pd) {
     if (cat < 0 || cat == THEATRHYTHM_NOTE_JOINT) return;
     if (judge == NS_JUDGE_NONE || judge >= NS_JUDGE_MISS) return;
 
-    void **p_ti = (void **)(s_module + RVA_EFFECT_POOL_TYPEINFO);
-    void *klass = *p_ti;
-    if (!ns_valid_ptr(klass) || *(int32_t *)((char *)klass + 0xe0) == 0) return;
-    void *static_fields = *(void **)((char *)klass + 0xb8);
-    if (!ns_valid_ptr(static_fields)) return;
-    void *pool = *(void **)((char *)static_fields + 0x10);
-    if (!ns_valid_ptr(pool) || *(uint8_t *)((char *)pool + 0x138) == 0) return;
+    int32_t judge_idx = resolve_judge_idx(controller, judge);
 
-    int32_t type_idx = *(int32_t *)((char *)pool + 0x128);
-    bool is_ems      = (*(uint8_t *)((char *)pool + 0x12c) != 0);
-
-    /* Hold midpoint tick effect */
+    /* Hold midpoint tick effect (1D array [type_idx]) */
     if (trig_type == NS_TRIG_LINHOLD_PASS || trig_type == NS_TRIG_CRVHOLD_PASS) {
-        int32_t arr_cnt = 0;
-        void **items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0x120 : 0xf0)), &arr_cnt);
-        if (items && type_idx >= 0 && type_idx < arr_cnt) {
-            apply_category_to_effect_player(select_next_ep(items[type_idx]), cat);
-        }
+        void *je = get_pool_je_slot(*(void **)((char *)pool + (is_ems ? 0x120 : 0xf0)), type_idx);
+        apply_category_to_effect_player(select_next_ep(je), cat);
     }
 
     /* Main judge hit burst: outer[0]=Touch, [1]=Slide/TwinSlide, [2]=Hold */
@@ -1499,57 +2173,42 @@ void runtime_note_skins_on_play_judge_effect(void *controller, void *trig_pd) {
     else if (trig_type == NS_TRIG_SLIDE || trig_type == NS_TRIG_TWINSLIDE) outer_idx = 1;
     else if (trig_type >= NS_TRIG_LINHOLD_START && trig_type <= NS_TRIG_CRVHOLD_END_S) outer_idx = 2;
 
-    if (outer_idx >= 0) {
-        bool timing_adj = (*(uint8_t *)((char *)controller + 0x45) != 0);
-        int32_t judge_idx = timing_adj ? ((judge == NS_JUDGE_MISS_PASS) ? 5 : 0) : ((int32_t)judge - 1);
-        if (judge_idx >= 0 && judge_idx <= 5) {
-            int32_t outer_cnt = 0;
-            void **outer_items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0xf8 : 0xc8)), &outer_cnt);
-            if (outer_items && outer_idx < outer_cnt && ns_valid_ptr(outer_items[outer_idx])) {
-                int32_t inner_cnt = 0;
-                void **inner_items = ns_managed_ptr_seq(outer_items[outer_idx], &inner_cnt);
-                int32_t slot = (inner_cnt / 2) * type_idx + judge_idx;
-                if (inner_items && slot >= 0 && slot < inner_cnt) {
-                    apply_category_to_effect_player(select_next_ep(inner_items[slot]), cat);
-                }
-            }
-        }
+    if (outer_idx >= 0 && judge_idx >= 0) {
+        void *outer_arr = get_pool_je_slot(*(void **)((char *)pool + (is_ems ? 0xf8 : 0xc8)), outer_idx);
+        void *je = get_pool_strided_slot(outer_arr, type_idx, judge_idx);
+        apply_category_to_effect_player(select_next_ep(je), cat);
     }
 
-    /* Critical hit & last trigger flare effects */
+    /* Last trigger flare effect (pool+0xe0 / +0x110, JudgeEffect[2, 2]) or Critical hit flare effect (pool+0xe8 / +0x118) */
     if (*(uint8_t *)((char *)trig_pd + 0x2d) != 0) {
-        int32_t arr_cnt = 0;
-        void **items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0x110 : 0xe0)), &arr_cnt);
-        if (items && type_idx >= 0 && type_idx < arr_cnt) {
-            apply_category_to_effect_player(select_next_ep(items[type_idx]), cat);
-        }
+        void *last_arr = *(void **)((char *)pool + (is_ems ? 0x110 : 0xe0));
+        int32_t sub = (*(uint8_t *)((char *)trig_pd + 0x2c) != 0) ? 0 : 1;
+        void *je = get_pool_strided_slot(last_arr, type_idx, sub);
+        if (!je) je = get_pool_je_slot(last_arr, type_idx);
+        apply_category_to_effect_player(select_next_ep(je), cat);
     } else if (*(uint8_t *)((char *)trig_pd + 0x2c) != 0) {
-        int32_t arr_cnt = 0;
-        void **items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0x118 : 0xe8)), &arr_cnt);
-        if (items && type_idx >= 0 && type_idx < arr_cnt) {
-            apply_category_to_effect_player(select_next_ep(items[type_idx]), cat);
-        }
+        void *je = get_pool_je_slot(*(void **)((char *)pool + (is_ems ? 0x118 : 0xe8)), type_idx);
+        apply_category_to_effect_player(select_next_ep(je), cat);
     }
 
     /* Slide direction line trail particles */
     if (trig_type == NS_TRIG_SLIDE || trig_type == NS_TRIG_TWINSLIDE) {
-        int32_t arr_cnt = 0;
-        void **items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0x100 : 0xd0)), &arr_cnt);
-        if (items && type_idx >= 0 && type_idx < arr_cnt) {
-            if (trig_type == NS_TRIG_TWINSLIDE) apply_category_to_two_eps(items[type_idx], cat);
-            else apply_category_to_effect_player(select_next_ep(items[type_idx]), cat);
-        }
+        void *slide_arr = *(void **)((char *)pool + (is_ems ? 0x100 : 0xd0));
+        void *je = (judge_idx >= 0) ? get_pool_strided_slot(slide_arr, type_idx, judge_idx) : NULL;
+        if (!je) je = get_pool_je_slot(slide_arr, type_idx);
+        if (trig_type == NS_TRIG_TWINSLIDE) apply_category_to_two_eps(je, cat);
+        else apply_category_to_effect_player(select_next_ep(je), cat);
     } else if (trig_type == NS_TRIG_LINHOLD_END_S || trig_type == NS_TRIG_CRVHOLD_END_S) {
-        int32_t arr_cnt = 0;
-        void **items = ns_managed_ptr_seq(*(void **)((char *)pool + (is_ems ? 0x108 : 0xd8)), &arr_cnt);
-        if (items && type_idx >= 0 && type_idx < arr_cnt) {
-            apply_category_to_effect_player(select_next_ep(items[type_idx]), cat);
-        }
+        void *hslide_arr = *(void **)((char *)pool + (is_ems ? 0x108 : 0xd8));
+        void *je = (judge_idx >= 0) ? get_pool_strided_slot(hslide_arr, type_idx, judge_idx) : NULL;
+        if (!je) je = get_pool_je_slot(hslide_arr, type_idx);
+        apply_category_to_effect_player(select_next_ep(je), cat);
     }
 }
 
 void runtime_note_skins_on_bms_holding(void *controller, void *trig_pd) {
-    if (!s_installed || !ns_valid_ptr(controller) || !ns_valid_ptr(trig_pd)) return;
+    if (!s_installed || !ns_should_apply() ||
+        !ns_mem_readable(controller, 0x20) || !ns_mem_readable(trig_pd, 0x50)) return;
     uint8_t type  = *(uint8_t *)((char *)trig_pd + 0x18);
     uint8_t judge = *(uint8_t *)((char *)trig_pd + 0x4c);
     if (((type & 0xfb) != 3) || judge == NS_JUDGE_MISS_PASS) return;
@@ -1560,22 +2219,44 @@ void runtime_note_skins_on_bms_holding(void *controller, void *trig_pd) {
     int32_t lane_idx = *(int32_t *)((char *)trig_pd + 0x1c);
     int32_t lane_cnt = 0;
     void **lanes = ns_managed_ptr_seq(*(void **)((char *)controller + 0x18), &lane_cnt);
-    if (!lanes || lane_idx < 0 || lane_idx >= lane_cnt || !ns_valid_ptr(lanes[lane_idx])) return;
+    if (!lanes || lane_idx < 0 || lane_idx >= lane_cnt || !ns_mem_readable(lanes[lane_idx], 0x88)) return;
 
     void *lane = lanes[lane_idx];
-    if (cat == THEATRHYTHM_NOTE_HOLD && runtime_unity_object_alive(s_slots[SLOT_HOLD_START].active_spr)) {
+    if (cat == THEATRHYTHM_NOTE_HOLD) {
+        void *active_spr = s_slots[SLOT_HOLD_START].active_spr;
         void *hold_sr = *(void **)((char *)lane + 0x48);
-        if (runtime_unity_object_alive(hold_sr)) {
-            typedef void * (ABI *SrGetSprFn)(void *s, void *m);
-            typedef void   (ABI *SrSetSprFn)(void *s, void *spr, void *m);
-            void *cur = ((SrGetSprFn)CODE(C_SR_GET_SPRITE))(hold_sr, NULL);
-            if (cur != s_slots[SLOT_HOLD_START].active_spr) {
-                ((SrSetSprFn)CODE(C_SR_SET_SPRITE))(hold_sr, s_slots[SLOT_HOLD_START].active_spr, NULL);
+        NSLaneHoldCache *lc = (lane_idx < NS_LANE_HOLD_CACHE_CAP) ? &s_ns_lane_hold_cache[lane_idx] : NULL;
+        if (!lc || lc->hold_sr != hold_sr || lc->last_trig_pd != trig_pd ||
+            lc->last_spr != active_spr || lc->last_skin_ver != s_stage_skin_ver) {
+            if (runtime_unity_object_alive(active_spr) && runtime_unity_object_alive(hold_sr)) {
+                typedef void * (ABI *SrGetSprFn)(void *s, void *m);
+                typedef void   (ABI *SrSetSprFn)(void *s, void *spr, void *m);
+                void *cur = ((SrGetSprFn)CODE(C_SR_GET_SPRITE))(hold_sr, NULL);
+                if (cur != active_spr) {
+                    ((SrSetSprFn)CODE(C_SR_SET_SPRITE))(hold_sr, active_spr, NULL);
+                }
+                if (lc) {
+                    lc->hold_sr = hold_sr;
+                    lc->last_trig_pd = trig_pd;
+                    lc->last_spr = active_spr;
+                    lc->last_skin_ver = s_stage_skin_ver;
+                }
             }
         }
     }
 
-    apply_category_to_loop_emitter(*(void **)((char *)lane + 0x80), cat);
+    apply_category_to_loop_emitter_hold(*(void **)((char *)lane + 0x80), cat, trig_pd);
+}
+
+void runtime_note_skins_on_triggers_created(void *mst) {
+    if (!s_installed || !ns_mem_readable(mst, 0x98)) return;
+    s_active_mst = mst;
+    resolve_loaded_effect_pool(NULL, NULL);
+    runtime_note_skins_sync_simple_colors();
+    if (!ns_should_apply()) return;
+    s_stage_skin_ver = theatrhythm_note_skin_version();
+    refresh_stage_visuals(mst);
+    prewarm_effect_pool_if_ready();
 }
 
 /* ========================================================================= */
@@ -1584,44 +2265,80 @@ void runtime_note_skins_on_bms_holding(void *controller, void *trig_pd) {
 
 static ABI int hook_create_triggers(HookRegs *r) {
     void *mst = (void *)r->rdi;
-    if (!ns_valid_ptr(mst)) return 0;
+    if (!ns_mem_readable(mst, 0x48)) return 0;
     s_active_mst = mst;
-    /* CreateTriggers loads TriggerSprite & spawns triggers asynchronously; force frame-1 UpdateTrigger to sync. */
+    reset_stage_instance_caches();
+    /* CreateTriggers loads TriggerSprite & spawns triggers asynchronously; force sync on completion. */
     s_stage_skin_ver = 0;
+    resolve_loaded_effect_pool(NULL, NULL);
+    runtime_note_skins_sync_simple_colors();
+    if (!ns_should_apply()) return 0;
     void *ts = *(void **)((char *)mst + 0x40);
-    if (runtime_unity_object_alive(ts)) {
+    if (ns_mem_readable(ts, 0x68)) {
         sync_trigger_sprite_object(ts);
     }
+    prewarm_effect_pool_if_ready();
     return 0;
 }
 
 static ABI int hook_update_trigger(HookRegs *r) {
     void *mst = (void *)r->rdi;
-    if (!ns_valid_ptr(mst)) return 0;
+    if (!ns_mem_readable(mst, 0x48)) return 0;
     s_active_mst = mst;
     tick_deferred_destroys();
+    if (!ns_should_apply()) {
+        if (s_stage_skin_ver != 0) {
+            s_stage_skin_ver = 0;
+            runtime_note_skins_sync_simple_colors();
+            void *ts = *(void **)((char *)mst + 0x40);
+            if (ns_mem_readable(ts, 0x68)) {
+                for (int i = 0; i < SLOT_SPRITE_COUNT; ++i) {
+                    if (runtime_unity_object_alive(s_slots[i].orig_spr)) {
+                        *(void **)((char *)ts + kSlotOffset[i]) = s_slots[i].orig_spr;
+                    }
+                }
+                if (runtime_unity_object_alive(s_hold_tex.orig_tex)) {
+                    *(void **)((char *)ts + HOLD_LINE_TEX_OFFSET) = s_hold_tex.orig_tex;
+                }
+            }
+            runtime_slidehold_on_skin_changed(mst);
+        }
+        return 0;
+    }
 
     uint32_t ver = theatrhythm_note_skin_version();
     if (ver != s_stage_skin_ver) {
+        if (s_stage_skin_ver != 0) {
+            reset_emitter_cache();
+        }
         s_stage_skin_ver = ver;
         refresh_stage_visuals(mst);
+        prewarm_effect_pool_if_ready();
+    } else if (!s_warmed_pool || s_active_tlc != s_warmed_tlc || ver != s_warmed_skin_ver ||
+               ver != s_warmed_tlc_skin_ver) {
+        prewarm_effect_pool_if_ready();
     }
     return 0;
 }
 
 static ABI int hook_tlc_setup(HookRegs *r) {
-    (void)r;
-    if (runtime_unity_object_alive(s_active_mst)) {
+    s_active_tlc = (void *)r->rdi;
+    s_warmed_tlc = NULL;
+    s_warmed_tlc_skin_ver = 0;
+    resolve_loaded_effect_pool(NULL, NULL);
+    if (!ns_should_apply()) return 0;
+    if (runtime_unity_object_alive(s_active_mst) && ns_mem_readable(s_active_mst, 0x48)) {
         void *ts = *(void **)((char *)s_active_mst + 0x40);
-        if (runtime_unity_object_alive(ts)) sync_trigger_sprite_object(ts);
+        if (ns_mem_readable(ts, 0x68)) sync_trigger_sprite_object(ts);
     }
     return 0;
 }
 
 static ABI int hook_bms_set_judge(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *lane    = (void *)r->rdi;
     void *trig_pd = (void *)r->rsi;
-    if (!ns_valid_ptr(lane) || !ns_valid_ptr(trig_pd)) return 0;
+    if (!ns_mem_readable(lane, 0x98) || !ns_mem_readable(trig_pd, 0x50)) return 0;
 
     uint8_t judge = *(uint8_t *)((char *)trig_pd + 0x4c);
     if (judge == NS_JUDGE_NONE || judge >= NS_JUDGE_MISS) return 0;
@@ -1629,21 +2346,22 @@ static ABI int hook_bms_set_judge(HookRegs *r) {
     int cat = ns_classify_trig_pd(trig_pd);
     if (cat < 0 || cat == THEATRHYTHM_NOTE_JOINT) return 0;
 
-    apply_category_to_idle_or_next_ep(*(void **)((char *)lane + 0x20), cat);
+    apply_category_to_effect_player(select_next_ep(*(void **)((char *)lane + 0x20)), cat);
     int32_t je_cnt = 0;
     void **jes = ns_managed_ptr_seq(*(void **)((char *)lane + 0x28), &je_cnt);
-    for (int32_t i = 0; i < je_cnt; ++i) apply_category_to_idle_or_next_ep(jes[i], cat);
+    for (int32_t i = 0; i < je_cnt; ++i) apply_category_to_effect_player(select_next_ep(jes[i]), cat);
     apply_category_to_loop_emitter(*(void **)((char *)lane + 0x90), cat);
     return 0;
 }
 
 static ABI int hook_fms_play_judge(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *lane       = (void *)r->rdi;
     void *trig_pd    = (void *)r->rsi;
     bool  force_crit = ((r->rcx & 0xff) != 0);
-    if (!ns_valid_ptr(lane) || !ns_valid_ptr(trig_pd)) return 0;
+    if (!ns_mem_readable(lane, 0x50) || !ns_mem_readable(trig_pd, 0x50)) return 0;
 
-    uint8_t judge = force_crit ? NS_JUDGE_CRITICAL : *(uint8_t *)((char *)trig_pd + 0x4c);
+    uint8_t judge = force_crit ? NS_JUDGE_RAINBOW : *(uint8_t *)((char *)trig_pd + 0x4c);
     if (judge == NS_JUDGE_NONE || judge >= NS_JUDGE_MISS) return 0;
 
     int cat = ns_classify_trig_pd(trig_pd);
@@ -1655,24 +2373,25 @@ static ABI int hook_fms_play_judge(HookRegs *r) {
         int32_t je_cnt = 0;
         void **jes = ns_managed_ptr_seq(*(void **)((char *)lane + 0x30), &je_cnt);
         if (jes && (int32_t)sub < je_cnt) {
-            apply_category_to_idle_or_next_ep(jes[sub], cat);
+            apply_category_to_effect_player(select_next_ep(jes[sub]), cat);
         }
         int32_t b_cnt = 0;
         void **bs = ns_managed_ptr_seq(*(void **)((char *)lane + 0x48), &b_cnt);
-        for (int32_t i = 0; i < b_cnt; ++i) apply_category_to_idle_or_next_ep(bs[i], cat);
+        for (int32_t i = 0; i < b_cnt; ++i) apply_category_to_effect_player(select_next_ep(bs[i]), cat);
     } else {
-        apply_category_to_idle_or_next_ep(*(void **)((char *)lane + 0x28), cat);
+        apply_category_to_effect_player(select_next_ep(*(void **)((char *)lane + 0x28)), cat);
         int32_t b_cnt = 0;
         void **bs = ns_managed_ptr_seq(*(void **)((char *)lane + 0x40), &b_cnt);
-        for (int32_t i = 0; i < b_cnt; ++i) apply_category_to_idle_or_next_ep(bs[i], cat);
+        for (int32_t i = 0; i < b_cnt; ++i) apply_category_to_effect_player(select_next_ep(bs[i]), cat);
     }
     return 0;
 }
 
 static ABI int hook_ems_set_judge(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *lane    = (void *)r->rdi;
     void *trig_pd = (void *)r->rsi;
-    if (!ns_valid_ptr(lane) || !ns_valid_ptr(trig_pd)) return 0;
+    if (!ns_mem_readable(lane, 0x30) || !ns_mem_readable(trig_pd, 0x50)) return 0;
 
     uint8_t judge = *(uint8_t *)((char *)trig_pd + 0x4c);
     if (judge == NS_JUDGE_NONE || judge >= NS_JUDGE_MISS) return 0;
@@ -1680,14 +2399,47 @@ static ABI int hook_ems_set_judge(HookRegs *r) {
     int cat = ns_classify_trig_pd(trig_pd);
     if (cat < 0 || cat == THEATRHYTHM_NOTE_JOINT) return 0;
 
-    apply_category_to_idle_or_next_ep(*(void **)((char *)lane + 0x20), cat);
+    apply_category_to_effect_player(select_next_ep(*(void **)((char *)lane + 0x20)), cat);
     return 0;
 }
 
+static void apply_fms_lane_holding(void *lane, int cat, void *trig_pd) {
+    if (!ns_mem_readable(lane, 0xa8)) return;
+
+    if (runtime_unity_object_alive(s_slots[SLOT_HOLD_START].active_spr)) {
+        int32_t sr_cnt = 0;
+        void **srs = ns_managed_ptr_seq(*(void **)((char *)lane + 0x98), &sr_cnt);
+        typedef void * (ABI *SrGetSprFn)(void *s, void *m);
+        typedef void   (ABI *SrSetSprFn)(void *s, void *spr, void *m);
+        for (int32_t i = 0; i < sr_cnt; ++i) {
+            if (runtime_unity_object_alive(srs[i])) {
+                void *cur = ((SrGetSprFn)CODE(C_SR_GET_SPRITE))(srs[i], NULL);
+                if (cur != s_slots[SLOT_HOLD_START].active_spr) {
+                    ((SrSetSprFn)CODE(C_SR_SET_SPRITE))(srs[i], s_slots[SLOT_HOLD_START].active_spr, NULL);
+                }
+            }
+        }
+    }
+
+    int32_t le_cnt = 0;
+    void **les = ns_managed_ptr_seq(*(void **)((char *)lane + 0xa0), &le_cnt);
+    for (int32_t i = 0; i < le_cnt; ++i) {
+        apply_category_to_loop_emitter_hold(les[i], cat, trig_pd);
+    }
+    if (ns_mem_readable(lane, 0xe0)) {
+        int32_t le_cnt2 = 0;
+        void **les2 = ns_managed_ptr_seq(*(void **)((char *)lane + 0xd8), &le_cnt2);
+        for (int32_t i = 0; i < le_cnt2; ++i) {
+            apply_category_to_loop_emitter_hold(les2[i], cat, trig_pd);
+        }
+    }
+}
+
 static ABI int hook_fms_update_holding(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *ctrl    = (void *)r->rdi;
     void *trig_pd = (void *)r->rsi;
-    if (!ns_valid_ptr(ctrl) || !ns_valid_ptr(trig_pd)) return 0;
+    if (!ns_mem_readable(ctrl, 0x20) || !ns_mem_readable(trig_pd, 0x50)) return 0;
 
     uint8_t judge = *(uint8_t *)((char *)trig_pd + 0x4c);
     if (judge == NS_JUDGE_MISS_PASS) return 0;
@@ -1695,42 +2447,31 @@ static ABI int hook_fms_update_holding(HookRegs *r) {
     int cat = ns_classify_trig_pd(trig_pd);
     if (cat < 0) cat = THEATRHYTHM_NOTE_HOLD;
 
-    int32_t lane_cnt = 0;
-    void **lanes = ns_managed_ptr_seq(*(void **)((char *)ctrl + 0x58), &lane_cnt);
-    if (!lanes || lane_cnt <= 0) return 0;
-
-    for (int32_t li = 0; li < lane_cnt; ++li) {
-        void *lane = lanes[li];
-        if (!ns_valid_ptr(lane)) continue;
-
-        if (runtime_unity_object_alive(s_slots[SLOT_HOLD_START].active_spr)) {
-            int32_t sr_cnt = 0;
-            void **srs = ns_managed_ptr_seq(*(void **)((char *)lane + 0x98), &sr_cnt);
-            typedef void * (ABI *SrGetSprFn)(void *s, void *m);
-            typedef void   (ABI *SrSetSprFn)(void *s, void *spr, void *m);
-            for (int32_t i = 0; i < sr_cnt; ++i) {
-                if (runtime_unity_object_alive(srs[i])) {
-                    void *cur = ((SrGetSprFn)CODE(C_SR_GET_SPRITE))(srs[i], NULL);
-                    if (cur != s_slots[SLOT_HOLD_START].active_spr) {
-                        ((SrSetSprFn)CODE(C_SR_SET_SPRITE))(srs[i], s_slots[SLOT_HOLD_START].active_spr, NULL);
-                    }
-                }
+    void *single_lane = *(void **)((char *)ctrl + 0x18);
+    if (ns_valid_ptr(single_lane)) {
+        apply_fms_lane_holding(single_lane, cat, trig_pd);
+    }
+    if (ns_mem_readable(ctrl, 0x60)) {
+        int32_t lane_cnt = 0;
+        void **lanes = ns_managed_ptr_seq(*(void **)((char *)ctrl + 0x58), &lane_cnt);
+        for (int32_t li = 0; li < lane_cnt; ++li) {
+            if (ns_valid_ptr(lanes[li]) && lanes[li] != single_lane) {
+                apply_fms_lane_holding(lanes[li], cat, trig_pd);
             }
-        }
-
-        int32_t le_cnt = 0;
-        void **les = ns_managed_ptr_seq(*(void **)((char *)lane + 0xa0), &le_cnt);
-        for (int32_t i = 0; i < le_cnt; ++i) {
-            apply_category_to_loop_emitter(les[i], cat);
         }
     }
     return 0;
 }
 
 static ABI int hook_ems_set_holding(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *lane    = (void *)r->rdi;
     bool  holding = ((r->rsi & 0xff) != 0);
-    if (!ns_valid_ptr(lane) || !holding) return 0;
+    if (!ns_mem_readable(lane, 0x80)) return 0;
+    if (!holding) {
+        clear_emitter_hold_tag(*(void **)((char *)lane + 0x78));
+        return 0;
+    }
 
     if (runtime_unity_object_alive(s_slots[SLOT_HOLD_START].active_spr)) {
         void *hold_sr = *(void **)((char *)lane + 0x48);
@@ -1743,23 +2484,27 @@ static ABI int hook_ems_set_holding(HookRegs *r) {
             }
         }
     }
-    apply_category_to_loop_emitter(*(void **)((char *)lane + 0x78), THEATRHYTHM_NOTE_HOLD);
+    apply_category_to_loop_emitter_hold(*(void **)((char *)lane + 0x78), THEATRHYTHM_NOTE_HOLD, lane);
     return 0;
 }
 
 static ABI int hook_tobj_set_crit(HookRegs *r) {
+    if (!ns_should_apply()) return 0;
     void *tobj = (void *)r->rdi;
-    void *ep   = (void *)r->rsi;
-    if (!ns_valid_ptr(tobj) || !ns_valid_ptr(ep)) return 0;
+    void *go   = (void *)r->rsi;
+    if (!ns_mem_readable(tobj, TOBJ_TRIG_TYPE_OFF + 1u) || !runtime_unity_object_alive(go)) return 0;
 
+    uint8_t trig_type = *(uint8_t *)((char *)tobj + TOBJ_TRIG_TYPE_OFF);
     int cat = runtime_slidehold_is_registered_trigger_obj(tobj)
             ? THEATRHYTHM_NOTE_SLIDEHOLD
-            : ns_trigger_type_to_category(*(uint8_t *)((char *)tobj + 0xd0));
+            : ns_trigger_type_to_category(trig_type);
     if (cat < 0 || cat == THEATRHYTHM_NOTE_JOINT) return 0;
 
-    void *xform = *(void **)((char *)ep + 0x10);
-    void *ps_all = *(void **)((char *)ep + 0x38);
-    apply_category_to_emitter(ep, xform, ps_all, cat);
+    typedef void * (ABI *GetXformFn)(void *obj, void *m);
+    void *xform = ((GetXformFn)CODE(C_GO_GET_TRANSFORM))(go, NULL);
+    if (runtime_unity_object_alive(xform)) {
+        apply_category_to_emitter(go, xform, NULL, cat, false);
+    }
     return 0;
 }
 
@@ -1853,6 +2598,9 @@ int runtime_note_skins_install(unsigned char *image, uint64_t module_base, unsig
         printf("NoteSkins: site discovery failed for game %s; custom note colors disabled\n", runtime_game_version());
         return -1;
     }
+    const char *ver = runtime_game_version();
+    s_is_game_104 = (s_code[H_CREATE_TRIGGERS].offset == 0x27198b0ULL) ||
+                    (ver && strstr(ver, "01.04") != NULL);
 
     size_t need = 0;
     size_t num_hooks = sizeof(kHooks) / sizeof(*kHooks);
@@ -1882,7 +2630,7 @@ int runtime_note_skins_install(unsigned char *image, uint64_t module_base, unsig
     }
 
     s_installed = true;
-    printf("NoteSkins: installed %zu hooks (%zu bytes stub) for game %s\n",
-           num_hooks, (size_t)(p - stubs), runtime_game_version());
+    printf("NoteSkins: installed %zu hooks (%zu bytes stub, v1.04=%d) for game %s\n",
+           num_hooks, (size_t)(p - stubs), s_is_game_104, runtime_game_version());
     return 0;
 }

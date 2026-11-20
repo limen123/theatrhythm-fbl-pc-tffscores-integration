@@ -108,14 +108,16 @@ static std::unordered_map<PathType, fs::path>& UserPaths() {
         // theatrhythm: never shadPS4's %APPDATA% folder (an installed shadPS4 owns it); this runs
         // on first use, so the portable folder is created here (run.py and src/launch.c set
         // THEATRHYTHM_GPU_USER_DIR).
-        std::filesystem::create_directories(user_dir);
+        std::error_code ec;
+        std::filesystem::create_directories(user_dir, ec);
 #endif
     }
 
     std::unordered_map<PathType, fs::path> paths;
 
     const auto create_path = [&](PathType shad_path, const fs::path& new_path) {
-        std::filesystem::create_directory(new_path);
+        std::error_code ec;
+        std::filesystem::create_directories(new_path, ec);
         paths.insert_or_assign(shad_path, new_path);
     };
 

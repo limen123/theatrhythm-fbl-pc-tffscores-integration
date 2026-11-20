@@ -218,9 +218,9 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void AccurateWaitUntil(const std::chrono::steady_clock::time_point deadline) {
     using namespace std::chrono;
 #ifdef _WIN32
-    // Windows waitable timers overshoot by ~0.4-1.0 ms depending on system timer resolution;
-    // sleep short by an adaptive overshoot margin and pause-spin the final sub-millisecond tail.
-    thread_local nanoseconds sleep_margin = microseconds(1150);
+    // High-resolution Windows waitable timers typically wake within ~0.1-0.4 ms; keep an adaptive
+    // overshoot margin that stays compact instead of busy-spinning for >1 ms per wait.
+    thread_local nanoseconds sleep_margin = microseconds(400);
     while (true) {
         const auto now = steady_clock::now();
         if (now >= deadline) {
@@ -228,14 +228,14 @@ void AccurateWaitUntil(const std::chrono::steady_clock::time_point deadline) {
         }
         const auto remaining = deadline - now;
         const auto sleep_target = remaining - sleep_margin;
-        if (sleep_target >= microseconds(250)) {
+        if (sleep_target >= microseconds(150)) {
             AccurateSleep(sleep_target, nullptr, false);
             const auto after = steady_clock::now();
             const auto overshoot = duration_cast<nanoseconds>(after - now) - sleep_target;
             if (overshoot > nanoseconds(0)) {
                 const auto safe_margin =
-                    std::clamp<nanoseconds>(overshoot + microseconds(150),
-                                            microseconds(600), microseconds(2000));
+                    std::clamp<nanoseconds>(overshoot + microseconds(100),
+                                            microseconds(150), microseconds(1000));
                 if (safe_margin > sleep_margin) {
                     sleep_margin = safe_margin;
                 } else {

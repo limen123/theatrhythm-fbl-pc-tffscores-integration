@@ -1415,6 +1415,14 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                   : std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it != program->modules.end()) {
         program->last_used = std::distance(program->modules.begin(), it);
+    } else if (DiskShadersActive() && disk_permutations.contains(params.hash) &&
+               LoadDiskProgram(params.hash)) {
+        it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+        if (it != program->modules.end()) {
+            program->last_used = std::distance(program->modules.begin(), it);
+        }
+        perm_idx = NewPermutationIndex(*program);
+        perm_hash = HashCombine(params.hash, perm_idx);
     }
     // theatrhythm: a new permutation compiles alongside the program's other pending ones; its draws
     // are skipped for at most async_shaders_skip_frames GPU frames, then it is waited for or built

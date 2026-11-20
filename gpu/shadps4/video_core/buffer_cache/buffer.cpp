@@ -117,7 +117,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-        const VmaAllocationCreateInfo alloc_ci = {
+        VmaAllocationCreateInfo alloc_ci = {
             .flags =
                 VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
             .usage = MemoryUsageVma(mem_type),
@@ -131,6 +131,20 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+            alloc_ci.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                              VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
+            alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            alloc_ci.preferredFlags = 0;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};

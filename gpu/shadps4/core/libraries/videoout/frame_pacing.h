@@ -48,7 +48,7 @@ inline PacingDecision ComputePacingDecision(int setting_fps, bool vsync, double 
     }
 
     // Follow display (0): when VSync is on, hardware eFifo already paces at the panel's true
-    // refresh rate; do not fight eFifo with a rounded software timer. When VSync is off,
+    // refresh rate; never add a competing software timer at the same rate. When VSync is off,
     // pace in software to the exact display rate.
     if (setting_fps == 0) {
         if (vsync) {
@@ -56,7 +56,7 @@ inline PacingDecision ComputePacingDecision(int setting_fps, bool vsync, double 
                 return {
                     .immediate_flips = true,
                     .follow_display = false,
-                    .frame_period = NanosecondsFromHz(display_hz),
+                    .frame_period = std::chrono::nanoseconds(0),
                 };
             }
             return {
@@ -74,8 +74,8 @@ inline PacingDecision ComputePacingDecision(int setting_fps, bool vsync, double 
     }
 
     // Explicit numeric cap (30, 60, 100, 120, 144, 180, 240, ...):
-    // When VSync is on and the target meets or exceeds the known display rate, let eFifo
-    // pace natively (or lock 1:1 to DXGI vblank on 60 Hz panels) instead of phase-beating.
+    // When VSync is on and the target meets or exceeds the known display rate, let hardware
+    // eFifo pace natively (or lock 1:1 to DXGI vblank on 60 Hz panels) instead of phase-beating.
     // When the target matches the guest vblank rate (e.g. 60 FPS at 60 Hz vblank), use the
     // fixed 1-flip-per-vblank path rather than colliding with tick_deadline inside run_immediate.
     const double requested_hz = static_cast<double>(setting_fps);
@@ -90,7 +90,7 @@ inline PacingDecision ComputePacingDecision(int setting_fps, bool vsync, double 
         return {
             .immediate_flips = true,
             .follow_display = false,
-            .frame_period = NanosecondsFromHz(display_hz),
+            .frame_period = std::chrono::nanoseconds(0),
         };
     }
     if (std::abs(requested_hz - vblank_hz) < 0.5) {

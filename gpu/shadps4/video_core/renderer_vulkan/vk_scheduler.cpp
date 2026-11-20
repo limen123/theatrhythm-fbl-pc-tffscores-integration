@@ -248,9 +248,6 @@ void Scheduler::WaitDeferredSignals() {
                                               : std::chrono::steady_clock::time_point{};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
-        if (recording_threaded) {
-            WaitRecordingIdle();
-        }
         // Helps and waits (without spinning) on the copy threads the signals wait for.
         TheatrhythmCopy::WaitAsync();
         if (deferred_signals_done->load(std::memory_order_acquire) >= issued) {
@@ -287,10 +284,6 @@ void Scheduler::WaitHostCopies() {
             while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued &&
                    std::chrono::steady_clock::now() < spin_until) {
                 __builtin_ia32_pause();
-            }
-            if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued &&
-                recording_threaded) {
-                WaitRecordingIdle();
             }
             while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
                 std::this_thread::yield();

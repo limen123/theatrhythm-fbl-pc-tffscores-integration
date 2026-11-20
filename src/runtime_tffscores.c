@@ -45,17 +45,26 @@ static volatile int s_stage_is_score_pb = 0;
 static volatile int s_stage_is_damage_pb = 0;
 static volatile int s_awaiting_result_screenshot = 0;
 static volatile int s_stage_active = 0;
-static volatile int s_stage_is_custom = 0;
+static volatile int s_stage_is_local_custom = 0;
 static volatile uint64_t s_custom_suppress_until_ms = 0;
 static char s_stage_save_host[700] = "";
+static uint64_t s_last_song_finish_ms = 0;
+static volatile int s_cloud_download_checked = 0;
 
 
 static pthread_mutex_t s_tff_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static int is_local_custom_id(uint32_t music_id) {
+    return runtime_custom_charts_is_custom_id(music_id) &&
+           !runtime_custom_charts_is_verified_id(music_id);
+}
+
 void runtime_tffscores_notify_stage_start(uint32_t music_id, int difficulty) {
     if (music_id == 0) return;
-    int is_custom = runtime_custom_charts_is_custom_id(music_id) ? 1 : 0;
+    int is_verified_custom = runtime_custom_charts_is_verified_id(music_id) ? 1 : 0;
+    int is_local_custom = is_local_custom_id(music_id) ? 1 : 0;
     pthread_mutex_lock(&s_tff_lock);
+    s_last_song_finish_ms = 0;
     if (s_stage_music_id == music_id && s_stage_difficulty >= 4 && difficulty < 4) {
         /* Preserve extra difficulty slot 4/5 if PlaySetting+0x50 was clamped */
     } else {
@@ -65,29 +74,62 @@ void runtime_tffscores_notify_stage_start(uint32_t music_id, int difficulty) {
     s_stage_is_score_pb = 0;
     s_stage_is_damage_pb = 0;
     s_stage_active = 1;
-    s_stage_is_custom = is_custom;
-    if (!is_custom) s_custom_suppress_until_ms = 0;
+    s_stage_is_local_custom = is_local_custom;
+    if (!is_local_custom) s_custom_suppress_until_ms = 0;
     s_stage_save_host[0] = '\0';
     s_awaiting_result_screenshot = 0;
     theatrhythm_gpu_clear_last_screenshot();
     pthread_mutex_unlock(&s_tff_lock);
-    if (is_custom) {
-        printf("TFFScores: Custom chart stage started (placeholder ID %u, diff=%d) -> TFFScores upload disabled\n",
+    if (is_local_custom) {
+        printf("TFFScores: Local custom chart stage started (placeholder ID %u, diff=%d) -> TFFScores upload disabled\n",
+               music_id, s_stage_difficulty);
+    } else if (is_verified_custom) {
+        printf("TFFScores: Verified custom chart stage started: music_id=%u, diff=%d\n",
                music_id, s_stage_difficulty);
     } else {
         printf("TFFScores: Stage started: music_id=%u, difficulty=%d\n", music_id, s_stage_difficulty);
     }
 }
 
+/* Save commit sync queue */
+static char s_pending_save_host[700] = "";
+static int s_pending_sync_req = 0;
+static pthread_cond_t s_sync_cond = PTHREAD_COND_INITIALIZER;
+
+static void *delayed_screenshot_thread(void *arg);
+
+static void trigger_late_pb_screenshot_locked(void) {
+    if (!s_stage_active && s_stage_music_id != 0 && !s_stage_is_local_custom &&
+        !is_local_custom_id(s_stage_music_id) && !s_awaiting_result_screenshot) {
+        s_awaiting_result_screenshot = 1;
+        printf("TFFScores: late PB notification after result finish -> starting screenshot capture\n");
+        pthread_t th;
+        if (pthread_create(&th, NULL, delayed_screenshot_thread, NULL) == 0) {
+            pthread_detach(th);
+        }
+        if (!s_pending_save_host[0]) {
+            if (s_stage_save_host[0]) {
+                snprintf(s_pending_save_host, sizeof(s_pending_save_host), "%s", s_stage_save_host);
+            } else if (runtime_savedata_get_active_save_dir(s_pending_save_host, sizeof(s_pending_save_host)) != 0 ||
+                       !s_pending_save_host[0]) {
+                snprintf(s_pending_save_host, sizeof(s_pending_save_host), "%s", s_user_dir);
+            }
+        }
+        s_pending_sync_req = 1;
+        pthread_cond_signal(&s_sync_cond);
+    }
+}
+
 void runtime_tffscores_notify_score_pb(int is_pb) {
     pthread_mutex_lock(&s_tff_lock);
-    if (s_stage_is_custom) {
+    if (s_stage_is_local_custom) {
         s_stage_is_score_pb = 0;
         pthread_mutex_unlock(&s_tff_lock);
         return;
     }
     if (is_pb) {
         s_stage_is_score_pb = 1;
+        trigger_late_pb_screenshot_locked();
     }
     int cur_pb = s_stage_is_score_pb;
     pthread_mutex_unlock(&s_tff_lock);
@@ -96,13 +138,14 @@ void runtime_tffscores_notify_score_pb(int is_pb) {
 
 void runtime_tffscores_notify_damage_pb(int is_pb) {
     pthread_mutex_lock(&s_tff_lock);
-    if (s_stage_is_custom) {
+    if (s_stage_is_local_custom) {
         s_stage_is_damage_pb = 0;
         pthread_mutex_unlock(&s_tff_lock);
         return;
     }
     if (is_pb) {
         s_stage_is_damage_pb = 1;
+        trigger_late_pb_screenshot_locked();
     }
     int cur_pb = s_stage_is_damage_pb;
     pthread_mutex_unlock(&s_tff_lock);
@@ -110,11 +153,6 @@ void runtime_tffscores_notify_damage_pb(int is_pb) {
 }
 static pthread_t s_worker_thread;
 static int s_worker_running = 0;
-
-/* Save commit sync queue */
-static char s_pending_save_host[700] = "";
-static int s_pending_sync_req = 0;
-static pthread_cond_t s_sync_cond = PTHREAD_COND_INITIALIZER;
 
 /* Local loopback auth server */
 static pthread_t s_auth_thread;
@@ -150,10 +188,30 @@ static int json_get_int(const char *json, const char *key, int default_val) {
     return atoi(p);
 }
 
+static bool get_localappdata_fbl_dir(char *out, size_t cap, bool create_dir) {
+    if (!out || cap == 0) return false;
+    out[0] = '\0';
+    const char *local_app = getenv("LOCALAPPDATA");
+    if (!local_app || !*local_app) local_app = getenv("APPDATA");
+    if (!local_app || !*local_app) return false;
+    snprintf(out, cap, "%s\\TheatrhythmFBL", local_app);
+    if (create_dir) {
+        CreateDirectoryA(out, NULL);
+    }
+    return true;
+}
+
 static void save_session(void) {
     char path[600];
     snprintf(path, sizeof(path), "%s/tffscores.json", s_user_dir);
     FILE *f = fopen(path, "w");
+    if (!f) {
+        char app_dir[512];
+        if (get_localappdata_fbl_dir(app_dir, sizeof(app_dir), true)) {
+            snprintf(path, sizeof(path), "%s\\tffscores.json", app_dir);
+            f = fopen(path, "w");
+        }
+    }
     if (!f) return;
     fprintf(f, "{\n  \"server_url\": \"%s\",\n  \"token\": \"%s\",\n  \"username\": \"%s\",\n  \"user_id\": %d\n}\n",
             s_server_url, s_auth_token, s_username, s_user_id);
@@ -164,6 +222,13 @@ static void load_session(void) {
     char path[600];
     snprintf(path, sizeof(path), "%s/tffscores.json", s_user_dir);
     FILE *f = fopen(path, "r");
+    if (!f) {
+        char app_dir[512];
+        if (get_localappdata_fbl_dir(app_dir, sizeof(app_dir), false)) {
+            snprintf(path, sizeof(path), "%s\\tffscores.json", app_dir);
+            f = fopen(path, "r");
+        }
+    }
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -231,16 +296,22 @@ static int http_post_multipart(const char *url_path, const char *post_data, size
         return -1;
     }
 
+    WinHttpSetTimeouts(hRequest, 10000, 15000, 60000, 60000);
+
     /* Add headers */
-    char hdr_buf[512];
+    char hdr_buf[1024];
     snprintf(hdr_buf, sizeof(hdr_buf),
              "Content-Type: multipart/form-data; boundary=%s\r\nAuthorization: Bearer %s\r\n",
              BOUNDARY_STRING, s_auth_token);
-    wchar_t whdrs[512];
-    MultiByteToWideChar(CP_UTF8, 0, hdr_buf, -1, whdrs, 512);
+    wchar_t whdrs[1024];
+    MultiByteToWideChar(CP_UTF8, 0, hdr_buf, -1, whdrs, 1024);
 
     BOOL res = WinHttpSendRequest(hRequest, whdrs, -1L, (LPVOID)post_data, (DWORD)post_len, (DWORD)post_len, 0);
     if (res) res = WinHttpReceiveResponse(hRequest, NULL);
+    if (!res) {
+        DWORD err = GetLastError();
+        printf("TFFScores: WinHTTP POST %s failed (err=%lu)\n", url_path, (unsigned long)err);
+    }
 
     int status_code = 0;
     if (res) {
@@ -250,9 +321,14 @@ static int http_post_multipart(const char *url_path, const char *post_data, size
         status_code = (int)dwStatusCode;
 
         if (resp_out && resp_cap > 1) {
+            DWORD total_read = 0;
             DWORD bytes_read = 0;
-            WinHttpReadData(hRequest, resp_out, (DWORD)(resp_cap - 1), &bytes_read);
-            resp_out[bytes_read] = 0;
+            while (total_read + 1 < resp_cap &&
+                   WinHttpReadData(hRequest, resp_out + total_read, (DWORD)(resp_cap - 1 - total_read), &bytes_read) &&
+                   bytes_read > 0) {
+                total_read += bytes_read;
+            }
+            resp_out[total_read] = 0;
         }
     }
 
@@ -300,6 +376,8 @@ static int http_get_json(const char *url_path, char *resp_out, size_t resp_cap) 
         return -1;
     }
 
+    WinHttpSetTimeouts(hRequest, 10000, 15000, 60000, 60000);
+
     char hdr_buf[512];
     snprintf(hdr_buf, sizeof(hdr_buf), "Authorization: Bearer %s\r\n", s_auth_token);
     wchar_t whdrs[512];
@@ -307,6 +385,10 @@ static int http_get_json(const char *url_path, char *resp_out, size_t resp_cap) 
 
     BOOL res = WinHttpSendRequest(hRequest, whdrs, -1L, NULL, 0, 0, 0);
     if (res) res = WinHttpReceiveResponse(hRequest, NULL);
+    if (!res) {
+        DWORD err = GetLastError();
+        printf("TFFScores: WinHTTP GET %s failed (err=%lu)\n", url_path, (unsigned long)err);
+    }
 
     int status_code = 0;
     if (res) {
@@ -381,6 +463,21 @@ static void write_file_bytes(const char *path, const unsigned char *bytes, size_
     fclose(f);
 }
 
+static void ensure_dir_tree(const char *path) {
+    if (!path || !*path) return;
+    char buf[760];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf; *p; ++p) { if (*p == '\\') *p = '/'; }
+    for (char *p = buf + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(buf, 0755);
+}
+
 static void extract_json_field_alloc(const char *json, const char *key, char **out_val, size_t *out_len) {
     *out_val = NULL;
     *out_len = 0;
@@ -389,7 +486,7 @@ static void extract_json_field_alloc(const char *json, const char *key, char **o
     const char *p = strstr(json, needle);
     if (!p) return;
     p += strlen(needle);
-    while (*p == ' ' || *p == '\t') p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
     if (*p == '\"') {
         p++;
         const char *end = strchr(p, '\"');
@@ -415,6 +512,10 @@ int runtime_tffscores_maybe_download_save(const char *save_host, const char *tit
         /* Local save already exists, keep local save */
         return 0;
     }
+    if (s_cloud_download_checked) {
+        return 0;
+    }
+    s_cloud_download_checked = 1;
 
     char url[512];
     snprintf(url, sizeof(url), "/api/game/cloud-save/download?title_id=%s", title_id && *title_id ? title_id : "CUSA32853");
@@ -423,18 +524,28 @@ int runtime_tffscores_maybe_download_save(const char *save_host, const char *tit
     if (!resp) return -1;
     int err = http_get_json(url, resp, resp_cap);
     if (err != 0) {
+        if (err != 404) {
+            printf("TFFScores: cloud save download check returned %d (%s)\n", err, resp);
+        }
         free(resp);
         return -1;
     }
 
     char *b_b64 = NULL, *m_b64 = NULL, *p_b64 = NULL, *j_b64 = NULL;
-    size_t b_len = 0, m_len = 0, p_len = 0, j_len = 0;
+    char *cr_b64 = NULL, *cj_b64 = NULL;
+    size_t b_len = 0, m_len = 0, p_len = 0, j_len = 0, cr_len = 0, cj_len = 0;
     extract_json_field_alloc(resp, "backup_b64", &b_b64, &b_len);
     extract_json_field_alloc(resp, "music_backup_b64", &m_b64, &m_len);
     extract_json_field_alloc(resp, "profica_backup_b64", &p_b64, &p_len);
     extract_json_field_alloc(resp, "judgements_backup_b64", &j_b64, &j_len);
+    extract_json_field_alloc(resp, "custom_records_b64", &cr_b64, &cr_len);
+    extract_json_field_alloc(resp, "custom_judgements_b64", &cj_b64, &cj_len);
 
     int restored = 0;
+    if ((b_b64 && b_len > 0) || (m_b64 && m_len > 0) || (p_b64 && p_len > 0) ||
+        (j_b64 && j_len > 0) || (cr_b64 && cr_len > 0) || (cj_b64 && cj_len > 0)) {
+        ensure_dir_tree(save_host);
+    }
     if (b_b64 && b_len > 0) {
         size_t dec_len = 0;
         unsigned char *dec = b64_decode(b_b64, b_len, &dec_len);
@@ -472,6 +583,8 @@ int runtime_tffscores_maybe_download_save(const char *save_host, const char *tit
             char p[750];
             snprintf(p, sizeof(p), "%s/judgementsBackup.inf", save_host);
             write_file_bytes(p, dec, dec_len);
+            const char *primary_j = runtime_judgements_get_save_path();
+            if (primary_j && *primary_j) write_file_bytes(primary_j, dec, dec_len);
             snprintf(p, sizeof(p), "%s/judgementsBackup.inf", s_user_dir);
             write_file_bytes(p, dec, dec_len);
             snprintf(p, sizeof(p), "%s/judgements.dat", save_host);
@@ -482,11 +595,39 @@ int runtime_tffscores_maybe_download_save(const char *save_host, const char *tit
             restored = 1;
         }
     }
+    if (cr_b64 && cr_len > 0) {
+        size_t dec_len = 0;
+        unsigned char *dec = b64_decode(cr_b64, cr_len, &dec_len);
+        if (dec) {
+            char p[750];
+            snprintf(p, sizeof(p), "%s/customRecords.dat", save_host);
+            write_file_bytes(p, dec, dec_len);
+            snprintf(p, sizeof(p), "%s/customRecords.dat", s_user_dir);
+            write_file_bytes(p, dec, dec_len);
+            free(dec);
+            restored = 1;
+        }
+    }
+    if (cj_b64 && cj_len > 0) {
+        size_t dec_len = 0;
+        unsigned char *dec = b64_decode(cj_b64, cj_len, &dec_len);
+        if (dec) {
+            char p[750];
+            snprintf(p, sizeof(p), "%s/customJudgements.dat", save_host);
+            write_file_bytes(p, dec, dec_len);
+            snprintf(p, sizeof(p), "%s/customJudgements.dat", s_user_dir);
+            write_file_bytes(p, dec, dec_len);
+            free(dec);
+            restored = 1;
+        }
+    }
 
     if (b_b64) free(b_b64);
     if (m_b64) free(m_b64);
     if (p_b64) free(p_b64);
     if (j_b64) free(j_b64);
+    if (cr_b64) free(cr_b64);
+    if (cj_b64) free(cj_b64);
     free(resp);
 
     if (restored) {
@@ -656,6 +797,7 @@ static void *auth_loopback_thread(void *arg) {
 
             if (s_auth_token[0]) {
                 s_logged_in = 1;
+                s_cloud_download_checked = 0;
                 save_session();
                 printf("TFFScores: successfully authenticated as user '%s' (ID %d)\n", s_username, s_user_id);
                 char notice[128];
@@ -701,6 +843,38 @@ void runtime_tffscores_trigger_auth_hotkey(void) {
 }
 
 /* Sync worker thread */
+static unsigned char *read_save_file_with_fallbacks(const char *dir1, const char *filename, const char *alt_path, const char *dir2, size_t *out_sz) {
+    char path[750];
+    unsigned char *data = NULL;
+    if (dir1 && dir1[0]) {
+        snprintf(path, sizeof(path), "%s/%s", dir1, filename);
+        data = read_entire_file(path, out_sz);
+        if (data) return data;
+    }
+    if (alt_path && alt_path[0]) {
+        data = read_entire_file(alt_path, out_sz);
+        if (data) return data;
+    }
+    if (dir2 && dir2[0]) {
+        snprintf(path, sizeof(path), "%s/%s", dir2, filename);
+        data = read_entire_file(path, out_sz);
+        if (data) return data;
+    }
+    char active_dir[512];
+    if (runtime_savedata_get_active_save_dir(active_dir, sizeof(active_dir)) == 0 && active_dir[0]) {
+        snprintf(path, sizeof(path), "%s/%s", active_dir, filename);
+        data = read_entire_file(path, out_sz);
+        if (data) return data;
+    }
+    char app_dir[512];
+    if (get_localappdata_fbl_dir(app_dir, sizeof(app_dir), false)) {
+        snprintf(path, sizeof(path), "%s\\%s", app_dir, filename);
+        data = read_entire_file(path, out_sz);
+        if (data) return data;
+    }
+    return NULL;
+}
+
 static void *sync_worker_loop(void *arg) {
     (void)arg;
     while (s_worker_running) {
@@ -711,7 +885,7 @@ static void *sync_worker_loop(void *arg) {
         int damage_pb = 0;
         uint32_t stage_music_id = 0;
         int stage_difficulty = -1;
-        int stage_is_custom = 0;
+        int stage_is_local_custom = 0;
 
         pthread_mutex_lock(&s_tff_lock);
         while (s_worker_running && !s_pending_sync_req) {
@@ -731,7 +905,7 @@ static void *sync_worker_loop(void *arg) {
             is_pb = (score_pb || damage_pb);
             stage_music_id = s_stage_music_id;
             stage_difficulty = s_stage_difficulty;
-            stage_is_custom = s_stage_is_custom;
+            stage_is_local_custom = s_stage_is_local_custom;
             s_song_result_pending = 0;
         }
         pthread_mutex_unlock(&s_tff_lock);
@@ -751,7 +925,7 @@ static void *sync_worker_loop(void *arg) {
                 if (s_stage_music_id != 0) {
                     stage_music_id = s_stage_music_id;
                     stage_difficulty = s_stage_difficulty;
-                    stage_is_custom = s_stage_is_custom;
+                    stage_is_local_custom = s_stage_is_local_custom;
                 }
             }
             pthread_mutex_unlock(&s_tff_lock);
@@ -761,7 +935,7 @@ static void *sync_worker_loop(void *arg) {
         if (!title_id || !*title_id) title_id = "CUSA32853";
 
         /* If this stage was a Personal Best, wait for screenshot before uploading */
-        if (is_pb && stage_music_id != 0 && !stage_is_custom && !runtime_custom_charts_is_custom_id(stage_music_id) && host[0]) {
+        if (is_pb && stage_music_id != 0 && !stage_is_local_custom && !is_local_custom_id(stage_music_id) && host[0]) {
             char screenshot_path[512] = "";
             uint64_t ss_time = 0;
             int has_ss = 0;
@@ -799,41 +973,56 @@ static void *sync_worker_loop(void *arg) {
             }
             pthread_mutex_unlock(&s_tff_lock);
 
-            /* Submit score + screenshot proof */
-            char music_path[750];
-            snprintf(music_path, sizeof(music_path), "%s/musicBackup.inf", host);
-            size_t m_sz = 0;
-            unsigned char *m_bytes = read_entire_file(music_path, &m_sz);
-            if (!m_bytes) {
-                char alt_m[750];
-                snprintf(alt_m, sizeof(alt_m), "%s/musicBackup.inf", s_user_dir);
-                m_bytes = read_entire_file(alt_m, &m_sz);
+            /* Wait briefly if savedata unmount or customRecords write is still flushing to disk */
+            for (int w = 0; w < 10 && (runtime_savedata_busy() || runtime_custom_charts_records_busy()); ++w) {
+                Sleep(50);
             }
 
-            if (m_bytes && m_sz > 0) {
+            /* Submit score + screenshot proof */
+            size_t m_sz = 0, c_sz = 0;
+            unsigned char *m_bytes = read_save_file_with_fallbacks(host, "musicBackup.inf", NULL, s_user_dir, &m_sz);
+            unsigned char *c_bytes = read_save_file_with_fallbacks(host, "customRecords.dat", NULL, s_user_dir, &c_sz);
+
+            if ((m_bytes && m_sz > 0) || (c_bytes && c_sz > 0)) {
                 MultipartBuf mp;
                 mp_init(&mp);
                 mp_add_field(&mp, "title_id", title_id);
 
+                uint32_t submit_id = stage_music_id;
+                if (runtime_custom_charts_is_verified_id(stage_music_id)) {
+                    submit_id = (stage_music_id >= 160000000u) ? (stage_music_id - 160000000u) : stage_music_id;
+                } else if (stage_music_id >= 160000000u && stage_music_id < 160090000u) {
+                    /* Vanilla songs use 3-digit mcode (1..999) on TFFScores; sending full 160000xxx
+                     * caused the server to treat vanilla songs as >=90000 custom songs and drop proofs! */
+                    submit_id = stage_music_id % 1000u;
+                }
+
                 char str_song[32], str_diff[16];
-                if (stage_music_id > 0) {
-                    snprintf(str_song, sizeof(str_song), "%u", stage_music_id);
+                if (submit_id > 0) {
+                    snprintf(str_song, sizeof(str_song), "%u", submit_id);
                     mp_add_field(&mp, "song_id", str_song);
                 }
                 if (stage_difficulty >= 0) {
                     snprintf(str_diff, sizeof(str_diff), "%d", stage_difficulty);
                     mp_add_field(&mp, "difficulty_index", str_diff);
+                    mp_add_field(&mp, "slot", str_diff);
                 }
+                mp_add_field(&mp, "style_key", runtime_custom_charts_get_play_style());
 
                 const char *ptype = "score";
                 if (score_pb && damage_pb) ptype = "both";
                 else if (score_pb) ptype = "score";
                 else if (damage_pb) ptype = "damage";
                 mp_add_field(&mp, "proof_type", ptype);
-                printf("TFFScores: Uploading PB proof with proof_type=%s (song_id=%u, diff=%d)\n",
-                       ptype, stage_music_id, stage_difficulty);
+                printf("TFFScores: Uploading PB proof with proof_type=%s (song_id=%u, diff=%d, style=%s)\n",
+                       ptype, submit_id, stage_difficulty, runtime_custom_charts_get_play_style());
 
-                mp_add_file(&mp, "music_backup", "musicBackup.inf", m_bytes, m_sz);
+                if (m_bytes && m_sz > 0) {
+                    mp_add_file(&mp, "music_backup", "musicBackup.inf", m_bytes, m_sz);
+                }
+                if (c_bytes && c_sz > 0) {
+                    mp_add_file(&mp, "custom_records", "customRecords.dat", c_bytes, c_sz);
+                }
 
                 if (has_ss && screenshot_path[0]) {
                     size_t ss_sz = 0;
@@ -858,42 +1047,41 @@ static void *sync_worker_loop(void *arg) {
                         theatrhythm_gpu_show_notice("TFFScores: Scores Synced", 3000);
                     }
                 } else {
-                    printf("TFFScores: /api/game/submit-score returned status %d\n", err);
+                    printf("TFFScores: /api/game/submit-score returned status %d (%s)\n", err, resp);
                 }
                 mp_free(&mp);
-                free(m_bytes);
             }
+            if (m_bytes) free(m_bytes);
+            if (c_bytes) free(c_bytes);
             theatrhythm_gpu_clear_last_screenshot();
         } else {
             /* No new PB: do not wait for any screenshot */
             s_awaiting_result_screenshot = 0;
         }
 
-        /* 4-file cloud save backup (backup.inf, musicBackup.inf, proficaBackup.inf, judgementsBackup.inf) */
+        /* Cloud save backup (backup.inf, musicBackup.inf, proficaBackup.inf, judgementsBackup.inf, customRecords.dat, customJudgements.dat) */
         if (has_work && host[0]) {
-            char b_path[750], m_path[750], p_path[750], j_path[750];
-            snprintf(b_path, sizeof(b_path), "%s/backup.inf", host);
-            snprintf(m_path, sizeof(m_path), "%s/musicBackup.inf", host);
-            snprintf(p_path, sizeof(p_path), "%s/proficaBackup.inf", host);
-            snprintf(j_path, sizeof(j_path), "%s/judgementsBackup.inf", host);
-
-            size_t b_sz = 0, m_sz = 0, p_sz = 0, j_sz = 0;
-            unsigned char *b_data = read_entire_file(b_path, &b_sz);
-            unsigned char *m_data = read_entire_file(m_path, &m_sz);
-            unsigned char *p_data = read_entire_file(p_path, &p_sz);
-            unsigned char *j_data = read_entire_file(j_path, &j_sz);
-
-            if (!j_data) {
-                const char *alt_j = runtime_judgements_get_save_path();
-                if (alt_j && *alt_j) j_data = read_entire_file(alt_j, &j_sz);
+            for (int w = 0; w < 10 && (runtime_savedata_busy() || runtime_custom_charts_records_busy()); ++w) {
+                Sleep(50);
             }
-            if (!j_data) {
-                char alt_j2[750];
-                snprintf(alt_j2, sizeof(alt_j2), "%s/judgementsBackup.inf", s_user_dir);
-                j_data = read_entire_file(alt_j2, &j_sz);
+            /* Coalesce redundant save commit queued for the same host while awaiting results screenshot */
+            if (is_pb) {
+                pthread_mutex_lock(&s_tff_lock);
+                if (s_pending_sync_req && strcmp(s_pending_save_host, host) == 0) {
+                    s_pending_sync_req = 0;
+                }
+                pthread_mutex_unlock(&s_tff_lock);
             }
 
-            if (b_data || m_data || p_data || j_data) {
+            size_t b_sz = 0, m_sz = 0, p_sz = 0, j_sz = 0, c_sz = 0, cj_sz = 0;
+            unsigned char *b_data = read_save_file_with_fallbacks(host, "backup.inf", NULL, NULL, &b_sz);
+            unsigned char *m_data = read_save_file_with_fallbacks(host, "musicBackup.inf", NULL, NULL, &m_sz);
+            unsigned char *p_data = read_save_file_with_fallbacks(host, "proficaBackup.inf", NULL, NULL, &p_sz);
+            unsigned char *j_data = read_save_file_with_fallbacks(host, "judgementsBackup.inf", runtime_judgements_get_save_path(), s_user_dir, &j_sz);
+            unsigned char *c_data = read_save_file_with_fallbacks(host, "customRecords.dat", NULL, s_user_dir, &c_sz);
+            unsigned char *cj_data = read_save_file_with_fallbacks(s_user_dir, "customJudgements.dat", NULL, host, &cj_sz);
+
+            if (b_data || m_data || p_data || j_data || c_data || cj_data) {
                 MultipartBuf mp;
                 mp_init(&mp);
                 mp_add_field(&mp, "title_id", title_id);
@@ -901,17 +1089,19 @@ static void *sync_worker_loop(void *arg) {
                 if (m_data) mp_add_file(&mp, "file_music_backup", "musicBackup.inf", m_data, m_sz);
                 if (p_data) mp_add_file(&mp, "file_profica_backup", "proficaBackup.inf", p_data, p_sz);
                 if (j_data) mp_add_file(&mp, "file_judgements_backup", "judgementsBackup.inf", j_data, j_sz);
+                if (c_data) mp_add_file(&mp, "file_custom_records", "customRecords.dat", c_data, c_sz);
+                if (cj_data) mp_add_file(&mp, "file_custom_judgements", "customJudgements.dat", cj_data, cj_sz);
                 mp_finish(&mp);
 
                 char resp[1024];
                 int err = http_post_multipart("/api/game/cloud-save/upload", mp.data, mp.size, resp, sizeof(resp));
                 if (err == 0) {
-                    printf("TFFScores: 4-file cloud save backed up successfully for %s (j_sz=%zu)\n", title_id, j_sz);
+                    printf("TFFScores: Cloud save backed up successfully for %s (j_sz=%zu, c_sz=%zu)\n", title_id, j_sz, c_sz);
                     if (!is_pb) {
                         theatrhythm_gpu_show_notice("TFFScores: Cloud save synced", 3000);
                     }
                 } else {
-                    printf("TFFScores: cloud save upload returned %d\n", err);
+                    printf("TFFScores: cloud save upload returned %d (%s)\n", err, resp);
                 }
                 mp_free(&mp);
             }
@@ -920,6 +1110,8 @@ static void *sync_worker_loop(void *arg) {
             if (m_data) free(m_data);
             if (p_data) free(p_data);
             if (j_data) free(j_data);
+            if (c_data) free(c_data);
+            if (cj_data) free(cj_data);
         }
 
         pthread_mutex_lock(&s_tff_lock);
@@ -950,8 +1142,6 @@ void runtime_tffscores_init(const char *user_dir) {
         theatrhythm_gpu_show_notice("TFFScores: Press F9 to Log In (Cloud Saves & Leaderboards)", 6000);
     }
 }
-
-static uint64_t s_last_song_finish_ms = 0;
 
 static void *immediate_screenshot_thread(void *arg) {
     (void)arg;
@@ -985,14 +1175,20 @@ static void *delayed_screenshot_thread(void *arg) {
 
 void runtime_tffscores_on_song_result_finish(void) {
     uint64_t now_ms = GetTickCount64();
-    if (s_last_song_finish_ms != 0 && (now_ms - s_last_song_finish_ms) < 12000) {
+
+    pthread_mutex_lock(&s_tff_lock);
+    if (!s_stage_active) {
+        pthread_mutex_unlock(&s_tff_lock);
+        return;
+    }
+    if (s_last_song_finish_ms != 0 && (now_ms - s_last_song_finish_ms) < 5000) {
         /* Debounce: count-up behaviours fire for every counter during results sequence */
+        pthread_mutex_unlock(&s_tff_lock);
         return;
     }
     s_last_song_finish_ms = now_ms;
 
-    pthread_mutex_lock(&s_tff_lock);
-    if (s_stage_music_id == 0 || s_stage_is_custom || runtime_custom_charts_is_custom_id(s_stage_music_id)) {
+    if (s_stage_music_id == 0 || s_stage_is_local_custom || is_local_custom_id(s_stage_music_id)) {
         uint32_t cid = s_stage_music_id;
         s_stage_active = 0;
         s_stage_is_score_pb = 0;
@@ -1001,7 +1197,7 @@ void runtime_tffscores_on_song_result_finish(void) {
         s_awaiting_result_screenshot = 0;
         s_custom_suppress_until_ms = now_ms + 15000;
         pthread_mutex_unlock(&s_tff_lock);
-        printf("TFFScores: Skipping upload & screenshot for custom/unknown chart (ID %u)\n", cid);
+        printf("TFFScores: Skipping upload & screenshot for local/unknown custom chart (ID %u)\n", cid);
         return;
     }
     int is_pb = (s_stage_is_score_pb || s_stage_is_damage_pb);
@@ -1037,8 +1233,8 @@ void runtime_tffscores_on_song_result_finish(void) {
 void runtime_tffscores_on_save_commit(const char *save_host) {
     if (!save_host || !*save_host) return;
     pthread_mutex_lock(&s_tff_lock);
-    if (s_stage_is_custom && (s_stage_active || GetTickCount64() < s_custom_suppress_until_ms)) {
-        printf("TFFScores: Ignoring save commit from custom chart session (%s)\n", save_host);
+    if (s_stage_is_local_custom && (s_stage_active || GetTickCount64() < s_custom_suppress_until_ms)) {
+        printf("TFFScores: Ignoring save commit from local custom chart session (%s)\n", save_host);
         pthread_mutex_unlock(&s_tff_lock);
         return;
     }

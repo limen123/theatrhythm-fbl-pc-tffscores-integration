@@ -8,6 +8,7 @@
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_tffscores.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +194,19 @@ static ABI int32_t save_terminate(void) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     initialized=0; return 0;
 }
+static int restore_cloud_save_into(const char *host, const char *meta, const char *title) {
+    if (runtime_tffscores_maybe_download_save(host, title && *title ? title : title_id) != 1) return 0;
+    make_dirs(meta);
+    Param p;
+    if (read_param(meta, &p) != 0) {
+        memset(&p, 0, sizeof(p));
+        snprintf(p.title, sizeof(p.title), "THEATRHYTHM FINAL BAR LINE");
+        snprintf(p.subtitle, sizeof(p.subtitle), "Cloud Save");
+        write_param(meta, &p);
+    }
+    return 1;
+}
+
 static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32_t mode, uint64_t blocks, MountResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (user<0) return ERR_INVALID_USER;
@@ -203,7 +217,16 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,dir->data);
     struct stat st;
     int exists=!stat(host,&st) && S_ISDIR(st.st_mode);
-    if ((mode & MODE_CREATE) && exists) return ERR_EXISTS;
+    int cloud_restored = 0;
+    if (strcmp(dir->data, "SaveData") == 0) {
+        char bcheck[700];
+        snprintf(bcheck, sizeof(bcheck), "%s/backup.inf", host);
+        if (!exists || stat(bcheck, &st) != 0 || st.st_size <= 0) {
+            cloud_restored = restore_cloud_save_into(host, meta, title);
+            if (cloud_restored) exists = 1;
+        }
+    }
+    if ((mode & MODE_CREATE) && exists && !cloud_restored) return ERR_EXISTS;
     if (!(mode & (MODE_CREATE|MODE_CREATE2)) && !exists) return ERR_NOT_FOUND;
     pthread_mutex_lock(&lock);
     int slot=-1;
@@ -214,8 +237,6 @@ static int32_t mount(int32_t user, const char *title, const DirName *dir, uint32
     if (slot<0) { pthread_mutex_unlock(&lock); return ERR_MOUNT_FULL; }
     if (!exists && (make_dirs(host) || make_dirs(meta))) { pthread_mutex_unlock(&lock); return ERR_INTERNAL; }
     if (!exists) { Param empty={0}; write_param(meta,&empty); }
-    extern int runtime_tffscores_maybe_download_save(const char *save_host, const char *title_id);
-    runtime_tffscores_maybe_download_save(host, title ? title : title_id);
     if (cloud_pre_mount) cloud_pre_mount(host, title ? title : title_id);
     slots[slot].used=1;
     slots[slot].blocks=blocks ? blocks : DEFAULT_BLOCKS;
@@ -332,7 +353,18 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     if (!cond || !result) return ERR_PARAMETER;
     char base[600];
-    root(cond->user,cond->title ? cond->title->data : NULL,base,sizeof(base));
+    const char *search_title = (cond->title && cond->title->data[0]) ? cond->title->data : title_id;
+    root(cond->user, cond->title ? cond->title->data : NULL, base, sizeof(base));
+    if (!cond->dir || !cond->dir->data[0] || like("SaveData", cond->dir->data)) {
+        char sd_host[640], sd_meta[680], bcheck[700];
+        snprintf(sd_host, sizeof(sd_host), "%s/SaveData", base);
+        snprintf(sd_meta, sizeof(sd_meta), "%s/SaveData.sce_sys", base);
+        snprintf(bcheck, sizeof(bcheck), "%s/backup.inf", sd_host);
+        struct stat st;
+        if (stat(bcheck, &st) != 0 || st.st_size <= 0) {
+            restore_cloud_save_into(sd_host, sd_meta, search_title);
+        }
+    }
     Entry *entries=NULL; size_t count=0, capacity=0;
     DIR *d=opendir(base);
     for (struct dirent *e; d && (e=readdir(d));) {

@@ -21,6 +21,8 @@ uint64_t runtime_wait_begin(void);
 void runtime_wait_end(const char *what,uint64_t start,const char *detail,long long arg);
 /* The floating-point state a PS4 gives its threads (runtime_thread.c). */
 void runtime_orbis_fpu(void);
+/* Run by runtime_orbis_fpu on each guest thread before its first code (Windows; NULL: none). */
+extern void (*runtime_thread_start_hook)(void);
 #define ABI __attribute__((sysv_abi))
 typedef void (ABI *GuestCallback)(void);
 /* Calls guest entry(arg0, arg1) with rbp 0, so unwinding and frame walks end there (runtime_thread.c). */
@@ -40,6 +42,8 @@ void runtime_mutex_report(void);
 uintptr_t runtime_memory_resolve(const char *name);
 void runtime_memory_report(void);
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
+/* Non-zero when [address, address+size) is committed, readable host/guest memory without faulting. */
+int runtime_host_is_readable(const void *address, size_t size);
 /* Host access to guest memory past page protection, through the backing view: write_backing
  * returns 0 when part of the range is unmapped, and skips GPU tracking (runtime_memory_invalidate). */
 int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size);
@@ -172,7 +176,7 @@ unsigned runtime_sema_waiters(uint32_t id);
 uintptr_t runtime_time_resolve(const char *name);
 void runtime_content_configure(const uint32_t values[5]);
 /* An extra folder of add-ons next to <user>/addcont/ (its <title_id>/ subfolder when it has one). */
-void runtime_content_extra_dir(const char *folder,const char *title_id);
+void runtime_content_extra_dir(const char *folder,const char *title_id,const char *game);
 void runtime_content_init_dlc(const char *app0, const char *user);
 void runtime_custom_charts_configure(const char *game_dir, const char *user_dir);
 int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);

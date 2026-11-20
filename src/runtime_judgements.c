@@ -64,6 +64,34 @@ const char *runtime_judgements_get_save_path(void) {
     return s_primary_save_path[0] ? s_primary_save_path : "Save/judgementsBackup.inf";
 }
 
+static bool s_stage_saved_best = false;
+
+void runtime_judgements_judge_color(uint8_t judge, uint16_t flags,
+                                    uint8_t *out_r, uint8_t *out_g, uint8_t *out_b) {
+    uint8_t r = 0xff, g = 0xff, b = 0xff;
+    if (judge == JUDGE_CRITICAL) {
+        if (flags & 1) {
+            /* Rainbow Critical: Pure White */
+            r = 0xff; g = 0xff; b = 0xff;
+        } else {
+            /* Critical: Gold / Yellow */
+            r = 0xff; g = 0xd7; b = 0x00;
+        }
+    } else if (judge == JUDGE_GREAT) {
+        /* Great: Orange */
+        r = 0xff; g = 0x8c; b = 0x00;
+    } else if (judge == JUDGE_GOOD) {
+        /* Good: Green */
+        r = 0x32; g = 0xcd; b = 0x32;
+    } else if (judge == JUDGE_BAD) {
+        /* Bad: Purple */
+        r = 0x93; g = 0x70; b = 0xdb;
+    }
+    if (out_r) *out_r = r;
+    if (out_g) *out_g = g;
+    if (out_b) *out_b = b;
+}
+
 void runtime_judgements_begin_stage(uint32_t music_id, int difficulty) {
     if (music_id == 0) return;
     pthread_mutex_lock(&s_judg_lock);
@@ -75,6 +103,7 @@ void runtime_judgements_begin_stage(uint32_t music_id, int difficulty) {
     s_current_music_id = music_id;
     s_current_run_count = 0;
     s_stage_unflushed = true;
+    s_stage_saved_best = false;
     pthread_mutex_unlock(&s_judg_lock);
 }
 
@@ -115,18 +144,23 @@ void runtime_judgements_ensure_stage_finished(uint32_t fallback_score) {
 
 void runtime_judgements_finish_stage(uint32_t score, bool is_new_best) {
     pthread_mutex_lock(&s_judg_lock);
+    bool was_unflushed = s_stage_unflushed;
     s_stage_unflushed = false;
 
-    /* Copy live run to display buffer */
-    s_display_count = s_current_run_count;
-    s_display_music_id = s_current_music_id;
-    s_display_difficulty = s_current_difficulty;
-    s_display_score = score;
-    if (s_current_run_count > 0) {
-        memcpy(s_display_notes, s_current_run_notes, s_current_run_count * sizeof(JudgementNote));
+    /* Copy live run to display buffer once, or upgrade display score if caller supplies real score */
+    if (was_unflushed || s_display_music_id != s_current_music_id ||
+        s_display_difficulty != s_current_difficulty || (score > 0 && s_display_score == 0)) {
+        s_display_count = s_current_run_count;
+        s_display_music_id = s_current_music_id;
+        s_display_difficulty = s_current_difficulty;
+        if (score > 0 || was_unflushed) s_display_score = score;
+        if (s_current_run_count > 0) {
+            memcpy(s_display_notes, s_current_run_notes, s_current_run_count * sizeof(JudgementNote));
+        }
     }
 
-    if (s_current_run_count == 0 || s_current_music_id == 0) {
+    if (!is_new_best || score == 0 || s_stage_saved_best ||
+        s_current_run_count == 0 || s_current_music_id == 0) {
         pthread_mutex_unlock(&s_judg_lock);
         return;
     }
@@ -192,7 +226,7 @@ void runtime_judgements_finish_stage(uint32_t score, bool is_new_best) {
             if (off + note_bytes > file_size) break;
 
             if (e.music_id == s_current_music_id && (int)e.difficulty == s_current_difficulty) {
-                if (is_new_best || score >= e.score) {
+                if (is_new_best && (e.score == 0 || score >= e.score)) {
                     JudgementsFileEntry new_e;
                     new_e.music_id = s_current_music_id;
                     new_e.difficulty = (uint32_t)s_current_difficulty;
@@ -253,6 +287,7 @@ void runtime_judgements_finish_stage(uint32_t score, bool is_new_best) {
         save_file_to_disk(slot_path, out_buf, out_pos);
     }
 
+    s_stage_saved_best = true;
     printf("Judgements: Successfully saved %s to %s (%u entries, %zu notes)\n",
            is_custom ? "customJudgements.dat" : "4th save file (judgementsBackup.inf)",
            path_backup, count, s_current_run_count);
@@ -499,7 +534,8 @@ int runtime_judgements_render_graph(uint8_t *rgba, int width, int height, uint32
         if (x < 2) x = 2;
         if (x >= width - 2) x = width - 3;
 
-        if (n->judge >= 6) {
+        if (n->judge == 0) continue;
+        if (n->judge >= 5) {
             /* Miss: draw a vertical red line */
             for (int y = cy - (cy * 2 / 3); y <= cy + (cy * 2 / 3); ++y) {
                 if (y >= 0 && y < height) {
@@ -521,22 +557,7 @@ int runtime_judgements_render_graph(uint8_t *rgba, int width, int height, uint32
 
             /* Select color */
             uint8_t r = 0xff, g = 0xff, b = 0xff;
-            if (n->flags & 1 || n->judge == 1) {
-                /* Rainbow Critical: Pure White */
-                r = 0xff; g = 0xff; b = 0xff;
-            } else if (n->judge == 2) {
-                /* Critical: Gold / Yellow */
-                r = 0xff; g = 0xd7; b = 0x00;
-            } else if (n->judge == 3) {
-                /* Great: Orange */
-                r = 0xff; g = 0x8c; b = 0x00;
-            } else if (n->judge == 4) {
-                /* Good: Green */
-                r = 0x32; g = 0xcd; b = 0x32;
-            } else if (n->judge == 5) {
-                /* Bad: Purple */
-                r = 0x93; g = 0x70; b = 0xdb;
-            }
+            runtime_judgements_judge_color(n->judge, n->flags, &r, &g, &b);
 
             /* Draw 3x3 dot */
             for (int dy = -1; dy <= 1; ++dy) {

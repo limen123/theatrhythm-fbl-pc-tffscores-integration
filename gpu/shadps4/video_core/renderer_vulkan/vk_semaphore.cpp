@@ -1,14 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
 #include <limits>
-#ifdef _WIN32
-#include <windows.h>
-#undef WAIT_TIMEOUT
-#endif
-#include "common/thread.h"
-#include "theatrhythm_toggles.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -62,36 +55,7 @@ void Semaphore::Wait(u64 tick) {
         return;
     }
 
-    // If none of the above is hit, fallback to a regular wait
-#ifdef _WIN32
-    ULONG64 cyc0 = 0;
-    if (TheatrhythmStats::enabled) {
-        QueryThreadCycleTime(GetCurrentThread(), &cyc0);
-    }
-    const auto finish_cycles = [&] {
-        if (TheatrhythmStats::enabled) {
-            ULONG64 cyc1 = 0;
-            QueryThreadCycleTime(GetCurrentThread(), &cyc1);
-            TheatrhythmStats::sem_wait_cycles.fetch_add(cyc1 - cyc0, std::memory_order_relaxed);
-        }
-    };
-    // On Windows NVIDIA drivers, vkWaitSemaphores busy-spins a CPU core; briefly spin for <30 us
-    // waits then sleep cleanly with the high-resolution waitable timer while polling the counter.
-    const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(30);
-    while (std::chrono::steady_clock::now() < spin_until) {
-        __builtin_ia32_pause();
-        Refresh();
-        if (IsFree(tick)) {
-            finish_cycles();
-            return;
-        }
-    }
-    while (!IsFree(tick)) {
-        Common::AccurateSleep(std::chrono::microseconds(250), nullptr, false);
-        Refresh();
-    }
-    finish_cycles();
-#else
+    // If none of the above is hit, fallback to a regular blocking Vulkan semaphore wait.
     const vk::SemaphoreWaitInfo wait_info = {
         .semaphoreCount = 1,
         .pSemaphores = &semaphore.get(),
@@ -101,7 +65,6 @@ void Semaphore::Wait(u64 tick) {
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
     }
     Refresh();
-#endif
 }
 
 } // namespace Vulkan

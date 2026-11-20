@@ -17,6 +17,11 @@ typedef struct {
 /* Install note skin & particle color-matching hooks into Il2CppUserAssemblies.prx. */
 int runtime_note_skins_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size);
 
+/* Track active TriggerColorIndex (0 = Noteskin A, 1 = Noteskin B).
+ * Custom note skin & particle recoloring only applies to Noteskin A (0). */
+void runtime_note_skins_set_color_type(int color_type);
+int runtime_note_skins_get_color_type(void);
+
 /* Recolor an RGBA8 pixel buffer in place using the category's Hue/Saturation while preserving
  * neutral white inner markings and dark outlines. */
 void runtime_note_skins_recolor_rgba(uint8_t *rgba, int w, int h, int category);
@@ -34,6 +39,9 @@ void runtime_note_skins_apply_ps_list_rgb(void *ps_list, float r, float g, float
 void runtime_note_skins_on_play_judge_effect(void *controller, void *trig_pd);
 void runtime_note_skins_on_bms_holding(void *controller, void *trig_pd);
 void *runtime_note_skins_active_hold_start_sprite(void);
+void runtime_note_skins_on_triggers_created(void *mst);
+void runtime_note_skins_sync_simple_colors(void);
+void runtime_note_skins_on_set_simple_type(void *tobj);
 
 /* Cross-module helpers exposed by runtime_custom_charts.c & runtime_slidehold.c. */
 uint8_t *runtime_decode_png_rgba(const uint8_t *png, size_t png_sz, int *out_w, int *out_h);

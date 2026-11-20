@@ -12,7 +12,9 @@
 #include "runtime_custom_charts.h"
 #include "runtime_judgements.h"
 #include "runtime_leaderboard.h"
+#include "runtime_note_skins.h"
 #include "runtime_slidehold.h"
+#include "runtime_tffscores.h"
 #include "custom_difficulty_assets.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,18 +67,26 @@ typedef struct {
     HookFn fn;
     unsigned char floats;
     int ver; /* 0 = both, 100 = v1.0.0, 104 = v1.0.4+ */
+    void **orig_ptr;
 } Hook;
 
 static unsigned char *module;
 static int is_game_104 = 0;
 #undef GUEST_CALL
 #define GUEST_CALL(off100, off104) ((void *)(module + (is_game_104 ? (off104) : (off100))))
-#define GUEST(offset) ((void *)(module + (offset)))
 
 static uint64_t load64(const void *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static uint32_t load32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void put64(void *p, uint64_t v) { memcpy(p, &v, 8); }
 static void put32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+
+static inline bool cc_mem_readable(const void *p, size_t size) {
+    return (((uintptr_t)p & 3ULL) == 0) && runtime_host_is_readable(p, size) != 0;
+}
+
+static inline bool cc_valid_ptr(const void *p) {
+    return cc_mem_readable(p, 0x18);
+}
 
 #define MAX_CUSTOM_SONGS 256
 #define MAX_SLOTS 6
@@ -289,23 +299,25 @@ static Il2CppMethodInfo *find_method(void *klass, const char *name, int args) {
 static void *clone_object(void *obj) {
     if (!obj) return NULL;
     typedef void *(ABI *CloneFn)(void *self, void *method);
-    CloneFn clone_fn = (CloneFn)GUEST(0x37271b0); /* System.Object::MemberwiseClone */
+    CloneFn clone_fn = (CloneFn)GUEST_CALL(0x36e19b0, 0x37271b0); /* System.Object::MemberwiseClone */
     return clone_fn(obj, NULL);
 }
 
-static void *resolve_typeinfo(uint64_t slot_rva) {
-    if (!module || !is_game_104) return NULL;
+static void *resolve_typeinfo(uint64_t slot100, uint64_t slot104) {
+    if (!module) return NULL;
+    uint64_t slot_rva = is_game_104 ? slot104 : slot100;
+    if (!slot_rva) return NULL;
     void **slot = (void **)(module + slot_rva);
     uintptr_t raw = (uintptr_t)(*slot);
     if (raw == 0 || (raw & 1u) != 0) {
         typedef void (ABI *InitMetaFn)(void **metadata_slot);
-        ((InitMetaFn)GUEST(0x486f90))(slot);
+        ((InitMetaFn)GUEST_CALL(0x4831c0, 0x486f90))(slot);
     }
     void *klass = *slot;
-    if (!klass || ((uintptr_t)klass & 1u) != 0 || (uintptr_t)klass < 0x10000ULL) return NULL;
+    if (!cc_mem_readable(klass, 0xe8)) return NULL;
     if (load32((const char *)klass + 0xe0) == 0) {
         typedef void (ABI *ClassInitFn)(void *k);
-        ((ClassInitFn)GUEST(0x45b590))(klass);
+        ((ClassInitFn)GUEST_CALL(0x4577c0, 0x45b590))(klass);
     }
     return klass;
 }
@@ -316,7 +328,7 @@ static void *alloc_managed_object(void *klass) {
     if (il2cpp_runtime_class_init_fn) il2cpp_runtime_class_init_fn(klass);
     if (il2cpp_object_new_fn) return il2cpp_object_new_fn(klass);
     typedef void *(ABI *NewObjFn)(void *klass);
-    NewObjFn new_obj = (NewObjFn)GUEST(0x458370);
+    NewObjFn new_obj = (NewObjFn)GUEST_CALL(0x4545a0, 0x458370);
     return new_obj(klass);
 }
 
@@ -331,7 +343,7 @@ static void *alloc_managed_array_by_elem(void *elem_klass, size_t count) {
 static void *alloc_managed_array_by_arr_class(void *arr_klass, size_t count) {
     if (!arr_klass) return NULL;
     typedef void *(ABI *ArrNewSpecificFn)(void *arr_klass, uintptr_t len);
-    ArrNewSpecificFn fn = (ArrNewSpecificFn)GUEST(0x45a880);
+    ArrNewSpecificFn fn = (ArrNewSpecificFn)GUEST_CALL(0x456ab0, 0x45a880);
     return fn(arr_klass, (uintptr_t)count);
 }
 
@@ -516,14 +528,30 @@ static void make_sort_key(const char *title, char *out, size_t size) {
     out[len] = '\0';
 }
 
+uint32_t runtime_custom_charts_normalize_id(uint32_t music_id) {
+    /* TFFScores verified custom IDs use 90000..99999; Game.MusicID adds PrefixNumber 16 * 10,000,000. */
+    if (music_id >= 90000u && music_id < 100000u) {
+        return 160000000u + music_id;
+    }
+    return music_id;
+}
+
+bool runtime_custom_charts_is_verified_id(uint32_t music_id) {
+    uint32_t norm = runtime_custom_charts_normalize_id(music_id);
+    return norm >= 160090000u && norm < 160100000u;
+}
+
 bool runtime_custom_charts_is_custom_id(uint32_t music_id) {
-    return (music_id >= 90000u && music_id < 100000u) || (music_id >= 169000000u && music_id < 170000000u);
+    uint32_t norm = runtime_custom_charts_normalize_id(music_id);
+    return (norm >= 160090000u && norm < 160100000u) ||
+           (norm >= 169000000u && norm < 170000000u);
 }
 
 static CustomSong *find_song_by_id(uint32_t id) {
-    if (!runtime_custom_charts_is_custom_id(id)) return NULL;
+    uint32_t norm = runtime_custom_charts_normalize_id(id);
+    if (!runtime_custom_charts_is_custom_id(norm)) return NULL;
     for (size_t i = 0; i < song_count; ++i) {
-        if (songs[i].music_id == id) return &songs[i];
+        if (songs[i].music_id == norm) return &songs[i];
     }
     return NULL;
 }
@@ -733,9 +761,17 @@ static void scan_custom_charts_dir(const char *root) {
             }
         }
         song.mode = (!strcmp(mode_str, "BMS")) ? 1 : 0;
-        uint32_t parsed_id = (uint32_t)strtoul(song.id, NULL, 10);
-        if ((parsed_id >= 90000u && parsed_id < 100000u) || (parsed_id >= 169000000u && parsed_id < 170000000u)) {
-            song.music_id = parsed_id;
+        char *id_end = NULL;
+        unsigned long parsed_ul = strtoul(song.id, &id_end, 10);
+        if (song.id[0] != '\0' && id_end && *id_end == '\0' && parsed_ul <= 0xFFFFFFFFUL) {
+            uint32_t parsed_id = (uint32_t)parsed_ul;
+            if ((parsed_id >= 90000u && parsed_id < 100000u) ||
+                (parsed_id >= 160090000u && parsed_id < 160100000u) ||
+                (parsed_id >= 169000000u && parsed_id < 170000000u)) {
+                song.music_id = runtime_custom_charts_normalize_id(parsed_id);
+            } else {
+                song.music_id = fnv1a_id(song.id);
+            }
         } else {
             song.music_id = fnv1a_id(song.id);
         }
@@ -997,7 +1033,7 @@ static void ensure_series_managed_objects(void) {
     if (series_object && series_title) return;
     ensure_il2cpp_api();
     if (!series_object) {
-        SeriesIDFromIntFn make_series_id = (SeriesIDFromIntFn)GUEST(0xebebb0);
+        SeriesIDFromIntFn make_series_id = (SeriesIDFromIntFn)GUEST_CALL(0x0e90930, 0x0ebebb0);
         series_object = make_series_id(custom_series_id, NULL);
         (void)gc_pin(series_object, false);
     }
@@ -1010,7 +1046,7 @@ static void ensure_song_managed_objects(CustomSong *song) {
     if (!song) return;
     ensure_il2cpp_api();
     if (!song->managed_id) {
-        MusicIDFromIntFn make_music_id = (MusicIDFromIntFn)GUEST(0xeb60c0);
+        MusicIDFromIntFn make_music_id = (MusicIDFromIntFn)GUEST_CALL(0x0e87e40, 0x0eb60c0);
         song->managed_id = make_music_id(song->music_id, NULL);
         song->root_id = gc_pin(song->managed_id, false);
     }
@@ -1024,7 +1060,8 @@ static void ensure_song_managed_objects(CustomSong *song) {
     }
     if (!song->managed_label) {
         char label[32];
-        snprintf(label, sizeof(label), "MUSIC%07u", song->music_id - 160000000u);
+        uint32_t label_num = (song->music_id >= 160000000u) ? (song->music_id - 160000000u) : song->music_id;
+        snprintf(label, sizeof(label), "MUSIC%07u", label_num);
         song->managed_label = make_pinned_string(label, &song->root_label);
     }
     if (!song->managed_jacket_addr && song->has_jacket) {
@@ -1160,6 +1197,78 @@ static ABI int wrap_music_table_convert(HookRegs *r) {
     printf("CustomCharts: Injected %d/%zu custom songs into base MusicTable\n", added, song_count);
     gc_unpin(dict_root);
     r->rax = (uint64_t)dict;
+    return 1;
+}
+
+static void *original_music_get_diff_value_list = NULL;
+
+/* Table.MusicTable::GetDifficultyValueList (v1.0.4: 0x0b585b0, v1.0.0: 0x0a8c740)
+ * Stock implementation only inspects _difficultyValues[0..3] (omitting Beginner slot 4 & Chaos slot 5,
+ * e.g. difficulty 20+) and only calls RemoveAt(0) once (leaving 0 in the list when a custom song
+ * is missing slots 0..2). Include all positive ratings across slots 0..5 and filter out <= 0. */
+static ABI int wrap_music_table_get_difficulty_value_list(HookRegs *r) {
+    ensure_il2cpp_api();
+    if (!original_music_get_diff_value_list) return 0;
+
+    typedef void *(ABI *GetDiffListFn)(void *self, void *method);
+    void *orig_arr = ((GetDiffListFn)original_music_get_diff_value_list)((void *)r->rdi, (void *)r->rsi);
+    if (!orig_arr) {
+        r->rax = 0;
+        return 1;
+    }
+
+    int32_t vals[256];
+    int count = 0;
+
+    uint64_t orig_len = load64((char *)orig_arr + 0x18);
+    if (orig_len > 2048) orig_len = 2048;
+    for (uint64_t i = 0; i < orig_len; ++i) {
+        int32_t v = (int32_t)load32((char *)orig_arr + 0x20 + i * 4);
+        if (v <= 0) continue;
+        bool exists = false;
+        for (int k = 0; k < count; ++k) {
+            if (vals[k] == v) { exists = true; break; }
+        }
+        if (!exists && count < 256) vals[count++] = v;
+    }
+
+    for (size_t i = 0; i < song_count; ++i) {
+        CustomSong *song = &songs[i];
+        for (int s = 0; s < MAX_SLOTS; ++s) {
+            if (!song->charts[s].data || song->charts[s].size == 0) continue;
+            int32_t v = song->charts[s].rating;
+            if (v <= 0) continue;
+            bool exists = false;
+            for (int k = 0; k < count; ++k) {
+                if (vals[k] == v) { exists = true; break; }
+            }
+            if (!exists && count < 256) vals[count++] = v;
+        }
+    }
+
+    for (int i = 1; i < count; ++i) {
+        int32_t key = vals[i];
+        int j = i - 1;
+        while (j >= 0 && vals[j] > key) {
+            vals[j + 1] = vals[j];
+            --j;
+        }
+        vals[j + 1] = key;
+    }
+
+    void *new_arr = alloc_managed_array_by_arr_class(object_class(orig_arr), (size_t)count);
+    if (!new_arr && s_int32_class) {
+        new_arr = alloc_managed_array_by_elem(s_int32_class, (size_t)count);
+    }
+    if (!new_arr) {
+        r->rax = (uint64_t)orig_arr;
+        return 1;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        put32((char *)new_arr + 0x20 + (size_t)i * 4, (uint32_t)vals[i]);
+    }
+    r->rax = (uint64_t)new_arr;
     return 1;
 }
 
@@ -1449,35 +1558,29 @@ static CustomOperation operations[MAX_ACTIVE_OPERATIONS];
 static uint64_t s_cache_clock = 0;
 
 static bool unity_native_alive(const void *obj) {
-    if (!obj || (uintptr_t)obj < 0x10000ULL || (uintptr_t)obj > 0x00007fffffffffffULL) return false;
-    if (load64((const char *)obj + 0x10) == 0) return false;
-    if (is_game_104) {
-        typedef bool (ABI *OpImplicitFn)(const void *obj, void *method);
-        OpImplicitFn op_imp = (OpImplicitFn)GUEST(0x1dce850);
-        return op_imp(obj, NULL);
-    }
-    return true;
+    if (!cc_mem_readable(obj, 0x18)) return false;
+    uint64_t native_ptr = load64((const char *)obj + 0x10);
+    if (!native_ptr || !runtime_host_is_readable((const void *)(uintptr_t)native_ptr, 8)) return false;
+    typedef bool (ABI *OpImplicitFn)(const void *obj, void *method);
+    OpImplicitFn op_imp = (OpImplicitFn)GUEST_CALL(0x1e2d820, 0x1dce850);
+    return op_imp(obj, NULL);
 }
 
 static void protect_cached_unity_object(void *obj) {
     if (!unity_native_alive(obj)) return;
-    if (is_game_104) {
-        /* HideFlags.DontUnloadUnusedAsset = 32 */
-        typedef void (ABI *SetHideFlagsFn)(void *obj, int32_t flags, void *method);
-        SetHideFlagsFn set_hf = (SetHideFlagsFn)GUEST(0x1dcfe50);
-        set_hf(obj, 32, NULL);
-    }
+    /* HideFlags.DontUnloadUnusedAsset = 32 */
+    typedef void (ABI *SetHideFlagsFn)(void *obj, int32_t flags, void *method);
+    SetHideFlagsFn set_hf = (SetHideFlagsFn)GUEST_CALL(0x1e2ee20, 0x1dcfe50);
+    set_hf(obj, 32, NULL);
 }
 
 static void destroy_cached_asset(CachedCustomAsset *a) {
     if (!a || !a->used) return;
-    if (is_game_104) {
-        typedef void (ABI *DestroyObjFn)(void *obj, void *method);
-        DestroyObjFn destroy_fn = (DestroyObjFn)GUEST(0x1dcfae0);
-        /* TextAsset Internal_CreateInstance is managed/native peer; Destroy handles Sprite, Texture2D, AudioClip, TextAsset */
-        if (unity_native_alive(a->object)) destroy_fn(a->object, NULL);
-        if (unity_native_alive(a->texture)) destroy_fn(a->texture, NULL);
-    }
+    typedef void (ABI *DestroyObjFn)(void *obj, void *method);
+    DestroyObjFn destroy_fn = (DestroyObjFn)GUEST_CALL(0x1e2eab0, 0x1dcfae0);
+    /* TextAsset Internal_CreateInstance is managed/native peer; Destroy handles Sprite, Texture2D, AudioClip, TextAsset */
+    if (unity_native_alive(a->object)) destroy_fn(a->object, NULL);
+    if (unity_native_alive(a->texture)) destroy_fn(a->texture, NULL);
     gc_unpin(a->obj_root);
     gc_unpin(a->tex_root);
     gc_unpin(a->bytes_root);
@@ -1549,9 +1652,8 @@ static ABI void *stage_native_text_bytes(void *text_asset) {
 }
 
 static void ensure_native_text_reader(void) {
-    if (!is_game_104) return;
     ensure_il2cpp_api();
-    NativeTextBytesFn *slot = (NativeTextBytesFn *)(module + 0x6332e28);
+    NativeTextBytesFn *slot = (NativeTextBytesFn *)GUEST_CALL(0x6331a28, 0x6332e28);
     if (*slot == stage_native_text_bytes) return;
     NativeTextBytesFn orig = *slot;
     if (!orig && il2cpp_resolve_icall_fn) {
@@ -1635,8 +1737,8 @@ static void *create_custom_audio_clip(CustomSong *song, bool preview) {
 
     typedef void *(ABI *CreateClipFn)(void *name, int lengthSamples, int channels, int freq, bool stream, void *method);
     typedef bool (ABI *SetDataFn)(void *self, void *data, int offset, void *method);
-    CreateClipFn create_clip = (CreateClipFn)GUEST(0x455bb50);
-    SetDataFn set_data = (SetDataFn)GUEST(0x455b630);
+    CreateClipFn create_clip = (CreateClipFn)GUEST_CALL(0x45485a0, 0x455bb50);
+    SetDataFn set_data = (SetDataFn)GUEST_CALL(0x4548080, 0x455b630);
 
     char wav_path[700];
     snprintf(wav_path, sizeof(wav_path), "%s\\%s", song->folder, song->audio_file);
@@ -1705,7 +1807,7 @@ static void *create_custom_audio_clip(CustomSong *song, bool preview) {
     if (!ok) {
         if (unity_native_alive(clip)) {
             typedef void (ABI *DestroyObjFn)(void *obj, void *method);
-            ((DestroyObjFn)GUEST(0x1dcfae0))(clip, NULL);
+            ((DestroyObjFn)GUEST_CALL(0x1e2eab0, 0x1dcfae0))(clip, NULL);
         }
         gc_unpin(clip_pin);
         return NULL;
@@ -1781,14 +1883,14 @@ static void *create_custom_sprite(CustomSong *song, int kind, void **out_tex) {
     if (!tex) { if (free_pixels) stbi_image_free(pixels); return NULL; }
     uint32_t tex_pin = gc_pin(tex, false);
 
-    ((TexCtorFn2)GUEST(0x39d63f0))(tex, width, height, 4 /* RGBA32 */, false, NULL);
-    ((TexSetIntFn2)GUEST(0x39d39f0))(tex, 1 /* Bilinear */, NULL);
-    ((TexSetIntFn2)GUEST(0x39d3940))(tex, 1 /* Clamp */, NULL);
-    ((LoadRawFn2)GUEST(0x39d72c0))(tex, pixels, width * height * 4, NULL);
-    ((ApplyFn2)GUEST(0x39d7540))(tex, false, true, NULL);
+    ((TexCtorFn2)GUEST_CALL(0x39e2dd0, 0x39d63f0))(tex, width, height, 4 /* RGBA32 */, false, NULL);
+    ((TexSetIntFn2)GUEST_CALL(0x39e03d0, 0x39d39f0))(tex, 1 /* Bilinear */, NULL);
+    ((TexSetIntFn2)GUEST_CALL(0x39e0320, 0x39d3940))(tex, 1 /* Clamp */, NULL);
+    ((LoadRawFn2)GUEST_CALL(0x39e3ca0, 0x39d72c0))(tex, pixels, width * height * 4, NULL);
+    ((ApplyFn2)GUEST_CALL(0x39e3f20, 0x39d7540))(tex, false, true, NULL);
     if (free_pixels) stbi_image_free(pixels);
 
-    void *sprite = ((SprCreateFullFn2)GUEST(0x1dddde0))(
+    void *sprite = ((SprCreateFullFn2)GUEST_CALL(0x1e3cdb0, 0x1dddde0))(
         tex,
         (SprRect){0.0f, 0.0f, (float)width, (float)height},
         (SprVec2){0.5f, 0.5f},
@@ -1799,7 +1901,7 @@ static void *create_custom_sprite(CustomSong *song, int kind, void **out_tex) {
     if (!sprite) {
         if (unity_native_alive(tex)) {
             typedef void (ABI *DestroyObjFn)(void *obj, void *method);
-            ((DestroyObjFn)GUEST(0x1dcfae0))(tex, NULL);
+            ((DestroyObjFn)GUEST_CALL(0x1e2eab0, 0x1dcfae0))(tex, NULL);
         }
         gc_unpin(tex_pin);
         return NULL;
@@ -1808,7 +1910,7 @@ static void *create_custom_sprite(CustomSong *song, int kind, void **out_tex) {
     uint32_t spr_pin = gc_pin(sprite, false);
     if (!s_str_custom_jacket_name) s_str_custom_jacket_name = make_pinned_string("FBL_CustomJacket", NULL);
     if (!s_str_custom_series_name) s_str_custom_series_name = make_pinned_string("FBL_CustomSeries", NULL);
-    ((SetNameFn2)GUEST(0x1dceb60))(sprite, kind == -3 ? s_str_custom_series_name : s_str_custom_jacket_name, NULL);
+    ((SetNameFn2)GUEST_CALL(0x1e2db30, 0x1dceb60))(sprite, kind == -3 ? s_str_custom_series_name : s_str_custom_jacket_name, NULL);
     if (out_tex) *out_tex = tex;
     gc_unpin(spr_pin);
     gc_unpin(tex_pin);
@@ -1838,7 +1940,7 @@ static void *create_custom_text_asset(CustomSong *song, int slot, void **out_byt
 
     /* Initialize native Unity TextAsset peer so m_CachedPtr (+0x10) is valid */
     typedef void (ABI *InternalCreateFn)(void *self, void *str, void *method);
-    ((InternalCreateFn)GUEST(0x1dcd690))(ta, make_string(NULL, ""), NULL);
+    ((InternalCreateFn)GUEST_CALL(0x1e2c660, 0x1dcd690))(ta, make_string(NULL, ""), NULL);
     ensure_native_text_reader();
 
     if (out_bytes) *out_bytes = bytes_arr;
@@ -2126,9 +2228,47 @@ int runtime_custom_charts_get_results_page(void) {
     return s_results_page;
 }
 
+static bool s_non_scoring_stage_active = false;
+static uint32_t s_stage_run_seq = 0;
+static uint32_t s_result_notified_seq = 0;
+static bool s_pending_config_stage_start = false;
+static void *s_pending_config_setting = NULL;
+static bool s_stage_context_entered = false;
+
+static bool is_play_setting_non_scoring(void *setting) {
+    if (!cc_mem_readable(setting, 0x118)) return false;
+    int32_t play_type = (int32_t)load32((char *)setting + 0x108); /* 1=Practice, 2=Auto/Demo */
+    uint8_t replay_mode = *(uint8_t *)((char *)setting + 0x10c);
+    int32_t tutorial_type = (int32_t)load32((char *)setting + 0x110); /* -1=None, 0/1=Tutorial */
+    uint8_t timing_adj = *(uint8_t *)((char *)setting + 0x115);
+    return (play_type != 0) || (replay_mode != 0) || (tutorial_type != -1) || (timing_adj != 0);
+}
+
+static void begin_stage_tracking(void *setting) {
+    if (!cc_mem_readable(setting, 0x58)) return;
+    void *mid = (void *)load64((char *)setting + 0x18);
+    CustomSong *song = find_song_by_obj(mid);
+    uint32_t music_id = cc_mem_readable(mid, 0x18) ? load32((char *)mid + 0x10) : 0;
+    int difficulty = (int)load32((char *)setting + 0x50);
+    if (s_gameplay_chart_slot >= 4) difficulty = s_gameplay_chart_slot;
+    else if (s_pending_chart_slot >= 4) difficulty = s_pending_chart_slot;
+    s_results_page = 1;
+    s_custom_stage_active = (song != NULL);
+    s_non_scoring_stage_active = is_play_setting_non_scoring(setting);
+    ++s_stage_run_seq;
+    if (!s_non_scoring_stage_active && music_id != 0) {
+        runtime_judgements_begin_stage(music_id, difficulty);
+        extern void runtime_tffscores_notify_stage_start(uint32_t music_id, int difficulty);
+        runtime_tffscores_notify_stage_start(music_id, difficulty);
+    } else {
+        /* Reset live notes without registering a scorable song for Tutorial/Demo/Practice */
+        runtime_judgements_begin_stage(0, 0);
+    }
+}
+
 static ABI int hook_theater_begin_init(HookRegs *r) {
     void *enumerator = (void *)r->rdi;
-    if (!enumerator || !original_theater_begin_init) return 0;
+    if (!cc_mem_readable(enumerator, 0x28) || !original_theater_begin_init) return 0;
 
     int before = (int)(int32_t)load32((char *)enumerator + 0x10);
     void *theater = (void *)load64((char *)enumerator + 0x20);
@@ -2137,31 +2277,35 @@ static ABI int hook_theater_begin_init(HookRegs *r) {
     typedef bool (ABI *MoveNextFn)(void *enumerator, void *method);
     bool pending = ((MoveNextFn)original_theater_begin_init)(enumerator, (void *)r->rsi);
 
-    if (theater) {
+    if (cc_mem_readable(theater, 0xa0)) {
         void *setting = (void *)load64((char *)theater + 0x98);
-        if (setting) {
+        if (cc_mem_readable(setting, 0x58)) {
             void *mid = (void *)load64((char *)setting + 0x18);
             song = find_song_by_obj(mid);
             if (before == 0) {
-                uint32_t music_id = mid ? load32((char *)mid + 0x10) : 0;
-                int difficulty = (int)load32((char *)setting + 0x50);
-                if (s_gameplay_chart_slot >= 4) difficulty = s_gameplay_chart_slot;
-                else if (s_pending_chart_slot >= 4) difficulty = s_pending_chart_slot;
-                runtime_judgements_begin_stage(music_id, difficulty);
-                s_results_page = 1;
-                s_custom_stage_active = (song != NULL);
-                extern void runtime_tffscores_notify_stage_start(uint32_t music_id, int difficulty);
-                runtime_tffscores_notify_stage_start(music_id, difficulty);
+                if (s_pending_config_stage_start && s_pending_config_setting == setting && !s_stage_context_entered) {
+                    s_pending_config_stage_start = false;
+                    s_pending_config_setting = NULL;
+                    s_custom_stage_active = (song != NULL);
+                    s_non_scoring_stage_active = is_play_setting_non_scoring(setting);
+                } else {
+                    s_pending_config_stage_start = false;
+                    s_pending_config_setting = NULL;
+                    s_stage_context_entered = false;
+                    begin_stage_tracking(setting);
+                }
             }
         }
     }
 
-    if (song && theater && !pending && before >= 0 && (int)(int32_t)load32((char *)theater + 0xc4) == 2) {
+    if (song && cc_mem_readable(theater, 0x218) && !pending && before >= 0 &&
+        (int)(int32_t)load32((char *)theater + 0xc4) == 2) {
         int mode = (int)load32((char *)theater + 0xd0);
         void *camera = (void *)load64((char *)theater + 0x190);
-        if (camera && is_game_104) {
+        if (camera) {
             typedef void (ABI *CamFn)(void *cam, void *method);
-            CamFn set_cam = (CamFn)GUEST(mode == 0 ? 0x2cc8180 : 0x2cc8480);
+            CamFn set_cam = (CamFn)GUEST_CALL(mode == 0 ? 0x2c762e0 : 0x2c765e0,
+                                              mode == 0 ? 0x2cc8180 : 0x2cc8480);
             set_cam(camera, NULL);
         }
         *(bool *)((char *)theater + 0x211) = false;
@@ -2173,6 +2317,9 @@ static ABI int hook_theater_begin_init(HookRegs *r) {
 
 static ABI int hook_theater_finish(HookRegs *r) {
     s_results_page = 1;
+    s_pending_config_stage_start = false;
+    s_pending_config_setting = NULL;
+    s_stage_context_entered = false;
     runtime_slidehold_reset();
     void *theater = (void *)r->rdi;
     if (theater) {
@@ -2224,8 +2371,21 @@ static ABI int hook_input_damage(HookRegs *r) {
 
 static char s_current_play_style[32] = "standard";
 
+const char *runtime_custom_charts_get_play_style(void) {
+    return s_current_play_style[0] ? s_current_play_style : "standard";
+}
+
+static ABI void (*original_play_setting_config)(void *setting, int32_t mode, void *method) = NULL;
+
 static ABI int hook_play_setting_config(HookRegs *r) {
     void *setting = (void *)r->rdi;
+    int32_t mode = (int32_t)r->rsi;
+    void *method = (void *)r->rdx;
+
+    if (original_play_setting_config) {
+        original_play_setting_config(setting, mode, method);
+    }
+
     if (setting) {
         int play_style = *(int32_t *)((char *)setting + 0x54);
         if (play_style == 1) snprintf(s_current_play_style, sizeof(s_current_play_style), "simple");
@@ -2233,7 +2393,10 @@ static ABI int hook_play_setting_config(HookRegs *r) {
         else snprintf(s_current_play_style, sizeof(s_current_play_style), "standard");
         printf("TFFScores: Play style configured: %s (%d)\n", s_current_play_style, play_style);
 
-        int trigger_color = *(int32_t *)((char *)setting + 0x100);
+        /* PlaySetting._triggerColorType (+0xfc, written by PlaySetting::Configuration @ 0x243bbf4):
+         * 0 = Note Skin A (custom note skins enabled), 1 = Note Skin B (vanilla Skin B). */
+        int trigger_color = (*(int32_t *)((char *)setting + 0xfc) == 1) ? 1 : 0;
+        runtime_note_skins_set_color_type(trigger_color);
         runtime_slidehold_set_color_type(trigger_color);
         runtime_slidehold_reset();
 
@@ -2251,10 +2414,16 @@ static ABI int hook_play_setting_config(HookRegs *r) {
                 *(bool *)((char *)setting + off) = false;
             }
         }
+        /* Initialize stage tracking here too so EMS stages (which skip TheaterController) set
+         * s_stage_music_id and judgements cleanly on both v1.0.0 and v1.0.4. */
+        s_stage_context_entered = false;
+        s_pending_config_stage_start = true;
+        s_pending_config_setting = setting;
+        begin_stage_tracking(setting);
     } else {
         runtime_slidehold_reset();
     }
-    return 0;
+    return original_play_setting_config ? 1 : 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2268,24 +2437,24 @@ static ABI int hook_fixed_trigger_judge(HookRegs *r) {
     int32_t hit_time = (int32_t)r->rcx;
 
     /* Manual gameplay SlideHold Start & End must be judged exclusively by our SlideHold
-     * stick tracker (is_internal_judge) or native timeout Miss (judge >= 5). Allow
+     * stick tracker (is_internal_judge) or native timeout Miss (judge >= 6). Allow
      * Auto/Demo mode unconditionally so Auto Play completes SlideHolds cleanly. */
     if (runtime_slidehold_is_start_trigger((int32_t)index) ||
         runtime_slidehold_is_end_trigger((int32_t)index)) {
-        if (judge < 5 && !runtime_slidehold_is_internal_judge() && !runtime_slidehold_is_auto_mode()) {
+        if (judge < 6 && !runtime_slidehold_is_internal_judge() && !runtime_slidehold_is_auto_mode()) {
             return 1;
         }
     }
 
-    if (context && judge > 0 && judge <= 6) {
+    if (!s_non_scoring_stage_active && cc_mem_readable(context, 0x40) && judge > 0 && judge <= 6) {
         void *triggers_list = *(void **)((char *)context + 0x10);
-        if (triggers_list) {
+        if (cc_mem_readable(triggers_list, 0x20)) {
             uint32_t count = *(uint32_t *)((char *)triggers_list + 0x18);
-            if (index < count) {
+            if (index < count && count <= 32768) {
                 void *items_arr = *(void **)((char *)triggers_list + 0x10);
-                if (items_arr) {
+                if (cc_mem_readable(items_arr, 0x20 + ((size_t)index + 1) * sizeof(void *))) {
                     void *trigger = *(void **)((char *)items_arr + 0x20 + index * sizeof(void *));
-                    if (trigger) {
+                    if (cc_mem_readable(trigger, 0x50)) {
                         uint8_t already = *(uint8_t *)((char *)trigger + 0x4c);
                         if (already == 0) {
                             runtime_slidehold_on_native_judge((int32_t)index, (uint8_t)judge, hit_time);
@@ -2297,8 +2466,19 @@ static ABI int hook_fixed_trigger_judge(HookRegs *r) {
                                 if (offset_ms > 300) offset_ms = 300;
                                 else if (offset_ms < -300) offset_ms = -300;
                             }
-                            int is_rainbow = (judge == 1 && abs(offset_ms) <= 17) ? 1 : 0;
-                            runtime_judgements_record(target_time, offset_ms, (int)judge, lane, is_rainbow);
+                            /* Native Judge enum (verified in JudgeTable..cctor @ 0x32d7ec0 & GetTriggerJudge @ 0x32cf930):
+                             *   1 = Rainbow Critical, 2 = Yellow Critical, 3 = Great, 4 = Good, 5 = Bad, 6 = Miss */
+                            int rec_judge = 0;
+                            int is_rainbow = 0;
+                            if (judge == 1)      { rec_judge = JUDGE_CRITICAL; is_rainbow = 1; }
+                            else if (judge == 2) { rec_judge = JUDGE_CRITICAL; is_rainbow = 0; }
+                            else if (judge == 3) { rec_judge = JUDGE_GREAT;    is_rainbow = 0; }
+                            else if (judge == 4) { rec_judge = JUDGE_GOOD;     is_rainbow = 0; }
+                            else if (judge == 5) { rec_judge = JUDGE_BAD;      is_rainbow = 0; }
+                            else if (judge == 6) { rec_judge = JUDGE_MISS;     is_rainbow = 0; }
+                            if (rec_judge > 0) {
+                                runtime_judgements_record(target_time, offset_ms, rec_judge, lane, is_rainbow);
+                            }
                         }
                     }
                 }
@@ -2312,29 +2492,48 @@ static ABI int (*original_need_update_best_score)(void *this);
 static void *s_title_parts_main = NULL;
 static void *s_best_play_display = NULL;
 
-static void check_and_notify_damage_pb(void *play_data) {
-    if (!is_game_104) return;
-    if (!play_data) {
-        /* Singleton<MusicResultDataManager>.Instance (TypeInfo 0x609cde0) */
-        void *mgr_klass = resolve_typeinfo(0x609cde0);
-        void *mgr_statics = mgr_klass ? (void *)load64((char *)mgr_klass + 0xb8) : NULL;
-        void *mgr = mgr_statics ? (void *)load64((char *)mgr_statics) : NULL;
-        play_data = mgr;
-    }
-    if (!play_data) return;
+static void *get_result_play_data(uint32_t *out_score, bool *out_can_save) {
+    if (out_score) *out_score = 0;
+    if (out_can_save) *out_can_save = false;
 
-    void *bpd_klass = resolve_typeinfo(0x6098f98); /* BeforePlayData_TypeInfo */
-    void *bpd_statics = bpd_klass ? (void *)load64((char *)bpd_klass + 0xb8) : NULL;
-    if (!bpd_statics) return;
+    void *mgr_klass = resolve_typeinfo(0x609bb48, 0x609cde0);
+    if (!cc_mem_readable(mgr_klass, 0xc0)) return NULL;
+    void *mgr_statics = (void *)load64((char *)mgr_klass + 0xb8);
+    if (!cc_mem_readable(mgr_statics, 8)) return NULL;
+    void *play_data = (void *)load64((char *)mgr_statics);
+    if (!cc_mem_readable(play_data, 0xc0)) return NULL;
 
-    uint8_t need_save_damage = *(uint8_t *)((char *)play_data + 0x84);
     uint8_t is_not_save = *(uint8_t *)((char *)play_data + 0xbc);
     uint8_t is_demo_or_auto = *(uint8_t *)((char *)play_data + 0xbd);
+    int32_t raw_score = (int32_t)load32((char *)play_data + 0x50);
+    if (out_score) *out_score = (raw_score > 0) ? (uint32_t)raw_score : 0u;
+    if (out_can_save) {
+        *out_can_save = !s_non_scoring_stage_active && is_not_save == 0 && is_demo_or_auto == 0;
+    }
+    return play_data;
+}
+
+static void check_and_notify_damage_pb(void *play_data) {
+    bool can_save = false;
+    if (!play_data) {
+        play_data = get_result_play_data(NULL, &can_save);
+    } else if (cc_mem_readable(play_data, 0xc0)) {
+        uint8_t is_not_save = *(uint8_t *)((char *)play_data + 0xbc);
+        uint8_t is_demo_or_auto = *(uint8_t *)((char *)play_data + 0xbd);
+        can_save = !s_non_scoring_stage_active && is_not_save == 0 && is_demo_or_auto == 0;
+    }
+    if (!can_save || !cc_mem_readable(play_data, 0xc0)) return;
+
+    void *bpd_klass = resolve_typeinfo(0x6097d00, 0x6098f98); /* BeforePlayData_TypeInfo */
+    if (!cc_mem_readable(bpd_klass, 0xc0)) return;
+    void *bpd_statics = (void *)load64((char *)bpd_klass + 0xb8);
+    if (!cc_mem_readable(bpd_statics, 0x30)) return;
+
+    uint8_t need_save_damage = *(uint8_t *)((char *)play_data + 0x84);
     int32_t cur_damage = (int32_t)load32((char *)play_data + 0x80);
     int32_t prev_max_damage = (int32_t)load32((char *)bpd_statics + 0x2c);
 
-    if (need_save_damage != 0 && is_not_save == 0 && is_demo_or_auto == 0 &&
-        cur_damage > 0 && cur_damage > prev_max_damage) {
+    if (need_save_damage != 0 && cur_damage > 0 && cur_damage > prev_max_damage) {
         extern void runtime_tffscores_notify_damage_pb(int is_pb);
         runtime_tffscores_notify_damage_pb(1);
     }
@@ -2346,18 +2545,41 @@ static ABI int hook_need_update_best_score(HookRegs *r) {
     int is_new_best = original_need_update_best_score((void *)r->rdi);
     r->rax = (uint64_t)is_new_best;
 
-    runtime_judgements_finish_stage(0, is_new_best != 0);
-    extern void runtime_tffscores_notify_score_pb(int is_pb);
-    runtime_tffscores_notify_score_pb(is_new_best != 0);
-    check_and_notify_damage_pb(NULL);
+    uint32_t stage_score = 0;
+    bool can_save = false;
+    (void)get_result_play_data(&stage_score, &can_save);
+
+    int32_t prev_best = 0;
+    void *bpd_klass = resolve_typeinfo(0x6097d00, 0x6098f98);
+    if (cc_mem_readable(bpd_klass, 0xc0)) {
+        void *bpd_statics = (void *)load64((char *)bpd_klass + 0xb8);
+        if (cc_mem_readable(bpd_statics, 4)) {
+            prev_best = (int32_t)load32(bpd_statics);
+        }
+    }
+
+    bool genuine_best = can_save && (is_new_best != 0) && (stage_score > 0) &&
+                        (prev_best <= 0 || stage_score > (uint32_t)prev_best);
+
+    runtime_judgements_finish_stage(stage_score, genuine_best);
+    if (s_result_notified_seq != s_stage_run_seq || genuine_best) {
+        s_result_notified_seq = s_stage_run_seq;
+        extern void runtime_tffscores_notify_score_pb(int is_pb);
+        runtime_tffscores_notify_score_pb(genuine_best ? 1 : 0);
+        check_and_notify_damage_pb(NULL);
+    }
     return 1;
 }
 
 static ABI int hook_title_parts_init(HookRegs *r) {
     s_title_parts_main = (void *)r->rdi;
     s_results_page = 1;
-    runtime_judgements_ensure_stage_finished(0);
-    check_and_notify_damage_pb(NULL);
+    uint32_t stage_score = 0;
+    (void)get_result_play_data(&stage_score, NULL);
+    runtime_judgements_ensure_stage_finished(stage_score);
+    if (s_result_notified_seq != s_stage_run_seq) {
+        check_and_notify_damage_pb(NULL);
+    }
     return 0;
 }
 
@@ -2411,10 +2633,9 @@ typedef void (ABI *TexApplyFn)(void *self, bool updateMip, bool makeUnreadable, 
 typedef void (ABI *GummiPlayFn)(void *anim, void *param_arr, void *method);
 
 static bool uobj_alive(const void *obj) {
-    if (!obj) return false;
-    uintptr_t p = (uintptr_t)obj;
-    if (p < 0x10000ULL || p > 0x00007fffffffffffULL) return false;
-    return load64((const char *)obj + 0x10) != 0;
+    if (!cc_mem_readable(obj, 0x18)) return false;
+    uint64_t native_ptr = load64((const char *)obj + 0x10);
+    return native_ptr != 0 && runtime_host_is_readable((const void *)(uintptr_t)native_ptr, 8) != 0;
 }
 
 /* Reusable alternating Il2Cpp System.String pair so UI.Text::set_text never short-circuits */
@@ -2887,7 +3108,7 @@ static void rasterize_judgement_graph_rgba(uint8_t *buf) {
         int miss_y1 = (int)(cy + max_y_dev * 0.80f);
 
         for (size_t i = 0; i < note_count; ++i) {
-            if (notes[i].judge < 6) continue;
+            if (notes[i].judge < 5) continue;
             float fx = (float)(px0 + 6) + ((float)notes[i].target_ms / (float)duration) * (plot_w - 12.0f);
             if (fx < (float)(px0 + 3)) fx = (float)(px0 + 3);
             if (fx > (float)(px1 - 4)) fx = (float)(px1 - 4);
@@ -2897,7 +3118,7 @@ static void rasterize_judgement_graph_rgba(uint8_t *buf) {
 
         for (size_t i = 0; i < note_count; ++i) {
             const JudgementNote *n = &notes[i];
-            if (n->judge >= 6 || n->judge == 0) continue;
+            if (n->judge >= 5 || n->judge == 0) continue;
             float fx = (float)(px0 + 6) + ((float)n->target_ms / (float)duration) * (plot_w - 12.0f);
             if (fx < (float)(px0 + 4)) fx = (float)(px0 + 4);
             if (fx > (float)(px1 - 5)) fx = (float)(px1 - 5);
@@ -2908,17 +3129,7 @@ static void rasterize_judgement_graph_rgba(uint8_t *buf) {
             float fy = cy + (off / 120.0f) * max_y_dev;
 
             uint8_t cr = 255, cg = 255, cb = 255;
-            if ((n->flags & 1) || n->judge == 1) {
-                cr = 255; cg = 255; cb = 255; /* Rainbow Critical: White */
-            } else if (n->judge == 2) {
-                cr = 255; cg = 215; cb = 0;   /* Gold Critical: Gold */
-            } else if (n->judge == 3) {
-                cr = 255; cg = 140; cb = 0;   /* Great: Orange */
-            } else if (n->judge == 4) {
-                cr = 50;  cg = 205; cb = 50;  /* Good: Green */
-            } else if (n->judge == 5) {
-                cr = 155; cg = 115; cb = 225; /* Bad: Purple */
-            }
+            runtime_judgements_judge_color(n->judge, n->flags, &cr, &cg, &cb);
             graph_draw_aa_disc(buf, fx, fy, 3.1f, cr, cg, cb);
         }
     }
@@ -3060,22 +3271,26 @@ static void refresh_page3_leaderboard_rows(void) {
     SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
     SetColorFn set_color = (SetColorFn)GUEST_CALL(0x2cbec60, 0x2ce3d30);
 
+    s_lb_rendered_rev = runtime_leaderboard_get_revision();
     size_t lb_count = runtime_leaderboard_get_count();
     int scroll_val = runtime_leaderboard_get_scroll();
     size_t scroll = (scroll_val > 0) ? (size_t)scroll_val : 0;
-    s_lb_rendered_rev = runtime_leaderboard_get_revision();
 
     if (uobj_alive(s_lb_txt_empty)) {
         if (lb_count == 0) {
             uint32_t cur_mid = 0;
             runtime_judgements_get_song_info(&cur_mid, NULL, NULL);
-            if (runtime_custom_charts_is_custom_id(cur_mid)) {
-                ugui_set_text_str(s_lb_txt_empty, &s_ds_lb_empty,
-                                  "Custom Chart (Local Only - TFFScores Disabled)");
-            } else {
-                ugui_set_text_str(s_lb_txt_empty, &s_ds_lb_empty,
-                                  "Fetching leaderboard scores...");
+            LeaderboardStatus lb_status = runtime_leaderboard_get_status();
+            const char *msg = "Fetching leaderboard scores...";
+            if (lb_status == LB_STATUS_LOCAL_ONLY ||
+                (runtime_custom_charts_is_custom_id(cur_mid) && !runtime_custom_charts_is_verified_id(cur_mid))) {
+                msg = "Custom Chart (Local Only - TFFScores Disabled)";
+            } else if (lb_status == LB_STATUS_EMPTY) {
+                msg = "No scores on TFFScores yet.";
+            } else if (lb_status == LB_STATUS_ERROR) {
+                msg = "TFFScores leaderboard unavailable.";
             }
+            ugui_set_text_str(s_lb_txt_empty, &s_ds_lb_empty, msg);
         }
         GetGOPtrFn get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
         void *ego = get_go(s_lb_txt_empty, NULL);
@@ -3539,16 +3754,16 @@ static void hide_page3_custom_ui(void) {
 
 /* Replay native ContentDetail_In slide-in animation on detail_parts_main->_animation */
 static void play_page3_slide_in_anim(void *detail_parts_main) {
-    if (!detail_parts_main) return;
+    if (!cc_mem_readable(detail_parts_main, 0xa0)) return;
     void *anim = *(void **)((char *)detail_parts_main + 0x98);
     if (!uobj_alive(anim)) return;
     s_detail_anim = anim;
 
     void *klass = object_class(detail_parts_main);
-    if (!klass) return;
+    if (!cc_mem_readable(klass, 0xc0)) return;
     if (il2cpp_runtime_class_init_fn) il2cpp_runtime_class_init_fn(klass);
     void *static_fields = (void *)load64((const char *)klass + 0xb8);
-    if (!static_fields) return;
+    if (!cc_mem_readable(static_fields, 0x28)) return;
 
     if (!s_anim_in_arr) {
         s_anim_in_arr = runtime_low_alloc(0x50);
@@ -3567,35 +3782,49 @@ static void play_page3_slide_in_anim(void *detail_parts_main) {
  * then restore the normal closing-details SE once on Page 3 so closing Page 3 plays HideDetail SE. */
 static void *s_swapped_hide_btns[8];
 static void *s_orig_hide_se_labels[8];
+static uint32_t s_swapped_hide_btn_pins[8];
+static uint32_t s_orig_hide_se_pins[8];
 static int s_swapped_hide_count = 0;
 
 static void set_page2_triangle_open_se(void *detail_parts_main, bool use_open_se) {
     if (!use_open_se) {
         for (int i = 0; i < s_swapped_hide_count; ++i) {
             void *btn = s_swapped_hide_btns[i];
-            if (btn && (uintptr_t)btn > 0x10000ULL && (uintptr_t)btn < 0x00007fffffffffffULL) {
-                put64((char *)btn + 0x28, (uint64_t)s_orig_hide_se_labels[i]);
+            void *orig_lbl = s_orig_hide_se_labels[i];
+            if (cc_mem_readable(btn, 0x30) && (!orig_lbl || cc_mem_readable(orig_lbl, 0x18))) {
+                put64((char *)btn + 0x28, (uint64_t)orig_lbl);
             }
+            if (s_swapped_hide_btn_pins[i]) {
+                gc_unpin(s_swapped_hide_btn_pins[i]);
+                s_swapped_hide_btn_pins[i] = 0;
+            }
+            if (s_orig_hide_se_pins[i]) {
+                gc_unpin(s_orig_hide_se_pins[i]);
+                s_orig_hide_se_pins[i] = 0;
+            }
+            s_swapped_hide_btns[i] = NULL;
+            s_orig_hide_se_labels[i] = NULL;
         }
         s_swapped_hide_count = 0;
         return;
     }
-    if (!detail_parts_main) return;
+    if (!cc_mem_readable(detail_parts_main, 0xa0)) return;
     set_page2_triangle_open_se(NULL, false);
 
     void *ui_btns = *(void **)((char *)detail_parts_main + 0x90);
-    if (!ui_btns) return;
+    if (!cc_mem_readable(ui_btns, 0x20)) return;
     uint32_t len = load32((char *)ui_btns + 0x18);
     if (len == 0 || len > 32) return;
+    if (!cc_mem_readable(ui_btns, 0x20 + (size_t)len * sizeof(void *))) return;
 
     void *open_se_label = NULL;
     for (uint32_t i = 0; i < len; ++i) {
         void *btn = *(void **)((char *)ui_btns + 0x20 + i * sizeof(void *));
-        if (!btn) continue;
+        if (!cc_mem_readable(btn, 0x30)) continue;
         int32_t val = (int32_t)load32((char *)btn + 0x20);
         if (val == 1) { /* DisplayDetail */
             void *lbl = (void *)load64((char *)btn + 0x28);
-            if (lbl) {
+            if (cc_mem_readable(lbl, 0x18)) {
                 open_se_label = lbl;
                 break;
             }
@@ -3605,11 +3834,14 @@ static void set_page2_triangle_open_se(void *detail_parts_main, bool use_open_se
 
     for (uint32_t i = 0; i < len && s_swapped_hide_count < 8; ++i) {
         void *btn = *(void **)((char *)ui_btns + 0x20 + i * sizeof(void *));
-        if (!btn) continue;
+        if (!cc_mem_readable(btn, 0x30)) continue;
         int32_t val = (int32_t)load32((char *)btn + 0x20);
         if (val == 2) { /* HideDetail */
+            void *orig_lbl = (void *)load64((char *)btn + 0x28);
             s_swapped_hide_btns[s_swapped_hide_count] = btn;
-            s_orig_hide_se_labels[s_swapped_hide_count] = (void *)load64((char *)btn + 0x28);
+            s_orig_hide_se_labels[s_swapped_hide_count] = orig_lbl;
+            s_swapped_hide_btn_pins[s_swapped_hide_count] = gc_pin(btn, false);
+            s_orig_hide_se_pins[s_swapped_hide_count] = orig_lbl ? gc_pin(orig_lbl, false) : 0;
             put64((char *)btn + 0x28, (uint64_t)open_se_label);
             ++s_swapped_hide_count;
         }
@@ -3619,7 +3851,9 @@ static void set_page2_triangle_open_se(void *detail_parts_main, bool use_open_se
 static ABI int hook_result_detail_init(HookRegs *r) {
     void *detail_parts_main = (void *)r->rdi;
     s_results_page = 1;
-    runtime_judgements_ensure_stage_finished(0);
+    uint32_t stage_score = 0;
+    (void)get_result_play_data(&stage_score, NULL);
+    runtime_judgements_ensure_stage_finished(stage_score);
     set_page2_triangle_open_se(NULL, false);
     if (detail_parts_main != s_page3_owner) {
         s_page3_owner = NULL;
@@ -3632,15 +3866,33 @@ static ABI int hook_result_detail_init(HookRegs *r) {
     return 0;
 }
 
+static ABI int hook_countup_on_end(HookRegs *r) {
+    (void)r;
+    runtime_tffscores_on_song_result_finish();
+    return 0;
+}
+
+static ABI int hook_retry_window_open(HookRegs *r) {
+    (void)r;
+    runtime_tffscores_trigger_immediate_screenshot();
+    return 0;
+}
+
 static ABI int hook_move_next_scene(HookRegs *r) {
     (void)r;
+    runtime_tffscores_trigger_immediate_screenshot();
+    runtime_tffscores_on_song_result_finish();
     s_results_page = 1;
+    s_pending_config_stage_start = false;
+    s_pending_config_setting = NULL;
+    s_stage_context_entered = false;
     set_page2_triangle_open_se(NULL, false);
     return 0;
 }
 
 static ABI int hook_gummi_anim_update(HookRegs *r) {
-    if (s_results_page == 3 && s_detail_anim && (void *)r->rdi == s_detail_anim) {
+    (void)r;
+    if (s_results_page == 3 && uobj_alive(s_lb_root_go)) {
         if (runtime_leaderboard_get_revision() != s_lb_rendered_rev) {
             refresh_page3_leaderboard_rows();
         }
@@ -3867,12 +4119,12 @@ static void *cda_create_texture2d_rgba(const uint8_t *rgba, int width, int heigh
     ensure_il2cpp_api();
     if (!rgba || width <= 0 || height <= 0 || !s_texture2d_class) return NULL;
 
-    TexCtorFn tex_ctor = (TexCtorFn)GUEST(0x39d63f0);
-    TexSetIntFn set_filter = (TexSetIntFn)GUEST(0x39d39f0);
-    TexSetIntFn set_wrap = (TexSetIntFn)GUEST(0x39d3940);
-    TexLoadRawFn load_raw = (TexLoadRawFn)GUEST(0x39d72c0);
-    TexApplyFn apply = (TexApplyFn)GUEST(0x39d7540);
-    SetObjNameFn set_name = (SetObjNameFn)GUEST(0x1dceb60);
+    TexCtorFn tex_ctor = (TexCtorFn)GUEST_CALL(0x39e2dd0, 0x39d63f0);
+    TexSetIntFn set_filter = (TexSetIntFn)GUEST_CALL(0x39e03d0, 0x39d39f0);
+    TexSetIntFn set_wrap = (TexSetIntFn)GUEST_CALL(0x39e0320, 0x39d3940);
+    TexLoadRawFn load_raw = (TexLoadRawFn)GUEST_CALL(0x39e3ca0, 0x39d72c0);
+    TexApplyFn apply = (TexApplyFn)GUEST_CALL(0x39e3f20, 0x39d7540);
+    SetObjNameFn set_name = (SetObjNameFn)GUEST_CALL(0x1e2db30, 0x1dceb60);
 
     void *tex = alloc_managed_object(s_texture2d_class);
     if (!tex) return NULL;
@@ -3896,8 +4148,8 @@ static void *cda_create_sprite_rgba(const uint8_t *rgba, int width, int height,
     void *tex = cda_create_texture2d_rgba(rgba, width, height, NULL);
     if (!tex) return NULL;
 
-    SpriteCreateFullFn spr_create = (SpriteCreateFullFn)GUEST(0x1dddde0);
-    SetObjNameFn set_name = (SetObjNameFn)GUEST(0x1dceb60);
+    SpriteCreateFullFn spr_create = (SpriteCreateFullFn)GUEST_CALL(0x1e3cdb0, 0x1dddde0);
+    SetObjNameFn set_name = (SetObjNameFn)GUEST_CALL(0x1e2db30, 0x1dceb60);
     void *spr = spr_create(tex, rect, pivot, ppu, 0, 0, border, false, NULL);
     if (!spr) return NULL;
     (void)gc_pin(spr, false);
@@ -4114,21 +4366,17 @@ void runtime_gc_unpin_obj(uint32_t handle) {
     gc_unpin(handle);
 }
 
-static inline bool cc_valid_ptr(const void *p) {
-    uintptr_t u = (uintptr_t)p;
-    return u >= 0x10000ULL && u <= 0x00007fffffffffffULL && (u & 1ULL) == 0;
-}
-
 static void *cda_get_comp(void *go, const char *full_name, const char *short_name);
 
 bool runtime_object_name_equals(void *obj, const char *ascii_name) {
     if (!unity_native_alive(obj) || !ascii_name) return false;
     typedef void *(ABI *GetObjNameFn)(void *o, void *method);
-    void *str = ((GetObjNameFn)GUEST(0x1dcea80))(obj, NULL);
-    if (!cc_valid_ptr(str)) return false;
+    void *str = ((GetObjNameFn)GUEST_CALL(0x1e2da50, 0x1dcea80))(obj, NULL);
+    if (!cc_mem_readable(str, 0x18)) return false;
     int32_t slen = *(const int32_t *)((const char *)str + 0x10);
     size_t tlen = strlen(ascii_name);
     if (slen != (int32_t)tlen) return false;
+    if (slen > 0 && !cc_mem_readable(str, 0x14 + (size_t)slen * sizeof(uint16_t))) return false;
     const uint16_t *wchars = (const uint16_t *)((const char *)str + 0x14);
     for (int32_t i = 0; i < slen; ++i) {
         if (wchars[i] != (uint16_t)(unsigned char)ascii_name[i]) return false;
@@ -4141,8 +4389,10 @@ typedef struct {
     void *src_mat;
     void *tex;
     void *cloned_mat;
+    uint32_t pin;
 } ShMatTexCache;
 static ShMatTexCache s_sh_mat_tex_cache[16];
+static int s_sh_mat_tex_evict = 0;
 
 void *runtime_clone_material_with_main_tex(void *src_mat, void *tex) {
     if (!unity_native_alive(src_mat) || !unity_native_alive(tex)) return src_mat;
@@ -4161,20 +4411,28 @@ void *runtime_clone_material_with_main_tex(void *src_mat, void *tex) {
     if (!s_sh_mat_class) return src_mat;
     void *mat = alloc_managed_object(s_sh_mat_class);
     if (!mat) return src_mat;
-    (void)gc_pin(mat, false);
+    uint32_t pin = gc_pin(mat, false);
     typedef void (ABI *MatCtorFn)(void *self, void *source, void *method);
     typedef void (ABI *MatSetTexFn)(void *self, void *val, void *method);
-    ((MatCtorFn)GUEST(0xe11330))(mat, src_mat, NULL);
-    ((MatSetTexFn)GUEST(0xe11d00))(mat, tex, NULL);
+    ((MatCtorFn)GUEST_CALL(0xe07100, 0xe11330))(mat, src_mat, NULL);
+    ((MatSetTexFn)GUEST_CALL(0xe07ad0, 0xe11d00))(mat, tex, NULL);
     protect_cached_unity_object(mat);
+    int slot_idx = -1;
     for (int i = 0; i < 16; ++i) {
         if (!unity_native_alive(s_sh_mat_tex_cache[i].cloned_mat)) {
-            s_sh_mat_tex_cache[i].src_mat = src_mat;
-            s_sh_mat_tex_cache[i].tex = tex;
-            s_sh_mat_tex_cache[i].cloned_mat = mat;
+            slot_idx = i;
             break;
         }
     }
+    if (slot_idx < 0) {
+        slot_idx = s_sh_mat_tex_evict;
+        s_sh_mat_tex_evict = (s_sh_mat_tex_evict + 1) & 15;
+    }
+    gc_unpin(s_sh_mat_tex_cache[slot_idx].pin);
+    s_sh_mat_tex_cache[slot_idx].src_mat = src_mat;
+    s_sh_mat_tex_cache[slot_idx].tex = tex;
+    s_sh_mat_tex_cache[slot_idx].cloned_mat = mat;
+    s_sh_mat_tex_cache[slot_idx].pin = pin;
     return mat;
 }
 
@@ -4195,12 +4453,13 @@ void *runtime_clone_gradient_solid_color(void *src_grad, float r, float g, float
     typedef void     (ABI *GradSetModeFn)(void *self, int32_t mode, void *method);
     typedef void     (ABI *GradSetKeysFn)(void *self, void *ck, void *ak, void *method);
 
-    void *ck = ((GradGetKeysFn)GUEST(0x39e62b0))(src_grad, NULL);
-    void *ak = ((GradGetKeysFn)GUEST(0x39e6360))(src_grad, NULL);
-    if (!cc_valid_ptr(ck) || !cc_valid_ptr(ak)) return NULL;
+    void *ck = ((GradGetKeysFn)GUEST_CALL(0x39f2c90, 0x39e62b0))(src_grad, NULL);
+    void *ak = ((GradGetKeysFn)GUEST_CALL(0x39f2d40, 0x39e6360))(src_grad, NULL);
+    if (!cc_mem_readable(ck, 0x20) || !cc_mem_readable(ak, 0x20)) return NULL;
 
     int32_t ck_cnt = *(const int32_t *)((const char *)ck + 0x18);
     if (ck_cnt <= 0 || ck_cnt > 16) return NULL;
+    if (!cc_mem_readable(ck, 0x20 + (size_t)ck_cnt * 20u)) return NULL;
     bool all_white = true;
     for (int32_t i = 0; i < ck_cnt; ++i) {
         const float *key_rgba = (const float *)((const char *)ck + 0x20 + (size_t)i * 20u);
@@ -4221,16 +4480,16 @@ void *runtime_clone_gradient_solid_color(void *src_grad, float r, float g, float
 
     void *dst = alloc_managed_object(s_sh_gradient_class);
     if (!dst) return NULL;
-    ((GradCtorFn)GUEST(0x39e6090))(dst, NULL);
-    ((GradSetModeFn)GUEST(0x39e6460))(dst, ((GradGetModeFn)GUEST(0x39e6410))(src_grad, NULL), NULL);
-    ((GradSetKeysFn)GUEST(0x39e64c0))(dst, ck, ak, NULL);
+    ((GradCtorFn)GUEST_CALL(0x39f2a70, 0x39e6090))(dst, NULL);
+    ((GradSetModeFn)GUEST_CALL(0x39f2e40, 0x39e6460))(dst, ((GradGetModeFn)GUEST_CALL(0x39f2df0, 0x39e6410))(src_grad, NULL), NULL);
+    ((GradSetKeysFn)GUEST_CALL(0x39f2ea0, 0x39e64c0))(dst, ck, ak, NULL);
     (void)gc_pin(dst, false);
     return dst;
 }
 
 void *runtime_get_particle_system_renderer(void *ps) {
     if (!unity_native_alive(ps)) return NULL;
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
     void *go = comp_get_go(ps, NULL);
     return unity_native_alive(go) ? cda_get_comp(go, "UnityEngine.ParticleSystemRenderer", "ParticleSystemRenderer") : NULL;
 }
@@ -4251,7 +4510,7 @@ void *runtime_clone_material_raw(void *src_mat) {
     if (!mat) return NULL;
     (void)gc_pin(mat, false);
     typedef void (ABI *MatCtorFn)(void *self, void *source, void *method);
-    ((MatCtorFn)GUEST(0xe11330))(mat, src_mat, NULL);
+    ((MatCtorFn)GUEST_CALL(0xe07100, 0xe11330))(mat, src_mat, NULL);
     protect_cached_unity_object(mat);
     return mat;
 }
@@ -4318,16 +4577,16 @@ uint8_t *runtime_extract_texture_rgba(void *tex, int *out_w, int *out_h) {
     uint8_t *out = NULL;
     if (tmp) {
         uint32_t pin = gc_pin(tmp, false);
-        TexCtorFn tex_ctor = (TexCtorFn)GUEST(0x39d63f0);
+        TexCtorFn tex_ctor = (TexCtorFn)GUEST_CALL(0x39e2dd0, 0x39d63f0);
         tex_ctor(tmp, w, h, 4 /* RGBA32 */, false, NULL);
         UGuiRect r = {0.0f, 0.0f, (float)w, (float)h};
         ((ReadPixFn)m_read_pix->pointer)(tmp, r, 0, 0, false, m_read_pix);
         void *arr = ((GetP32Fn)m_get_p32->pointer)(tmp, m_get_p32);
-        if (cc_valid_ptr(arr)) {
+        if (cc_mem_readable(arr, 0x20)) {
             int32_t len = *(const int32_t *)((const char *)arr + 0x18);
             size_t total = (size_t)w * (size_t)h;
-            if ((size_t)len >= total) {
-                size_t bytes = total * 4u;
+            size_t bytes = total * 4u;
+            if (len > 0 && (size_t)len >= total && cc_mem_readable((const char *)arr + 0x20, bytes)) {
                 out = (uint8_t *)malloc(bytes);
                 if (out) {
                     memcpy(out, (const char *)arr + 0x20, bytes);
@@ -4367,16 +4626,16 @@ void *runtime_create_child_sprite_renderer(void *base_sr, void *parent_tr, const
     typedef void *(ABI *GetMatFn)(void *rend, void *method);
     typedef void (ABI *SetMatFn)(void *rend, void *mat, void *method);
 
-    GoCtorFn go_ctor       = (GoCtorFn)GUEST(0x1dcab80);
-    GetTypeFn get_type     = (GetTypeFn)GUEST(0x371b7d0);
-    AddCompFn add_comp     = (AddCompFn)GUEST(0x1dca3a0);
-    GoGetTrFn go_get_tr    = (GoGetTrFn)GUEST(0x1dca400);
-    SetParentFn set_parent = (SetParentFn)GUEST(0x1dd90a0);
-    CompGetGoFn comp_go    = (CompGetGoFn)GUEST(0x1dc8910);
-    GetLayerFn get_layer   = (GetLayerFn)GUEST(0x1dca450);
-    SetLayerFn set_layer   = (SetLayerFn)GUEST(0x1dca4a0);
-    GetMatFn get_mat       = (GetMatFn)GUEST(0x0e09be0);
-    SetMatFn set_mat       = (SetMatFn)GUEST(0x0e09c30);
+    GoCtorFn go_ctor       = (GoCtorFn)GUEST_CALL(0x1e29b50, 0x1dcab80);
+    GetTypeFn get_type     = (GetTypeFn)GUEST_CALL(0x36d5fd0, 0x371b7d0);
+    AddCompFn add_comp     = (AddCompFn)GUEST_CALL(0x1e29370, 0x1dca3a0);
+    GoGetTrFn go_get_tr    = (GoGetTrFn)GUEST_CALL(0x1e293d0, 0x1dca400);
+    SetParentFn set_parent = (SetParentFn)GUEST_CALL(0x1e38070, 0x1dd90a0);
+    CompGetGoFn comp_go    = (CompGetGoFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetLayerFn get_layer   = (GetLayerFn)GUEST_CALL(0x1e29420, 0x1dca450);
+    SetLayerFn set_layer   = (SetLayerFn)GUEST_CALL(0x1e29470, 0x1dca4a0);
+    GetMatFn get_mat       = (GetMatFn)GUEST_CALL(0x0dff9b0, 0x0e09be0);
+    SetMatFn set_mat       = (SetMatFn)GUEST_CALL(0x0dffa00, 0x0e09c30);
 
     void *sr_type = get_type(base_sr, NULL);
     if (!sr_type) return NULL;
@@ -4467,16 +4726,16 @@ static void cda_read_sprite_metrics(void *source_spr, int fallback_w, int fallba
     typedef float (ABI *GetPpuFn)(void *spr, void *method);
     typedef UGuiRect (ABI *GetSprRectFn)(void *spr, void *method);
 
-    UGuiVec2 piv = ((GetPivotFn)GUEST(0x1dde3e0))(source_spr, NULL);
-    UGuiRect r = ((GetSprRectFn)GUEST(0x1dde060))(source_spr, NULL);
+    UGuiVec2 piv = ((GetPivotFn)GUEST_CALL(0x1e3d3b0, 0x1dde3e0))(source_spr, NULL);
+    UGuiRect r = ((GetSprRectFn)GUEST_CALL(0x1e3d030, 0x1dde060))(source_spr, NULL);
     float w = (r.w > 0.0f) ? r.w : (float)fallback_w;
     float h = (r.h > 0.0f) ? r.h : (float)fallback_h;
     if (w > 0.0f && h > 0.0f) {
         out_pivot->x = piv.x / w;
         out_pivot->y = piv.y / h;
     }
-    *out_border = ((GetBorderFn)GUEST(0x1dde150))(source_spr, NULL);
-    float ppu = ((GetPpuFn)GUEST(0x1dde2f0))(source_spr, NULL);
+    *out_border = ((GetBorderFn)GUEST_CALL(0x1e3d120, 0x1dde150))(source_spr, NULL);
+    float ppu = ((GetPpuFn)GUEST_CALL(0x1e3d2c0, 0x1dde2f0))(source_spr, NULL);
     if (ppu > 0.0f) *out_ppu = ppu;
 }
 
@@ -4487,6 +4746,7 @@ typedef struct {
 } CdaSpriteVariantCacheEntry;
 
 static CdaSpriteVariantCacheEntry s_cda_variant_cache[64];
+static int s_cda_variant_evict_idx = 0;
 
 static void *cda_blue_variant(void *source_spr, int slot) {
     if (!unity_native_alive(source_spr) || (slot != 4 && slot != 5)) return source_spr;
@@ -4498,7 +4758,7 @@ static void *cda_blue_variant(void *source_spr, int slot) {
         }
     }
 
-    GetObjNameFn get_name = (GetObjNameFn)GUEST(0x1dcea80);
+    GetObjNameFn get_name = (GetObjNameFn)GUEST_CALL(0x1e2da50, 0x1dcea80);
     char name[128] = {0};
     read_guest_string(get_name(source_spr, NULL), name, sizeof(name));
     void *out_spr = source_spr;
@@ -4534,7 +4794,10 @@ static void *cda_blue_variant(void *source_spr, int slot) {
                 break;
             }
         }
-        if (slot_idx < 0) slot_idx = 0;
+        if (slot_idx < 0) {
+            slot_idx = s_cda_variant_evict_idx;
+            s_cda_variant_evict_idx = (s_cda_variant_evict_idx + 1) & 63;
+        }
         s_cda_variant_cache[slot_idx].source_spr = source_spr;
         s_cda_variant_cache[slot_idx].slot = slot;
         s_cda_variant_cache[slot_idx].result_spr = out_spr;
@@ -4566,9 +4829,11 @@ typedef struct {
     void *img;
     void *orig_sprite;
     UGuiVec2 orig_size;
+    uint32_t orig_pin;
 } CdaOrigImageEntry;
 
 static CdaOrigImageEntry s_cda_orig_ind_imgs[64];
+static size_t s_cda_orig_evict_idx = 0;
 
 static void cda_remember_orig_sprite(CdaOrigImageEntry *table, size_t cap, void *img, void *spr, UGuiVec2 sz) {
     if (!uobj_alive(img) || !unity_native_alive(spr)) return;
@@ -4577,7 +4842,7 @@ static void cda_remember_orig_sprite(CdaOrigImageEntry *table, size_t cap, void 
             return;
         }
     }
-    GetObjNameFn get_name = (GetObjNameFn)GUEST(0x1dcea80);
+    GetObjNameFn get_name = (GetObjNameFn)GUEST_CALL(0x1e2da50, 0x1dcea80);
     char nm[128] = {0};
     read_guest_string(get_name(spr, NULL), nm, sizeof(nm));
     if (!strncmp(nm, "FBL.CustomDifficulty/", 21)) return;
@@ -4585,8 +4850,9 @@ static void cda_remember_orig_sprite(CdaOrigImageEntry *table, size_t cap, void 
     for (size_t i = 0; i < cap; ++i) {
         if (table[i].img == img) {
             if (!unity_native_alive(table[i].orig_sprite)) {
+                gc_unpin(table[i].orig_pin);
                 table[i].orig_sprite = spr;
-                (void)gc_pin(spr, false);
+                table[i].orig_pin = gc_pin(spr, false);
                 table[i].orig_size = sz;
             }
             return;
@@ -4594,12 +4860,22 @@ static void cda_remember_orig_sprite(CdaOrigImageEntry *table, size_t cap, void 
     }
     for (size_t i = 0; i < cap; ++i) {
         if (!uobj_alive(table[i].img)) {
+            gc_unpin(table[i].orig_pin);
             table[i].img = img;
             table[i].orig_sprite = spr;
-            (void)gc_pin(spr, false);
+            table[i].orig_pin = gc_pin(spr, false);
             table[i].orig_size = sz;
             return;
         }
+    }
+    if (cap > 0) {
+        size_t idx = s_cda_orig_evict_idx % cap;
+        s_cda_orig_evict_idx = (idx + 1) % cap;
+        gc_unpin(table[idx].orig_pin);
+        table[idx].img = img;
+        table[idx].orig_sprite = spr;
+        table[idx].orig_pin = gc_pin(spr, false);
+        table[idx].orig_size = sz;
     }
 }
 
@@ -4633,7 +4909,7 @@ static void *cda_cached_comp_str(const char *name) {
 static void *cda_get_comp(void *go, const char *full_name, const char *short_name) {
     if (!uobj_alive(go)) return NULL;
     typedef void *(ABI *GetCompByNameFn)(void *go, void *str, void *method);
-    GetCompByNameFn get_comp = (GetCompByNameFn)GUEST(0x1dc9410);
+    GetCompByNameFn get_comp = (GetCompByNameFn)GUEST_CALL(0x1e283e0, 0x1dc9410);
     if (full_name && *full_name) {
         void *c = get_comp(go, cda_cached_comp_str(full_name), NULL);
         if (uobj_alive(c)) return c;
@@ -4647,9 +4923,9 @@ static void *cda_get_comp(void *go, const char *full_name, const char *short_nam
 
 static void *cda_find_comp_in_children(void *tr, const char *full_name, const char *short_name, int depth) {
     if (!uobj_alive(tr) || depth > 8) return NULL;
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetChildCountFn get_cc = (GetChildCountFn)GUEST(0x1ddbb00);
-    GetChildFn get_ch = (GetChildFn)GUEST(0x1ddc370);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetChildCountFn get_cc = (GetChildCountFn)GUEST_CALL(0x1e3aad0, 0x1ddbb00);
+    GetChildFn get_ch = (GetChildFn)GUEST_CALL(0x1e3b340, 0x1ddc370);
     void *go = comp_get_go(tr, NULL);
     void *c = cda_get_comp(go, full_name, short_name);
     if (uobj_alive(c)) return c;
@@ -4666,18 +4942,20 @@ static void *cda_find_comp_in_children(void *tr, const char *full_name, const ch
 typedef struct {
     void *ms_mark;
     void *custom_mark;
+    uint32_t custom_pin;
     bool is_custom;
 } CdaCustomMarkEntry;
 
 static CdaCustomMarkEntry s_cda_custom_marks[CDA_CUSTOM_MARKS_CAP];
+static int s_cda_mark_evict_idx = 0;
 static void *original_set_active_edition_mark = NULL;
 
 static void cda_configure_custom_mark_hierarchy(void *node_tr) {
     if (!uobj_alive(node_tr)) return;
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
-    GetChildCountFn get_cc = (GetChildCountFn)GUEST(0x1ddbb00);
-    GetChildFn get_ch = (GetChildFn)GUEST(0x1ddc370);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    SetSpriteFn set_spr = (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
+    GetChildCountFn get_cc = (GetChildCountFn)GUEST_CALL(0x1e3aad0, 0x1ddbb00);
+    GetChildFn get_ch = (GetChildFn)GUEST_CALL(0x1e3b340, 0x1ddc370);
 
     void *go = comp_get_go(node_tr, NULL);
     if (uobj_alive(go)) {
@@ -4702,9 +4980,9 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
         for (int i = 0; i < 4; ++i) {
             void *txt = cda_get_comp(go, text_types[i].full_name, text_types[i].short_name);
             if (uobj_alive(txt)) {
-                SetEnabledFn set_enabled = (SetEnabledFn)GUEST(0x1dc8780);
+                SetEnabledFn set_enabled = (SetEnabledFn)GUEST_CALL(0x1e27750, 0x1dc8780);
                 set_enabled(txt, true, NULL);
-                SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+                SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
                 void *txt_go = comp_get_go(txt, NULL);
                 if (uobj_alive(txt_go)) set_active(txt_go, true, NULL);
 
@@ -4727,7 +5005,7 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
                 if (i == 0 || i == 2 || (kname && strstr(kname, "TMPro"))) {
                     put64((char *)txt + 0xd0, (uint64_t)gstr);
                     typedef void (ABI *TmpSetTextFn)(void *self, void *str, void *method);
-                    ((TmpSetTextFn)GUEST(0x259D340))(txt, gstr, NULL);
+                    ((TmpSetTextFn)GUEST_CALL(0x2583020, 0x259d340))(txt, gstr, NULL);
                 }
             }
         }
@@ -4740,7 +5018,7 @@ static void cda_configure_custom_mark_hierarchy(void *node_tr) {
 
 static void cda_apply_ms_mark(void *self, bool is_custom) {
     if (!uobj_alive(self)) return;
-    GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
+    GetTransformFn go_get_tr = (GetTransformFn)GUEST_CALL(0x1e293d0, 0x1dca400);
     void *custom_mark = NULL;
     int entry_idx = -1;
     for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
@@ -4758,30 +5036,35 @@ static void cda_apply_ms_mark(void *self, bool is_custom) {
         void *dlc = (void *)load64((char *)self + 0x20);
         if (!uobj_alive(dlc)) dlc = (void *)load64((char *)self + 0x28);
         if (uobj_alive(dlc)) {
-            GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-            CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST(0x1dcfa70);
+            GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+            CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST_CALL(0x1e2ea40, 0x1dcfa70);
             void *dlc_tr = go_get_tr(dlc, NULL);
             void *par_tr = uobj_alive(dlc_tr) ? get_parent(dlc_tr, NULL) : NULL;
             if (uobj_alive(par_tr)) {
                 custom_mark = clone_obj(dlc, par_tr, 0);
                 if (uobj_alive(custom_mark)) {
-                    (void)gc_pin(custom_mark, false);
+                    uint32_t pin = gc_pin(custom_mark, false);
                     cda_configure_custom_mark_hierarchy(go_get_tr(custom_mark, NULL));
                     if (entry_idx < 0) {
                         for (int i = 0; i < CDA_CUSTOM_MARKS_CAP; ++i) {
                             if (!uobj_alive(s_cda_custom_marks[i].ms_mark)) { entry_idx = i; break; }
                         }
-                        if (entry_idx < 0) entry_idx = 0;
+                        if (entry_idx < 0) {
+                            entry_idx = s_cda_mark_evict_idx;
+                            s_cda_mark_evict_idx = (s_cda_mark_evict_idx + 1) % CDA_CUSTOM_MARKS_CAP;
+                        }
                     }
+                    gc_unpin(s_cda_custom_marks[entry_idx].custom_pin);
                     s_cda_custom_marks[entry_idx].ms_mark = self;
                     s_cda_custom_marks[entry_idx].custom_mark = custom_mark;
+                    s_cda_custom_marks[entry_idx].custom_pin = pin;
                     s_cda_custom_marks[entry_idx].is_custom = is_custom;
                 }
             }
         }
     }
 
-    SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+    SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
     void *dlc = (void *)load64((char *)self + 0x20);
     void *dx = (void *)load64((char *)self + 0x28);
     if (is_custom) {
@@ -4875,9 +5158,11 @@ typedef struct {
     void *src_mat;
     int slot;
     void *cloned_mat;
+    uint32_t pin;
 } CdaMatCacheEntry;
 
 static CdaMatCacheEntry s_cda_mat_cache[32];
+static int s_cda_mat_evict_idx = 0;
 
 static void *cda_clone_tmp_material(void *src_mat, int slot) {
     if (!unity_native_alive(src_mat) || (slot != 4 && slot != 5)) return src_mat;
@@ -4897,26 +5182,34 @@ static void *cda_clone_tmp_material(void *src_mat, int slot) {
 
     void *mat = alloc_managed_object(s_material_class);
     if (!mat) return src_mat;
-    (void)gc_pin(mat, false);
+    uint32_t pin = gc_pin(mat, false);
 
     typedef void (ABI *MatCtorFn)(void *self, void *source, void *method);
     typedef void (ABI *MatSetColorFn)(void *self, void *name_str, UGuiVec4 col, void *method);
-    ((MatCtorFn)GUEST(0xe11330))(mat, src_mat, NULL);
+    ((MatCtorFn)GUEST_CALL(0xe07100, 0xe11330))(mat, src_mat, NULL);
     protect_cached_unity_object(mat);
 
     UGuiVec4 outline = cda_outline_vec4(slot);
     UGuiVec4 shadow = cda_shadow_vec4(slot);
-    ((MatSetColorFn)GUEST(0xe11a40))(mat, cda_cached_comp_str("_OutlineColor"), outline, NULL);
-    ((MatSetColorFn)GUEST(0xe11a40))(mat, cda_cached_comp_str("_UnderlayColor"), shadow, NULL);
+    ((MatSetColorFn)GUEST_CALL(0xe07810, 0xe11a40))(mat, cda_cached_comp_str("_OutlineColor"), outline, NULL);
+    ((MatSetColorFn)GUEST_CALL(0xe07810, 0xe11a40))(mat, cda_cached_comp_str("_UnderlayColor"), shadow, NULL);
 
+    int slot_idx = -1;
     for (int i = 0; i < 32; ++i) {
         if (!unity_native_alive(s_cda_mat_cache[i].cloned_mat)) {
-            s_cda_mat_cache[i].src_mat = src_mat;
-            s_cda_mat_cache[i].slot = slot;
-            s_cda_mat_cache[i].cloned_mat = mat;
+            slot_idx = i;
             break;
         }
     }
+    if (slot_idx < 0) {
+        slot_idx = s_cda_mat_evict_idx;
+        s_cda_mat_evict_idx = (s_cda_mat_evict_idx + 1) & 31;
+    }
+    gc_unpin(s_cda_mat_cache[slot_idx].pin);
+    s_cda_mat_cache[slot_idx].src_mat = src_mat;
+    s_cda_mat_cache[slot_idx].slot = slot;
+    s_cda_mat_cache[slot_idx].cloned_mat = mat;
+    s_cda_mat_cache[slot_idx].pin = pin;
     return mat;
 }
 
@@ -4928,6 +5221,7 @@ typedef struct {
 } DiffListCtxEntry;
 
 static DiffListCtxEntry s_diff_list_ctx[16];
+static int s_diff_ctx_evict_idx = 0;
 
 static void set_diff_list_ctx(void *control, const CustomSong *song, bool is_popup) {
     if (!control) return;
@@ -4946,9 +5240,11 @@ static void set_diff_list_ctx(void *control, const CustomSong *song, bool is_pop
             return;
         }
     }
-    s_diff_list_ctx[0].control = control;
-    s_diff_list_ctx[0].song = song;
-    s_diff_list_ctx[0].is_popup = is_popup;
+    int idx = s_diff_ctx_evict_idx;
+    s_diff_ctx_evict_idx = (s_diff_ctx_evict_idx + 1) & 15;
+    s_diff_list_ctx[idx].control = control;
+    s_diff_list_ctx[idx].song = song;
+    s_diff_list_ctx[idx].is_popup = is_popup;
 }
 
 static const DiffListCtxEntry *get_diff_list_ctx(void *control) {
@@ -4964,7 +5260,7 @@ static void draw_diff_control(void *control, const CustomSong *song, int slot, b
     set_diff_list_ctx(control, song, is_popup);
     if (!song || !song_has_chart(song, slot)) return;
     typedef void (ABI *SetDiffFn)(void *self, int32_t diff, bool isSupremeActive, bool isOneDiff, void *method);
-    SetDiffFn set_diff = (SetDiffFn)GUEST(0x1d95610);
+    SetDiffFn set_diff = (SetDiffFn)GUEST_CALL(0x1dde2c0, 0x1d95610);
     bool has_sup = song_has_chart(song, 3);
     bool one_diff = (count_song_charts(song) <= 1);
     set_diff(control, slot, has_sup, one_diff, NULL);
@@ -4973,11 +5269,11 @@ static void draw_diff_control(void *control, const CustomSong *song, int slot, b
 /* Map a descendant GameObject from src_root_tr to dst_root_tr by matching child transform indices */
 static void *cda_map_cloned_go(void *src_root_tr, void *dst_root_tr, void *src_child_go) {
     if (!uobj_alive(src_root_tr) || !uobj_alive(dst_root_tr) || !uobj_alive(src_child_go)) return NULL;
-    GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-    GetChildCountFn get_cc = (GetChildCountFn)GUEST(0x1ddbb00);
-    GetChildFn get_ch = (GetChildFn)GUEST(0x1ddc370);
+    GetTransformFn go_get_tr = (GetTransformFn)GUEST_CALL(0x1e293d0, 0x1dca400);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+    GetChildCountFn get_cc = (GetChildCountFn)GUEST_CALL(0x1e3aad0, 0x1ddbb00);
+    GetChildFn get_ch = (GetChildFn)GUEST_CALL(0x1e3b340, 0x1ddc370);
 
     void *target_tr = go_get_tr(src_child_go, NULL);
     if (!uobj_alive(target_tr)) return NULL;
@@ -5026,6 +5322,10 @@ typedef struct {
 
 static CdaImageSkinEntry s_cda_skins[128];
 static CdaSpriteVariantCacheEntry s_cda_resolve_cache[64];
+static int s_cda_skin_evict_idx = 0;
+static int s_cda_resolve_evict_idx = 0;
+static bool s_has_cda_skins = false;
+static int s_cda_skin_limit = 0;
 
 static UGuiVec4 cda_recolor_blue(UGuiVec4 color, int slot) {
     if (color.z <= color.x + 0.04f || color.z <= color.y + 0.015f) return color;
@@ -5047,7 +5347,7 @@ static void *cda_resolve_sprite(void *source_spr, int slot) {
             return s_cda_resolve_cache[i].result_spr;
         }
     }
-    GetObjNameFn get_name = (GetObjNameFn)GUEST(0x1dcea80);
+    GetObjNameFn get_name = (GetObjNameFn)GUEST_CALL(0x1e2da50, 0x1dcea80);
     char nm[128] = {0};
     read_guest_string(get_name(source_spr, NULL), nm, sizeof(nm));
     void *out_spr = NULL;
@@ -5071,7 +5371,10 @@ static void *cda_resolve_sprite(void *source_spr, int slot) {
                 break;
             }
         }
-        if (slot_idx < 0) slot_idx = 0;
+        if (slot_idx < 0) {
+            slot_idx = s_cda_resolve_evict_idx;
+            s_cda_resolve_evict_idx = (s_cda_resolve_evict_idx + 1) & 63;
+        }
         s_cda_resolve_cache[slot_idx].source_spr = source_spr;
         s_cda_resolve_cache[slot_idx].slot = slot;
         s_cda_resolve_cache[slot_idx].result_spr = out_spr;
@@ -5081,7 +5384,7 @@ static void *cda_resolve_sprite(void *source_spr, int slot) {
 
 static bool cda_is_button_sprite(void *spr) {
     if (!unity_native_alive(spr)) return false;
-    GetObjNameFn get_name = (GetObjNameFn)GUEST(0x1dcea80);
+    GetObjNameFn get_name = (GetObjNameFn)GUEST_CALL(0x1e2da50, 0x1dcea80);
     char nm[128] = {0};
     read_guest_string(get_name(spr, NULL), nm, sizeof(nm));
     return (!strncmp(nm, "DifficultyList_Button", 21) ||
@@ -5090,7 +5393,8 @@ static bool cda_is_button_sprite(void *spr) {
 
 static void cda_register_image_skin(void *img, void *source_spr, int slot) {
     if (!uobj_alive(img) || (slot != 4 && slot != 5)) return;
-    for (int i = 0; i < 128; ++i) {
+    s_has_cda_skins = true;
+    for (int i = 0; i < s_cda_skin_limit; ++i) {
         if (s_cda_skins[i].image == img) {
             if (unity_native_alive(source_spr) && s_cda_skins[i].source != source_spr) {
                 s_cda_skins[i].source = source_spr;
@@ -5109,35 +5413,39 @@ static void cda_register_image_skin(void *img, void *source_spr, int slot) {
             s_cda_skins[i].image = img;
             s_cda_skins[i].source = source_spr;
             s_cda_skins[i].slot = slot;
+            if (i + 1 > s_cda_skin_limit) s_cda_skin_limit = i + 1;
             return;
         }
     }
-    memset(&s_cda_skins[0], 0, sizeof(s_cda_skins[0]));
-    s_cda_skins[0].image = img;
-    s_cda_skins[0].source = source_spr;
-    s_cda_skins[0].slot = slot;
+    int idx = s_cda_skin_evict_idx;
+    s_cda_skin_evict_idx = (s_cda_skin_evict_idx + 1) & 127;
+    memset(&s_cda_skins[idx], 0, sizeof(s_cda_skins[idx]));
+    s_cda_skins[idx].image = img;
+    s_cda_skins[idx].source = source_spr;
+    s_cda_skins[idx].slot = slot;
+    s_cda_skin_limit = 128;
 }
 
 static void *original_image_set_sprite = NULL;
 
 static void cda_apply_image_skin(CdaImageSkinEntry *skin) {
     if (!skin || !uobj_alive(skin->image)) return;
-    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
+    GetSpriteFn get_spr = (GetSpriteFn)GUEST_CALL(0x2cc9cd0, 0x2ceeda0);
     SetSpriteFn set_spr = original_image_set_sprite
                           ? (SetSpriteFn)original_image_set_sprite
-                          : (SetSpriteFn)GUEST(0x2cd5560);
+                          : (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
     typedef UGuiVec4 (ABI *GetColorFn)(void *graphic, void *method);
-    GetColorFn get_color = (GetColorFn)GUEST(0x2ce3d20);
-    SetColorFn set_color = (SetColorFn)GUEST(0x2ce3d30);
-    SetEnabledFn set_enabled = (SetEnabledFn)GUEST(0x1dc8780);
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
+    GetColorFn get_color = (GetColorFn)GUEST_CALL(0x2cbec50, 0x2ce3d20);
+    SetColorFn set_color = (SetColorFn)GUEST_CALL(0x2cbec60, 0x2ce3d30);
+    SetEnabledFn set_enabled = (SetEnabledFn)GUEST_CALL(0x1e27750, 0x1dc8780);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
 
     void *cur = get_spr(skin->image, NULL);
     void *rep = cur;
     if (!cur || cur != skin->last_resolved) {
-        void *base_spr = unity_native_alive(cur) ? cur : skin->source;
+        void *base_spr = unity_native_alive(cur) ? cur : (unity_native_alive(skin->source) ? skin->source : NULL);
         rep = cda_resolve_sprite(base_spr, skin->slot);
-        if (!unity_native_alive(rep)) rep = cda_resolve_sprite(skin->source, skin->slot);
+        if (!unity_native_alive(rep) && unity_native_alive(skin->source)) rep = cda_resolve_sprite(skin->source, skin->slot);
         if (unity_native_alive(rep)) {
             if (rep != cur) set_spr(skin->image, rep, NULL);
             skin->last_resolved = rep;
@@ -5163,9 +5471,9 @@ static void cda_apply_image_skin(CdaImageSkinEntry *skin) {
 
 static void cda_set_button_label(void *tr, const char *label) {
     if (!uobj_alive(tr) || !label) return;
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetChildCountFn get_cc = (GetChildCountFn)GUEST(0x1ddbb00);
-    GetChildFn get_ch = (GetChildFn)GUEST(0x1ddc370);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetChildCountFn get_cc = (GetChildCountFn)GUEST_CALL(0x1e3aad0, 0x1ddbb00);
+    GetChildFn get_ch = (GetChildFn)GUEST_CALL(0x1e3b340, 0x1ddc370);
 
     void *go = comp_get_go(tr, NULL);
     if (uobj_alive(go)) {
@@ -5200,18 +5508,18 @@ static void cda_set_button_label(void *tr, const char *label) {
 
 static void cda_skin_hierarchy(void *tr, void *skip_tr, int slot) {
     if (!uobj_alive(tr) || tr == skip_tr || (slot != 4 && slot != 5)) return;
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetSpriteFn get_spr = (GetSpriteFn)GUEST_CALL(0x2cc9cd0, 0x2ceeda0);
     typedef UGuiVec4 (ABI *GetColorFn)(void *graphic, void *method);
-    GetColorFn get_color = (GetColorFn)GUEST(0x2ce3d20);
-    SetColorFn set_color = (SetColorFn)GUEST(0x2ce3d30);
-    GetChildCountFn get_cc = (GetChildCountFn)GUEST(0x1ddbb00);
-    GetChildFn get_ch = (GetChildFn)GUEST(0x1ddc370);
+    GetColorFn get_color = (GetColorFn)GUEST_CALL(0x2cbec50, 0x2ce3d20);
+    SetColorFn set_color = (SetColorFn)GUEST_CALL(0x2cbec60, 0x2ce3d30);
+    GetChildCountFn get_cc = (GetChildCountFn)GUEST_CALL(0x1e3aad0, 0x1ddbb00);
+    GetChildFn get_ch = (GetChildFn)GUEST_CALL(0x1e3b340, 0x1ddc370);
     typedef void *(ABI *GetTmpMatFn)(void *tmp, void *method);
     typedef void (ABI *SetTmpMatFn)(void *tmp, void *mat, void *method);
-    GetTmpMatFn get_tmp_mat = (GetTmpMatFn)GUEST(0x259d590);
-    SetTmpMatFn set_shared_mat = (SetTmpMatFn)GUEST(0x259d5a0);
-    SetTmpMatFn set_tmp_mat = (SetTmpMatFn)GUEST(0x259d730);
+    GetTmpMatFn get_tmp_mat = (GetTmpMatFn)GUEST_CALL(0x2583270, 0x259d590);
+    SetTmpMatFn set_shared_mat = (SetTmpMatFn)GUEST_CALL(0x2583280, 0x259d5a0);
+    SetTmpMatFn set_tmp_mat = (SetTmpMatFn)GUEST_CALL(0x2583410, 0x259d730);
 
     void *go = comp_get_go(tr, NULL);
     if (uobj_alive(go)) {
@@ -5219,12 +5527,13 @@ static void cda_skin_hierarchy(void *tr, void *skip_tr, int slot) {
         void *grad = cda_get_comp(go, "Coffee.UIExtensions.UIGradient", "UIGradient");
         if (uobj_alive(grad)) {
             static const size_t grad_offs[4] = {0x24, 0x34, 0x44, 0x54};
-            static const uint64_t grad_rvas[4] = {0x2be37e0, 0x2be3860, 0x2be38e0, 0x2be3960};
+            static const uint64_t grad_rvas_100[4] = {0x2b73fd0, 0x2b74050, 0x2b740d0, 0x2b74150};
+            static const uint64_t grad_rvas_104[4] = {0x2be37e0, 0x2be3860, 0x2be38e0, 0x2be3960};
             for (int k = 0; k < 4; ++k) {
                 UGuiVec4 c;
                 memcpy(&c, (const char *)grad + grad_offs[k], sizeof(UGuiVec4));
                 UGuiVec4 rc = cda_recolor_blue(c, slot);
-                ((SetColorFn)GUEST(grad_rvas[k]))(grad, rc, NULL);
+                ((SetColorFn)GUEST_CALL(grad_rvas_100[k], grad_rvas_104[k]))(grad, rc, NULL);
             }
         }
 
@@ -5262,7 +5571,7 @@ static void cda_skin_hierarchy(void *tr, void *skip_tr, int slot) {
             if (sc.z > sc.x + 0.04f && sc.z > sc.y + 0.015f) {
                 UGuiVec4 target = cda_outline_vec4(slot);
                 target.w = sc.w;
-                ((SetColorFn)GUEST(0x1e11110))(mshadow, target, NULL);
+                ((SetColorFn)GUEST_CALL(0x1e700e0, 0x1e11110))(mshadow, target, NULL);
             }
         }
         void *ushadow = cda_get_comp(go, "UnityEngine.UI.Shadow", "Shadow");
@@ -5270,7 +5579,7 @@ static void cda_skin_hierarchy(void *tr, void *skip_tr, int slot) {
             UGuiVec4 sc;
             memcpy(&sc, (const char *)ushadow + 0x20, sizeof(UGuiVec4));
             if (sc.z > sc.x + 0.04f && sc.z > sc.y + 0.015f) {
-                ((SetColorFn)GUEST(0x3479770))(ushadow, cda_recolor_blue(sc, slot), NULL);
+                ((SetColorFn)GUEST_CALL(0x33fdf50, 0x3479770))(ushadow, cda_recolor_blue(sc, slot), NULL);
             }
         }
         void *utxt = cda_get_comp(go, "UnityEngine.UI.Text", "Text");
@@ -5291,10 +5600,10 @@ static void cda_skin_hierarchy(void *tr, void *skip_tr, int slot) {
 static void cda_freeze_button_grid(void *parent_tr) {
     if (!uobj_alive(parent_tr)) return;
     typedef void (ABI *ForceRebuildFn)(void *rt, void *method);
-    ((ForceRebuildFn)GUEST(0x3889570))(parent_tr, NULL);
+    ((ForceRebuildFn)GUEST_CALL(0x38255c0, 0x3889570))(parent_tr, NULL);
 
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    SetEnabledFn set_enabled = (SetEnabledFn)GUEST(0x1dc8780);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    SetEnabledFn set_enabled = (SetEnabledFn)GUEST_CALL(0x1e27750, 0x1dc8780);
 
     void *go = comp_get_go(parent_tr, NULL);
     if (!uobj_alive(go)) return;
@@ -5321,18 +5630,18 @@ static void cda_ensure_diff_list_buttons(void *self) {
     uint64_t len = load64((char *)old_arr + 0x18);
     if (len != 4) return;
 
-    GetTransformFn comp_get_tr = (GetTransformFn)GUEST(0x1dc88c0);
-    GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
-    GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-    CloneWithParentFn clone_comp = (CloneWithParentFn)GUEST(0x1dcfa70);
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    SetObjNameFn set_name = (SetObjNameFn)GUEST(0x1dceb60);
+    GetTransformFn comp_get_tr = (GetTransformFn)GUEST_CALL(0x1e27890, 0x1dc88c0);
+    GetTransformFn go_get_tr = (GetTransformFn)GUEST_CALL(0x1e293d0, 0x1dca400);
+    GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+    CloneWithParentFn clone_comp = (CloneWithParentFn)GUEST_CALL(0x1e2ea40, 0x1dcfa70);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    SetObjNameFn set_name = (SetObjNameFn)GUEST_CALL(0x1e2db30, 0x1dceb60);
     typedef UGuiVec2 (ABI *GetVec2Fn)(void *rt, void *method);
-    GetVec2Fn get_apos = (GetVec2Fn)GUEST(0x1dd4ed0);
-    SetVec2Fn set_apos = (SetVec2Fn)GUEST(0x1dd4fc0);
-    SetLocalScaleFn set_scale = (SetLocalScaleFn)GUEST(0x1dd8d80);
+    GetVec2Fn get_apos = (GetVec2Fn)GUEST_CALL(0x1e33ea0, 0x1dd4ed0);
+    SetVec2Fn set_apos = (SetVec2Fn)GUEST_CALL(0x1e33f90, 0x1dd4fc0);
+    SetLocalScaleFn set_scale = (SetLocalScaleFn)GUEST_CALL(0x1e37d50, 0x1dd8d80);
     typedef void (ABI *SetSiblingIdxFn)(void *tr, int32_t idx, void *method);
-    SetSiblingIdxFn set_sib = (SetSiblingIdxFn)GUEST(0x1ddbc40);
+    SetSiblingIdxFn set_sib = (SetSiblingIdxFn)GUEST_CALL(0x1e3ac10, 0x1ddbc40);
 
     void *b0 = (void *)load64((char *)old_arr + 0x20 + 0 * sizeof(void *));
     void *b1 = (void *)load64((char *)old_arr + 0x20 + 1 * sizeof(void *));
@@ -5455,13 +5764,13 @@ static ABI int hook_diff_list_set_difficulty(HookRegs *r) {
     }
 
     typedef void (ABI *ButtonBaseSetActiveFn)(void *base, bool active, bool oneDiff, void *method);
-    ButtonBaseSetActiveFn base_set_active = (ButtonBaseSetActiveFn)GUEST(0x1d95ca0);
+    ButtonBaseSetActiveFn base_set_active = (ButtonBaseSetActiveFn)GUEST_CALL(0x1dde950, 0x1d95ca0);
     typedef void (ABI *DiffBtnSetActiveFn)(void *btn, bool active, void *method);
-    DiffBtnSetActiveFn btn_set_active = (DiffBtnSetActiveFn)GUEST(0x1d95d70);
+    DiffBtnSetActiveFn btn_set_active = (DiffBtnSetActiveFn)GUEST_CALL(0x1ddea20, 0x1d95d70);
     typedef void (ABI *PlayDiffAnimFn)(void *btn, bool transit, void *method);
-    PlayDiffAnimFn play_sel = (PlayDiffAnimFn)GUEST(0x1d95be0);
-    PlayDiffAnimFn play_unsel = (PlayDiffAnimFn)GUEST(0x1d95b20);
-    SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+    PlayDiffAnimFn play_sel = (PlayDiffAnimFn)GUEST_CALL(0x1dde890, 0x1d95be0);
+    PlayDiffAnimFn play_unsel = (PlayDiffAnimFn)GUEST_CALL(0x1dde7d0, 0x1d95b20);
+    SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
 
     void *base_20 = (void *)load64((char *)self + 0x20);
     void *base_28 = (void *)load64((char *)self + 0x28);
@@ -5550,17 +5859,17 @@ static ABI int hook_level_base_set_difficulty(HookRegs *r) {
         }
     }
 
-    GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST(0x1dcfa70);
-    SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
-    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
+    GetTransformFn go_get_tr = (GetTransformFn)GUEST_CALL(0x1e293d0, 0x1dca400);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST_CALL(0x1e2ea40, 0x1dcfa70);
+    SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
+    SetSpriteFn set_spr = (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
     typedef void *(ABI *GetTmpMatFn)(void *tmp, void *method);
     typedef void (ABI *SetTmpMatFn)(void *tmp, void *mat, void *method);
-    GetTmpMatFn get_tmp_mat = (GetTmpMatFn)GUEST(0x259d590);
-    SetTmpMatFn set_shared_mat = (SetTmpMatFn)GUEST(0x259d5a0);
-    SetTmpMatFn set_tmp_mat = (SetTmpMatFn)GUEST(0x259d730);
+    GetTmpMatFn get_tmp_mat = (GetTmpMatFn)GUEST_CALL(0x2583270, 0x259d590);
+    SetTmpMatFn set_shared_mat = (SetTmpMatFn)GUEST_CALL(0x2583280, 0x259d5a0);
+    SetTmpMatFn set_tmp_mat = (SetTmpMatFn)GUEST_CALL(0x2583410, 0x259d730);
 
     if (load64((char *)bases + 0x18) >= MAX_SLOTS && load64((char *)texts + 0x18) >= MAX_SLOTS) {
         void *src_base = (void *)load64((char *)bases + 0x20 + 1 * sizeof(void *)); /* Expert (1) */
@@ -5634,9 +5943,9 @@ static ABI int hook_level_base_set_difficulty(HookRegs *r) {
     if ((uint64_t)slot < load64((char *)texts + 0x18)) {
         void *tmp = (void *)load64((char *)texts + 0x20 + (size_t)slot * sizeof(void *));
         if (uobj_alive(tmp)) {
-            static void *s_level_strs[32];
+            static void *s_level_strs[128];
             void *gstr = NULL;
-            if (level >= 0 && level < 32) {
+            if (level >= 0 && level < 128) {
                 if (!s_level_strs[level]) {
                     char buf[16];
                     snprintf(buf, sizeof(buf), "%d", level);
@@ -5770,11 +6079,11 @@ static ABI int hook_menu_add_song(HookRegs *r) {
 
     CustomSong *song = res ? find_song_by_obj(mid) : NULL;
     if (song && self) {
-        void *panel_class = resolve_typeinfo(0x609c2f0);
+        void *panel_class = resolve_typeinfo(0x609b058, 0x609c2f0);
         typedef void (ABI *PanelCtorFn)(void *panel, void *mid, int32_t slot, int32_t style, bool fixed, void *method);
         typedef void (ABI *UIListAddFn)(void *uilist, void *item, void *method);
-        PanelCtorFn panel_ctor = (PanelCtorFn)GUEST(0x272e2e0);
-        UIListAddFn uilist_add = (UIListAddFn)GUEST(0x28c17e0);
+        PanelCtorFn panel_ctor = (PanelCtorFn)GUEST_CALL(0x2824f70, 0x272e2e0);
+        UIListAddFn uilist_add = (UIListAddFn)GUEST_CALL(0x2938ba0, 0x28c17e0);
 
         const int extra_slots[2] = {4, 5};
         for (int k = 0; k < 2; ++k) {
@@ -5835,6 +6144,171 @@ static ABI int hook_list_change_view_diff(HookRegs *r) {
 
 static ABI int hook_sort_refresh_badges(HookRegs *r) {
     r->rsi = (uint64_t)clamp_extra_slot((int)r->rsi);
+    return 0;
+}
+
+static void *original_count_data_list_init = NULL;
+static void *original_set_sort_category_count = NULL;
+static void *original_edit_count = NULL;
+
+static void *find_sample_count_data(void *diff_dict) {
+    if (!diff_dict) return NULL;
+    void *entries = (void *)load64((char *)diff_dict + 0x18);
+    int count = (int)load32((char *)diff_dict + 0x20);
+    if (!entries || count <= 0 || (uint64_t)count > load64((char *)entries + 0x18)) return NULL;
+    for (int i = 0; i < count; ++i) {
+        size_t at = 0x20 + (size_t)i * 24;
+        if ((int32_t)load32((char *)entries + at) < 0) continue;
+        void *val = (void *)load64((char *)entries + at + 16);
+        if (val) return val;
+    }
+    return NULL;
+}
+
+static void *ensure_diff_count_data_entry(void *diff_dict, void *sample_cd, int key) {
+    if (!diff_dict) return NULL;
+    void *existing = NULL;
+    if (dict_find_i32(diff_dict, key, &existing) && existing) return existing;
+    if (!sample_cd) sample_cd = find_sample_count_data(diff_dict);
+    if (!sample_cd) return NULL;
+    void *fresh = clone_object(sample_cd);
+    if (!fresh) return NULL;
+    uint32_t froot = gc_pin(fresh, false);
+    memset((char *)fresh + 0x10, 0, 0x18);
+    dict_add_i32(diff_dict, key, fresh);
+    gc_unpin(froot);
+    return fresh;
+}
+
+/* CountDataList::InitializeList (v1.0.4: 0x2729ca0, v1.0.0: 0x2820930)
+ * Ensure _difficultyList (+0x30) contains CountData entries for every custom chart rating (including 20+
+ * and Beginner/Chaos ratings) as well as dummy keys 0 and -1 so stock 0..2 loops on custom songs with
+ * unpopulated base slots never throw KeyNotFoundException. */
+static ABI int wrap_count_data_list_init(HookRegs *r) {
+    void *self = (void *)r->rdi;
+    void *method = (void *)r->rsi;
+    if (!original_count_data_list_init) return 0;
+
+    typedef void (ABI *InitListFn)(void *self, void *method);
+    ((InitListFn)original_count_data_list_init)(self, method);
+
+    void *diff_dict = self ? (void *)load64((char *)self + 0x30) : NULL;
+    void *sample_cd = find_sample_count_data(diff_dict);
+    if (diff_dict && sample_cd) {
+        ensure_diff_count_data_entry(diff_dict, sample_cd, 0);
+        ensure_diff_count_data_entry(diff_dict, sample_cd, -1);
+        for (size_t i = 0; i < song_count; ++i) {
+            CustomSong *song = &songs[i];
+            for (int s = 0; s < MAX_SLOTS; ++s) {
+                if (song_has_chart(song, s) && song->charts[s].rating > 0) {
+                    ensure_diff_count_data_entry(diff_dict, sample_cd, song->charts[s].rating);
+                }
+            }
+        }
+    }
+    r->rax = 0;
+    return 1;
+}
+
+static void adjust_custom_song_difficulty_counts(void *diff_dict, CustomSong *song, void *music_rec, int32_t delta) {
+    if (!diff_dict || !song || delta == 0) return;
+    void *sample_cd = find_sample_count_data(diff_dict);
+    bool is_unlocked = music_rec ? (*(uint8_t *)((char *)music_rec + 0x10) != 0) : true;
+    bool is_new      = music_rec ? (*(uint8_t *)((char *)music_rec + 0x11) != 0) : false;
+    bool is_fav      = music_rec ? (*(uint8_t *)((char *)music_rec + 0x14) != 0) : false;
+
+    const int extra_slots[2] = {4, 5};
+    for (int k = 0; k < 2; ++k) {
+        int s = extra_slots[k];
+        if (!song_has_chart(song, s)) continue;
+        int rating = song->charts[s].rating;
+        if (rating <= 0) continue;
+        void *cd = ensure_diff_count_data_entry(diff_dict, sample_cd, rating);
+        if (!cd) continue;
+
+        int32_t all_cnt = (int32_t)load32((char *)cd + 0x10) + delta;
+        put32((char *)cd + 0x10, (uint32_t)(all_cnt < 0 ? 0 : all_cnt));
+        if (is_unlocked) {
+            int32_t play_cnt = (int32_t)load32((char *)cd + 0x14) + delta;
+            put32((char *)cd + 0x14, (uint32_t)(play_cnt < 0 ? 0 : play_cnt));
+            if (is_new) {
+                int32_t new_cnt = (int32_t)load32((char *)cd + 0x18) + delta;
+                put32((char *)cd + 0x18, (uint32_t)(new_cnt < 0 ? 0 : new_cnt));
+            }
+            if (is_fav) {
+                int32_t fav_cnt = (int32_t)load32((char *)cd + 0x1c) + delta;
+                put32((char *)cd + 0x1c, (uint32_t)(fav_cnt < 0 ? 0 : fav_cnt));
+            }
+        }
+    }
+}
+
+/* ListCount::SetSortCategoryCount (v1.0.4: 0x272b800, v1.0.0: 0x2822490)
+ * Stock implementation only counts slots 0..2 (and 3 if HasSupreme), leaving Beginner(4) & Chaos(5)
+ * ratings (such as 20+) with 0 count so their section header is hidden by filterSeparator. */
+static ABI int wrap_set_sort_category_count(HookRegs *r) {
+    void *self = (void *)r->rdi;
+    void *music_data_list = (void *)r->rsi;
+    void *music_info = (void *)r->rdx;
+    int32_t play_style = (int32_t)r->rcx;
+    void *method = (void *)r->r8;
+    if (!original_set_sort_category_count) return 0;
+
+    typedef void (ABI *SetCountFn)(void *self, void *data_list, void *info, int32_t style, void *method);
+    ((SetCountFn)original_set_sort_category_count)(self, music_data_list, music_info, play_style, method);
+
+    void *cd_list = self ? (void *)load64((char *)self + 0x20) : NULL;
+    void *diff_dict = cd_list ? (void *)load64((char *)cd_list + 0x30) : NULL;
+    if (diff_dict && music_data_list) {
+        for (size_t i = 0; i < song_count; ++i) {
+            CustomSong *song = &songs[i];
+            if (!song->registered || !song->managed_id) continue;
+            if (!song_has_chart(song, 4) && !song_has_chart(song, 5)) continue;
+            if (!dict_contains_key(music_data_list, song->managed_id)) continue;
+            adjust_custom_song_difficulty_counts(diff_dict, song, song->managed_record, 1);
+        }
+    }
+    r->rax = 0;
+    return 1;
+}
+
+/* ListCount::EditCount (v1.0.4: 0x272cbb0, v1.0.0: 0x2823840) */
+static ABI int wrap_edit_count(HookRegs *r) {
+    void *self = (void *)r->rdi;
+    void *music_data = (void *)r->rsi;
+    void *music_rec = (void *)r->rdx;
+    int32_t play_style = (int32_t)r->rcx;
+    bool is_add = (r->r8 & 1) != 0;
+    void *method = (void *)r->r9;
+    if (!original_edit_count) return 0;
+
+    typedef void (ABI *EditCountFn)(void *self, void *data, void *rec, int32_t style, bool add, void *method);
+    ((EditCountFn)original_edit_count)(self, music_data, music_rec, play_style, is_add, method);
+
+    CustomSong *song = music_data ? find_song_by_obj((void *)load64((char *)music_data + 0x10)) : NULL;
+    if (song && self && (song_has_chart(song, 4) || song_has_chart(song, 5))) {
+        void *cd_list = (void *)load64((char *)self + 0x20);
+        void *diff_dict = cd_list ? (void *)load64((char *)cd_list + 0x30) : NULL;
+        if (diff_dict) {
+            adjust_custom_song_difficulty_counts(diff_dict, song, music_rec ? music_rec : song->managed_record, is_add ? 1 : -1);
+        }
+    }
+    r->rax = 0;
+    return 1;
+}
+
+/* MusicSelectMainBase::createSelectableSortData(this, MusicID mid, ref FilterCategory, ref SortType, int difficulty, int playStyle)
+ * (v1.0.4: 0x1693df0, v1.0.0: 0x160b320)
+ * Ensure r->r8 (difficulty) resolves to a populated slot for custom songs so non-Difficulty sort modes
+ * never read an empty slot (rating 0) or clamp slot 3 -> 2 when Supreme is absent. */
+static ABI int hook_create_selectable_sort_data(HookRegs *r) {
+    CustomSong *song = find_song_by_obj((void *)r->rsi);
+    if (song) {
+        int slot = (int)r->r8;
+        if (slot < 0 || slot >= MAX_SLOTS || !song_has_chart(song, slot)) {
+            r->r8 = (uint64_t)resolve_song_slot(song, slot, song->last_selected_slot);
+        }
+    }
     return 0;
 }
 
@@ -5916,7 +6390,7 @@ static ABI int hook_jacket_refresh_view(HookRegs *r) {
             void *beh = (void *)load64((char *)panel + 0x100);
             if (beh) {
                 typedef void (ABI *SetMusicNameFn)(void *beh, void *str, void *method);
-                ((SetMusicNameFn)GUEST(0x167a2d0))(beh, song->managed_title, NULL);
+                ((SetMusicNameFn)GUEST_CALL(0x15f1780, 0x167a2d0))(beh, song->managed_title, NULL);
             }
         }
         cda_apply_ms_mark((void *)load64((char *)panel + 0xc0), true);
@@ -5963,7 +6437,7 @@ static ABI int hook_jacket_set_difficulty(HookRegs *r) {
 }
 
 static void *allocate_jacket_reaction(int next_slot) {
-    void *reaction_class = resolve_typeinfo(0x60a2d68);
+    void *reaction_class = resolve_typeinfo(0x60a1a78, 0x60a2d68);
     void *reaction = alloc_managed_object(reaction_class);
     if (reaction) {
         put32((char *)reaction + 0x10, 0);
@@ -5989,8 +6463,8 @@ static ABI int hook_jacket_execute(HookRegs *r) {
     /* Consume UIObject action identically to native path */
     *(bool *)((char *)source + 0x30) = false;
     typedef void (ABI *ActionFn)(void *action, void *method);
-    ((ActionFn)GUEST(0x28ca8b0))(source, NULL); /* UIObject::onChangedActionFlag */
-    ((ActionFn)GUEST(0x28ca7e0))(source, NULL); /* UIObject::EndAction */
+    ((ActionFn)GUEST_CALL(0x2941c70, 0x28ca8b0))(source, NULL); /* UIObject::onChangedActionFlag */
+    ((ActionFn)GUEST_CALL(0x2941ba0, 0x28ca7e0))(source, NULL); /* UIObject::EndAction */
 
     int change_type = (act == 0) ? 1 : 0;
     int sel_slot = (int)load32((char *)selection + 0x2c);
@@ -6005,7 +6479,7 @@ static ABI int hook_jacket_execute(HookRegs *r) {
     song->last_selected_slot = next;
 
     typedef void (ABI *PlaySEFn)(int32_t diff, void *method);
-    ((PlaySEFn)GUEST(0x1d95e70))(next, NULL);
+    ((PlaySEFn)GUEST_CALL(0x1ddeb20, 0x1d95e70))(next, NULL);
 
     r->rax = (uint64_t)allocate_jacket_reaction(next);
     return 1;
@@ -6036,7 +6510,7 @@ static ABI int hook_jacket_difficulty_reaction(HookRegs *r) {
     song->last_selected_slot = next_slot;
 
     typedef void (ABI *PlaySEFn)(int32_t diff, void *method);
-    ((PlaySEFn)GUEST(0x1d95e70))(next_slot, NULL);
+    ((PlaySEFn)GUEST_CALL(0x1ddeb20, 0x1d95e70))(next_slot, NULL);
 
     void *reaction = allocate_jacket_reaction(next_slot);
     if (reaction) {
@@ -6153,10 +6627,10 @@ static ABI int hook_panel_view_on_set_view(HookRegs *r) {
         }
     }
 
-    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
-    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
-    GetTransformFn comp_get_tr = (GetTransformFn)GUEST(0x1dc88c0);
-    SetVec2Fn set_size = (SetVec2Fn)GUEST(0x1dd5190);
+    GetSpriteFn get_spr = (GetSpriteFn)GUEST_CALL(0x2cc9cd0, 0x2ceeda0);
+    SetSpriteFn set_spr = (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
+    GetTransformFn comp_get_tr = (GetTransformFn)GUEST_CALL(0x1e27890, 0x1dc88c0);
+    SetVec2Fn set_size = (SetVec2Fn)GUEST_CALL(0x1e34160, 0x1dd5190);
 
     if (self && !song) {
         cda_apply_ms_mark((void *)load64((char *)self + 0x60), false);
@@ -6193,7 +6667,7 @@ static ABI int hook_panel_view_on_set_view(HookRegs *r) {
             UGuiVec2 cur_sz = {156.0f, 28.0f};
             if (uobj_alive(ind_rt)) {
                 typedef UGuiVec2 (ABI *GetVec2Fn)(void *rt, void *method);
-                UGuiVec2 sd = ((GetVec2Fn)GUEST(0x1dd50a0))(ind_rt, NULL);
+                UGuiVec2 sd = ((GetVec2Fn)GUEST_CALL(0x1e34070, 0x1dd50a0))(ind_rt, NULL);
                 if (sd.x > 1.0f && sd.x < 200.0f) cur_sz = sd;
             }
             cda_remember_orig_sprite(s_cda_orig_ind_imgs, 64, ind_img, cur_spr, cur_sz);
@@ -6221,7 +6695,7 @@ static void refresh_popup_ui(void *window_setup, void *setting, const CustomSong
     void *status = (void *)load64((char *)window_setup + 0xb0);
     if (status) {
         typedef void (ABI *SetStatusFn)(void *status, void *setting, bool skipAnim, void *method);
-        ((SetStatusFn)GUEST(0x135df60))(status, setting, false, NULL);
+        ((SetStatusFn)GUEST_CALL(0x1684900, 0x135df60))(status, setting, false, NULL);
     }
 }
 
@@ -6342,7 +6816,7 @@ static ABI int hook_window_setup_change_difficulty(HookRegs *r) {
     refresh_popup_ui(window_setup, setting, song);
 
     typedef void (ABI *PlaySEFn)(int32_t diff, void *method);
-    ((PlaySEFn)GUEST(0x1d95e70))(next_slot, NULL);
+    ((PlaySEFn)GUEST_CALL(0x1ddeb20, 0x1d95e70))(next_slot, NULL);
 
     r->rax = 0;
     return 1;
@@ -6370,7 +6844,7 @@ static ABI int hook_music_name_set_color(HookRegs *r) {
     int slot = (int)r->rsi;
     bool unavailable = (r->rdx & 1) != 0;
 
-    void *klass = resolve_typeinfo(0x609cd40);
+    void *klass = resolve_typeinfo(0x609baa8, 0x609cd40);
     void *statics = klass ? (void *)load64((char *)klass + 0xb8) : NULL;
     void *old_arr = statics ? (void *)load64((char *)statics + 0x10) : NULL;
     if (old_arr && load64((char *)old_arr + 0x18) == 4) {
@@ -6388,7 +6862,7 @@ static ABI int hook_music_name_set_color(HookRegs *r) {
         CustomRgba8 out_c = (slot == 4) ? cda_beginner_outline : cda_chaos_outline;
         CustomRgba8 shd_c = (slot == 4) ? cda_beginner_shadow : cda_chaos_shadow;
         typedef void (ABI *SetTextColorFn)(void *self, uint32_t top, uint32_t outline, uint32_t shadow, void *method);
-        ((SetTextColorFn)GUEST(0x1685510))(self, 0xffffffffu, cda_pack_rgba8(out_c), cda_pack_rgba8(shd_c), NULL);
+        ((SetTextColorFn)GUEST_CALL(0x15fcb40, 0x1685510))(self, 0xffffffffu, cda_pack_rgba8(out_c), cda_pack_rgba8(shd_c), NULL);
         r->rax = 0;
         return 1;
     }
@@ -6407,10 +6881,10 @@ static void cda_expand_popup_go_array(void *owner, size_t offset) {
     void *src_go = (void *)load64((char *)old_arr + 0x20 + 1 * sizeof(void *)); /* Expert (1) */
     if (!uobj_alive(src_go)) return;
 
-    GetTransformFn go_get_tr = (GetTransformFn)GUEST(0x1dca400);
-    GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST(0x1dcfa70);
-    SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+    GetTransformFn go_get_tr = (GetTransformFn)GUEST_CALL(0x1e293d0, 0x1dca400);
+    GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST_CALL(0x1e2ea40, 0x1dcfa70);
+    SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
 
     void *src_tr = go_get_tr(src_go, NULL);
     void *parent_tr = uobj_alive(src_tr) ? get_parent(src_tr, NULL) : NULL;
@@ -6442,7 +6916,7 @@ static ABI int hook_music_status_set_diff_color(HookRegs *r) {
     int slot = (int)r->rsi;
     void *method = (void *)r->rdx;
 
-    void *klass = resolve_typeinfo(0x60a2f10);
+    void *klass = resolve_typeinfo(0x60a1c20, 0x60a2f10);
     void *statics = klass ? (void *)load64((char *)klass + 0xb8) : NULL;
     if (statics) {
         for (int which = 0; which < 2; ++which) {
@@ -6473,7 +6947,7 @@ static ABI int hook_music_status_set_diff_color(HookRegs *r) {
         typedef void (ABI *SetPopupColorFn)(void *self, int32_t diff, void *method);
         ((SetPopupColorFn)original_music_status_set_diff_color)(self, slot, method);
         if (self) {
-            SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
+            SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
             static const size_t offs[2] = {0x30, 0x38};
             for (int k = 0; k < 2; ++k) {
                 void *arr = (void *)load64((char *)self + offs[k]);
@@ -6504,6 +6978,11 @@ static ABI int hook_stage_intro_setup(HookRegs *r) {
     if (play_setting) {
         void *mid = (void *)load64((char *)play_setting + 0x18);
         s_custom_stage_active = (find_song_by_obj(mid) != NULL);
+        if (!s_pending_config_stage_start && s_stage_context_entered) {
+            /* Retry within an already-started stage (e.g. EMS) where setConfigInfo did not re-run */
+            s_stage_context_entered = false;
+            begin_stage_tracking(play_setting);
+        }
     }
 
     int active_extra = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : s_pending_chart_slot;
@@ -6603,34 +7082,49 @@ static ABI int hook_music_intro_setup(HookRegs *r) {
 static void *original_live_info_setup_fixed_text = NULL;
 
 /* Game.Scene.MusicStage.LiveInfoController::setupFixedText (0x29f6000) */
+static void *s_liveinfo_last_self = NULL;
+static uint32_t s_liveinfo_pins[4] = {0, 0, 0, 0};
+
 static ABI int hook_live_info_setup_fixed_text(HookRegs *r) {
     void *self = (void *)r->rdi;
     void *method = (void *)r->rsi;
     if (!original_live_info_setup_fixed_text) return 0;
 
-    /* 0x60c3720 is Method$SingletonMonoBehaviour<MusicStageMainManager>.get_Instance() (guarded by byte 0x6335dd6) */
-    if (*(uint8_t *)GUEST(0x6335dd6) == 0) {
+    if (self && self != s_liveinfo_last_self) {
+        for (int i = 0; i < 4; ++i) {
+            gc_unpin(s_liveinfo_pins[i]);
+            s_liveinfo_pins[i] = 0;
+        }
+        s_liveinfo_last_self = self;
+    }
+
+    /* Method$SingletonMonoBehaviour<MusicStageMainManager>.get_Instance() */
+    uint8_t *guard_byte = (uint8_t *)GUEST_CALL(0x63344a5, 0x6335dd6);
+    void **stage_slot = (void **)GUEST_CALL(0x60c2390, 0x60c3720);
+    if (*guard_byte == 0) {
         typedef void (ABI *InitMetaFn)(void **metadata_slot);
-        ((InitMetaFn)GUEST(0x486f90))((void **)GUEST(0x60c3720));
-        *(uint8_t *)GUEST(0x6335dd6) = 1;
+        ((InitMetaFn)GUEST_CALL(0x4831c0, 0x486f90))(stage_slot);
+        *guard_byte = 1;
     }
     typedef void *(ABI *GetStageMainFn)(void *method_info);
-    void *stage_method = *(void **)GUEST(0x60c3720);
+    void *stage_method = *stage_slot;
     void *stage_mgr = (stage_method && ((uintptr_t)stage_method & 1u) == 0)
-                      ? ((GetStageMainFn)GUEST(0x38e36a0))(stage_method)
+                      ? ((GetStageMainFn)GUEST_CALL(0x3901d60, 0x38e36a0))(stage_method)
                       : NULL;
-    void *play_setting = stage_mgr ? (void *)load64((char *)stage_mgr + 0x30) : NULL;
+    void *play_setting = (stage_mgr && cc_mem_readable(stage_mgr, 0x38))
+                         ? (void *)load64((char *)stage_mgr + 0x30)
+                         : NULL;
 
     int active_extra = (s_gameplay_chart_slot >= 4) ? s_gameplay_chart_slot : s_pending_chart_slot;
     CustomSong *song = NULL;
     int saved_diff = -1;
 
-    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST(0x1dc8910);
-    GetTransformFn comp_get_tr = (GetTransformFn)GUEST(0x1dc88c0);
-    GetParentFn get_parent = (GetParentFn)GUEST(0x1dd73a0);
-    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST(0x1dcfa70);
-    SetActiveFn set_active = (SetActiveFn)GUEST(0x1dca5b0);
-    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
+    GetGOPtrFn comp_get_go = (GetGOPtrFn)GUEST_CALL(0x1e278e0, 0x1dc8910);
+    GetTransformFn comp_get_tr = (GetTransformFn)GUEST_CALL(0x1e27890, 0x1dc88c0);
+    GetParentFn get_parent = (GetParentFn)GUEST_CALL(0x1e36370, 0x1dd73a0);
+    CloneWithParentFn clone_obj = (CloneWithParentFn)GUEST_CALL(0x1e2ea40, 0x1dcfa70);
+    SetActiveFn set_active = (SetActiveFn)GUEST_CALL(0x1e29580, 0x1dca5b0);
+    SetSpriteFn set_spr = (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
 
     if (self) {
         /* self + 0x78 is UnityEngine.UI.Image[] _difficultyIcons */
@@ -6652,11 +7146,13 @@ static ABI int hook_live_info_setup_fixed_text(HookRegs *r) {
                     uobj_alive(src_go) && uobj_alive(par_tr)) {
                     void *clone_go = clone_obj(src_go, par_tr, 0);
                     if (uobj_alive(clone_go)) {
-                        (void)gc_pin(clone_go, false);
+                        gc_unpin(s_liveinfo_pins[k * 2]);
+                        s_liveinfo_pins[k * 2] = gc_pin(clone_go, false);
                         set_active(clone_go, true, NULL);
                         void *c_img = cda_get_comp(clone_go, "UnityEngine.UI.Image", "Image");
                         if (uobj_alive(c_img)) {
-                            (void)gc_pin(c_img, false);
+                            gc_unpin(s_liveinfo_pins[k * 2 + 1]);
+                            s_liveinfo_pins[k * 2 + 1] = gc_pin(c_img, false);
                             void *spr = cda_artwork_sprite(es == 4 ? &cda_kBeginnerTrigger : &cda_kChaosTrigger);
                             if (spr) set_spr(c_img, spr, NULL);
                             put64((char *)icons + 0x20 + (size_t)es * sizeof(void *), (uint64_t)c_img);
@@ -6698,7 +7194,7 @@ static ABI int hook_live_info_setup_fixed_text(HookRegs *r) {
 /* MusicStageMainLoop::createMSParts (0x1f17aa0) */
 static ABI int hook_create_ms_parts(HookRegs *r) {
     void *play_setting = (void *)r->rsi;
-    if (play_setting) {
+    if (cc_mem_readable(play_setting, 0x58)) {
         int diff = (int)load32((char *)play_setting + 0x50);
         if (diff == 4 || diff == 5) {
             s_gameplay_chart_slot = diff;
@@ -6791,16 +7287,10 @@ static ABI int hook_support_manager_setup(HookRegs *r) {
 static ABI int hook_set_play_setting(HookRegs *r) {
     void *mid = (void *)r->rsi;
     int diff = (int)r->rdx;
-    uint32_t music_id = mid ? load32((char *)mid + 0x10) : 0;
-    CustomSong *song = find_song_by_obj(mid);
+    CustomSong *song = cc_mem_readable(mid, 0x18) ? find_song_by_obj(mid) : NULL;
     s_custom_stage_active = (song != NULL);
     if (song) {
         (void)load_or_get_custom_asset(song, -1);
-    }
-    if (music_id != 0) {
-        runtime_judgements_begin_stage(music_id, diff);
-        extern void runtime_tffscores_notify_stage_start(uint32_t music_id, int difficulty);
-        runtime_tffscores_notify_stage_start(music_id, diff);
     }
     if (diff >= 4) {
         s_pending_chart_slot = diff;
@@ -6836,6 +7326,9 @@ static ABI int hook_trigger_data_loader_get_address(HookRegs *r) {
 }
 
 static ABI int hook_runtime_context_setup(HookRegs *r) {
+    s_pending_config_stage_start = false;
+    s_pending_config_setting = NULL;
+    s_stage_context_entered = true;
     runtime_slidehold_reset_playback();
     runtime_slidehold_set_auto_mode((r->r8 & 0xffULL) != 0);
 
@@ -6868,7 +7361,7 @@ static ABI int hook_summon_bar_util_setup(HookRegs *r) {
 /* Restore true Beginner(4)/Chaos(5) slot onto playSetting (+0x50) before Results & Record save! */
 static ABI int hook_copy_ms_play_data(HookRegs *r) {
     void *play_setting = (void *)r->rcx;
-    if (play_setting && s_gameplay_chart_slot >= 4) {
+    if (cc_mem_readable(play_setting, 0x58) && s_gameplay_chart_slot >= 4) {
         put32((char *)play_setting + 0x50, (uint32_t)s_gameplay_chart_slot);
     }
     s_custom_records_dirty = true;
@@ -6906,10 +7399,14 @@ typedef struct {
 } CdaIconTargetEntry;
 
 static CdaIconTargetEntry s_cda_icon_targets[32];
+static int s_cda_icon_evict_idx = 0;
+static bool s_has_cda_icons = false;
+static int s_cda_icon_limit = 0;
 
 static void cda_register_icon_target(void *img, int slot) {
     if (!uobj_alive(img)) return;
-    for (int i = 0; i < 32; ++i) {
+    if (slot == 4 || slot == 5) s_has_cda_icons = true;
+    for (int i = 0; i < s_cda_icon_limit; ++i) {
         if (s_cda_icon_targets[i].image == img) {
             s_cda_icon_targets[i].slot = slot;
             return;
@@ -6919,11 +7416,15 @@ static void cda_register_icon_target(void *img, int slot) {
         if (!uobj_alive(s_cda_icon_targets[i].image)) {
             s_cda_icon_targets[i].image = img;
             s_cda_icon_targets[i].slot = slot;
+            if (i + 1 > s_cda_icon_limit) s_cda_icon_limit = i + 1;
             return;
         }
     }
-    s_cda_icon_targets[0].image = img;
-    s_cda_icon_targets[0].slot = slot;
+    int idx = s_cda_icon_evict_idx;
+    s_cda_icon_evict_idx = (s_cda_icon_evict_idx + 1) & 31;
+    s_cda_icon_targets[idx].image = img;
+    s_cda_icon_targets[idx].slot = slot;
+    s_cda_icon_limit = 32;
 }
 
 /* MusicTitleDisplay::Setup (0x12c6610) — returns 16-byte UniTask in rax:rdx.
@@ -6982,8 +7483,8 @@ static ABI int hook_load_title_plate_move_next(HookRegs *r) {
                 void *disp = (void *)load64((char *)closure + 0x18);
                 void *img = disp ? (void *)load64((char *)disp + 0x48) : NULL;
                 if (uobj_alive(img)) {
-                    GetSpriteFn get_spr = (GetSpriteFn)GUEST(0x2ceeda0);
-                    SetSpriteFn set_spr = (SetSpriteFn)GUEST(0x2cd5560);
+                    GetSpriteFn get_spr = (GetSpriteFn)GUEST_CALL(0x2cc9cd0, 0x2ceeda0);
+                    SetSpriteFn set_spr = (SetSpriteFn)GUEST_CALL(0x2cb0490, 0x2cd5560);
                     void *cur = get_spr(img, NULL);
                     void *rep = cda_blue_variant(cur, diff);
                     if (rep && rep != cur) {
@@ -7028,8 +7529,8 @@ static ABI int hook_image_anim_props(HookRegs *r) {
     typedef void (ABI *AnimPropsFn)(void *self, void *method);
     ((AnimPropsFn)original_image_anim_props)(self, method);
 
-    if (self) {
-        for (int i = 0; i < 128; ++i) {
+    if (self && s_has_cda_skins) {
+        for (int i = 0; i < s_cda_skin_limit; ++i) {
             if (s_cda_skins[i].image == self) {
                 cda_apply_image_skin(&s_cda_skins[i]);
                 break;
@@ -7042,24 +7543,29 @@ static ABI int hook_image_anim_props(HookRegs *r) {
 
 /* UnityEngine.UI.Image::set_sprite (0x2cd5560) */
 static ABI int hook_image_set_sprite(HookRegs *r) {
+    if (!s_has_cda_icons && !s_has_cda_skins) return 0;
     void *self = (void *)r->rdi;
     void *sprite = (void *)r->rsi;
     if (self && unity_native_alive(sprite)) {
-        for (int i = 0; i < 32; ++i) {
-            if (s_cda_icon_targets[i].image == self &&
-                (s_cda_icon_targets[i].slot == 4 || s_cda_icon_targets[i].slot == 5)) {
-                void *rep = cda_blue_variant(sprite, s_cda_icon_targets[i].slot);
-                if (unity_native_alive(rep)) r->rsi = (uint64_t)rep;
-                break;
+        if (s_has_cda_icons) {
+            for (int i = 0; i < s_cda_icon_limit; ++i) {
+                if (s_cda_icon_targets[i].image == self &&
+                    (s_cda_icon_targets[i].slot == 4 || s_cda_icon_targets[i].slot == 5)) {
+                    void *rep = cda_blue_variant(sprite, s_cda_icon_targets[i].slot);
+                    if (unity_native_alive(rep)) r->rsi = (uint64_t)rep;
+                    break;
+                }
             }
         }
-        for (int i = 0; i < 128; ++i) {
-            if (s_cda_skins[i].image == self &&
-                (s_cda_skins[i].slot == 4 || s_cda_skins[i].slot == 5)) {
-                s_cda_skins[i].source = sprite;
-                void *rep = cda_resolve_sprite(sprite, s_cda_skins[i].slot);
-                if (unity_native_alive(rep)) r->rsi = (uint64_t)rep;
-                break;
+        if (s_has_cda_skins) {
+            for (int i = 0; i < s_cda_skin_limit; ++i) {
+                if (s_cda_skins[i].image == self &&
+                    (s_cda_skins[i].slot == 4 || s_cda_skins[i].slot == 5)) {
+                    s_cda_skins[i].source = sprite;
+                    void *rep = cda_resolve_sprite(sprite, s_cda_skins[i].slot);
+                    if (unity_native_alive(rep)) r->rsi = (uint64_t)rep;
+                    break;
+                }
             }
         }
     }
@@ -7143,7 +7649,7 @@ static void ensure_extra_difficulty_records(void *record) {
     if (!dict) return;
 
     typedef void *(ABI *CreateDiffRecFn)(void *record, void *method);
-    CreateDiffRecFn create_diff = (CreateDiffRecFn)GUEST(0x45f2eb0);
+    CreateDiffRecFn create_diff = (CreateDiffRecFn)GUEST_CALL(0x45ded10, 0x45f2eb0);
 
     const int extra_keys[2] = {4, 5};
     for (int i = 0; i < 2; ++i) {
@@ -7172,15 +7678,34 @@ typedef void (ABI *PsrSetI32Fn)(void *psr, int32_t val, void *method);
 typedef int64_t (ABI *PsrGetI64Fn)(void *psr, void *method);
 typedef void (ABI *PsrSetI64Fn)(void *psr, int64_t val, void *method);
 
+static volatile int s_custom_records_saving = 0;
+
+bool runtime_custom_charts_records_busy(void) {
+    return __atomic_load_n(&s_custom_records_saving, __ATOMIC_ACQUIRE) > 0;
+}
+
 static void save_custom_records_to_path(const char *path, const CustomRecordsHeader *hdr, const CustomSavedSongRecord *recs, size_t count) {
     if (!path || !path[0]) return;
-    FILE *f = fopen(path, "wb");
+    char tmp_path[600];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE *f = fopen(tmp_path, "wb");
     if (!f) return;
-    fwrite(hdr, sizeof(*hdr), 1, f);
-    if (count > 0 && recs) {
-        fwrite(recs, sizeof(CustomSavedSongRecord), count, f);
+    size_t w_hdr = fwrite(hdr, sizeof(*hdr), 1, f);
+    size_t w_recs = (count > 0 && recs) ? fwrite(recs, sizeof(CustomSavedSongRecord), count, f) : 0;
+    int close_rc = fclose(f);
+    if (w_hdr != 1 || (count > 0 && w_recs != count) || close_rc != 0) {
+        remove(tmp_path);
+        return;
     }
-    fclose(f);
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING)) {
+        remove(tmp_path);
+    }
+#else
+    if (rename(tmp_path, path) != 0) {
+        remove(tmp_path);
+    }
+#endif
 }
 
 typedef struct {
@@ -7193,15 +7718,17 @@ typedef struct {
 
 static void *async_save_custom_records_worker(void *arg) {
     AsyncSaveCustomRecordsJob *job = (AsyncSaveCustomRecordsJob *)arg;
-    if (!job) return NULL;
-    if (job->path_primary[0]) {
-        save_custom_records_to_path(job->path_primary, &job->hdr, job->recs, job->count);
+    if (job) {
+        if (job->path_primary[0]) {
+            save_custom_records_to_path(job->path_primary, &job->hdr, job->recs, job->count);
+        }
+        if (job->path_slot[0]) {
+            save_custom_records_to_path(job->path_slot, &job->hdr, job->recs, job->count);
+        }
+        if (job->recs) free(job->recs);
+        free(job);
     }
-    if (job->path_slot[0]) {
-        save_custom_records_to_path(job->path_slot, &job->hdr, job->recs, job->count);
-    }
-    if (job->recs) free(job->recs);
-    free(job);
+    __atomic_sub_fetch(&s_custom_records_saving, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
@@ -7230,16 +7757,16 @@ static void save_custom_records(void *music_info) {
         if (!fav_changed) return;
     }
 
-    GetPlayStyleRecFn get_psr = (GetPlayStyleRecFn)GUEST(0x45fd7e0);
-    PsrGetI32Fn get_hs = (PsrGetI32Fn)GUEST(0x45febe0);
-    PsrGetI64Fn get_dt = (PsrGetI64Fn)GUEST(0x45fec20);
-    PsrGetI32Fn get_rk = (PsrGetI32Fn)GUEST(0x45fecf0);
-    PsrGetI32Fn get_mc = (PsrGetI32Fn)GUEST(0x45fed10);
-    PsrGetI32Fn get_cm = (PsrGetI32Fn)GUEST(0x45fed50);
-    PsrGetI32Fn get_pc = (PsrGetI32Fn)GUEST(0x45fe9e0);
-    PsrGetI32Fn get_cc = (PsrGetI32Fn)GUEST(0x45feee0);
-    PsrGetI32Fn get_fc = (PsrGetI32Fn)GUEST(0x45fef20);
-    PsrGetI32Fn get_md = (PsrGetI32Fn)GUEST(0x45fef60);
+    GetPlayStyleRecFn get_psr = (GetPlayStyleRecFn)GUEST_CALL(0x45e96b0, 0x45fd7e0);
+    PsrGetI32Fn get_hs = (PsrGetI32Fn)GUEST_CALL(0x45eaab0, 0x45febe0);
+    PsrGetI64Fn get_dt = (PsrGetI64Fn)GUEST_CALL(0x45eaaf0, 0x45fec20);
+    PsrGetI32Fn get_rk = (PsrGetI32Fn)GUEST_CALL(0x45eabc0, 0x45fecf0);
+    PsrGetI32Fn get_mc = (PsrGetI32Fn)GUEST_CALL(0x45eabe0, 0x45fed10);
+    PsrGetI32Fn get_cm = (PsrGetI32Fn)GUEST_CALL(0x45eac20, 0x45fed50);
+    PsrGetI32Fn get_pc = (PsrGetI32Fn)GUEST_CALL(0x45ea8b0, 0x45fe9e0);
+    PsrGetI32Fn get_cc = (PsrGetI32Fn)GUEST_CALL(0x45eadb0, 0x45feee0);
+    PsrGetI32Fn get_fc = (PsrGetI32Fn)GUEST_CALL(0x45eadf0, 0x45fef20);
+    PsrGetI32Fn get_md = (PsrGetI32Fn)GUEST_CALL(0x45eae30, 0x45fef60);
 
     CustomSavedSongRecord *recs = (CustomSavedSongRecord *)calloc(song_count, sizeof(CustomSavedSongRecord));
     if (!recs) return;
@@ -7311,6 +7838,7 @@ static void save_custom_records(void *music_info) {
         snprintf(job->path_slot, sizeof(job->path_slot), "%s/customRecords.dat", active_dir);
     }
 
+    __atomic_add_fetch(&s_custom_records_saving, 1, __ATOMIC_ACQ_REL);
     pthread_t th;
     if (pthread_create(&th, NULL, async_save_custom_records_worker, job) == 0) {
         pthread_detach(th);
@@ -7383,18 +7911,18 @@ static void load_custom_records(void *music_info) {
     fclose(f);
 
     typedef void *(ABI *GetRecFn)(void *self, void *mid, void *method);
-    GetPlayStyleRecFn get_psr = (GetPlayStyleRecFn)GUEST(0x45fd7e0);
-    PsrSetI32Fn set_hs = (PsrSetI32Fn)GUEST(0x45fec00);
-    PsrSetI64Fn set_dt = (PsrSetI64Fn)GUEST(0x45fec30);
-    PsrSetI32Fn set_rk = (PsrSetI32Fn)GUEST(0x45fed00);
-    PsrSetI32Fn set_mc = (PsrSetI32Fn)GUEST(0x45fed30);
-    PsrSetI32Fn set_cm = (PsrSetI32Fn)GUEST(0x45fed60);
-    PsrSetI32Fn set_pc = (PsrSetI32Fn)GUEST(0x45feec0);
-    PsrSetI32Fn set_cc = (PsrSetI32Fn)GUEST(0x45fef00);
-    PsrSetI32Fn set_fc = (PsrSetI32Fn)GUEST(0x45fef40);
-    PsrSetI32Fn set_md = (PsrSetI32Fn)GUEST(0x45fef80);
+    GetPlayStyleRecFn get_psr = (GetPlayStyleRecFn)GUEST_CALL(0x45e96b0, 0x45fd7e0);
+    PsrSetI32Fn set_hs = (PsrSetI32Fn)GUEST_CALL(0x45eaad0, 0x45fec00);
+    PsrSetI64Fn set_dt = (PsrSetI64Fn)GUEST_CALL(0x45eab00, 0x45fec30);
+    PsrSetI32Fn set_rk = (PsrSetI32Fn)GUEST_CALL(0x45eabd0, 0x45fed00);
+    PsrSetI32Fn set_mc = (PsrSetI32Fn)GUEST_CALL(0x45eac00, 0x45fed30);
+    PsrSetI32Fn set_cm = (PsrSetI32Fn)GUEST_CALL(0x45eac30, 0x45fed60);
+    PsrSetI32Fn set_pc = (PsrSetI32Fn)GUEST_CALL(0x45ead90, 0x45feec0);
+    PsrSetI32Fn set_cc = (PsrSetI32Fn)GUEST_CALL(0x45eadd0, 0x45fef00);
+    PsrSetI32Fn set_fc = (PsrSetI32Fn)GUEST_CALL(0x45eae10, 0x45fef40);
+    PsrSetI32Fn set_md = (PsrSetI32Fn)GUEST_CALL(0x45eae50, 0x45fef80);
     typedef bool (ABI *CheckBarBuriedFn)(void *psr, void *method);
-    CheckBarBuriedFn check_buried = (CheckBarBuriedFn)GUEST(0x45fee40);
+    CheckBarBuriedFn check_buried = (CheckBarBuriedFn)GUEST_CALL(0x45ead10, 0x45fee40);
 
     int restored = 0;
     for (size_t i = 0; i < nread; ++i) {
@@ -7440,10 +7968,8 @@ static void load_custom_records(void *music_info) {
                                 put32((char *)elem + 0x18, fbits);
                             }
                         }
-                        if ( is_game_104 ) {
-                            bool buried = check_buried(psr, NULL);
-                            *(uint8_t *)((char *)psr + 0x40) = buried ? 1u : 0u;
-                        }
+                        bool buried = check_buried(psr, NULL);
+                        *(uint8_t *)((char *)psr + 0x40) = buried ? 1u : 0u;
                     }
                 }
             }
@@ -7555,7 +8081,7 @@ static ABI int hook_get_music_record(HookRegs *r) {
     void *record = original_get_music_record ? ((GetRecFn)original_get_music_record)(self, mid, (void *)r->rdx) : NULL;
     if (!record && self) {
         typedef void *(ABI *CreateRecFn)(void *self, void *mid, void *method);
-        CreateRecFn create_rec = (CreateRecFn)GUEST(0x45f34c0);
+        CreateRecFn create_rec = (CreateRecFn)GUEST_CALL(0x45df320, 0x45f34c0);
         record = create_rec(self, mid, NULL);
         if (record) {
             uint32_t rroot = gc_pin(record, false);
@@ -7594,7 +8120,7 @@ static void unlock_all_custom_records(void *self) {
     void *dict = *(void **)((char *)self + 0x20);
     typedef void *(ABI *GetRecFn)(void *self, void *mid, void *method);
     typedef void *(ABI *CreateRecFn)(void *self, void *mid, void *method);
-    CreateRecFn create_rec = (CreateRecFn)GUEST(0x45f34c0);
+    CreateRecFn create_rec = (CreateRecFn)GUEST_CALL(0x45df320, 0x45f34c0);
 
     int unlocked_count = 0;
     for (size_t i = 0; i < song_count; ++i) {
@@ -7715,7 +8241,7 @@ static ABI int hook_music_record_total_play_count(HookRegs *r) {
     typedef int32_t (ABI *GetTotalPCFn)(void *self, void *method);
     typedef int32_t (ABI *GetPCFn)(void *psr, void *method);
     int32_t total = ((GetTotalPCFn)original_music_record_total_play_count)(self, method);
-    GetPCFn get_pc = (GetPCFn)GUEST(0x45fe9e0);
+    GetPCFn get_pc = (GetPCFn)GUEST_CALL(0x45ea8b0, 0x45fe9e0);
 
     if (self) {
         void *mid = (void *)load64((char *)self + 0x18);
@@ -7759,7 +8285,7 @@ static ABI int hook_profica_clear_ctor(HookRegs *r) {
             if (new_arr && elem_klass) {
                 uint32_t aroot = gc_pin(new_arr, false);
                 memcpy((char *)new_arr + 0x20, (char *)old_arr + 0x20, 4 * sizeof(void *));
-                CtorFn diff_clear_ctor = (CtorFn)GUEST(0x0acbbd0); /* ProficaDifficultyClearData::.ctor */
+                CtorFn diff_clear_ctor = (CtorFn)GUEST_CALL(0x1062e70, 0x0acbbd0); /* ProficaDifficultyClearData::.ctor */
                 for (int slot = 4; slot < MAX_SLOTS; ++slot) {
                     void *fresh = alloc_managed_object(elem_klass);
                     if (!fresh) break;
@@ -7862,148 +8388,272 @@ static ABI int hook_rhythpo_set_total(HookRegs *r) {
 
 static const Hook custom_hooks[] = {
     /* v1.0.4 Table, Localization, & Asset Loader hooks */
-    {0x0b57c40, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_music_table_convert, 0, 104},
-    {0x0b60660, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_series_table_convert, 0, 104},
-    {0x0b60ad0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_sound_labels, 0, 104},
-    {0x0eb61b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_music_id_get_name, 0, 104},
-    {0x0eb6310, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_id_get_sort_name, 0, 104},
-    {0x0ebeca0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_series_id_get_name, 0, 104},
-    {0x0ebee00, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_id_get_name, 0, 104},
-    {0x2d5af80, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_language_translation, 0, 104},
-    {0x1718540, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_address, 0, 104},
-    {0x17188b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_filename, 0, 104},
-    {0x17201e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_address, 0, 104},
-    {0x17204a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_subasset, 0, 104},
-    {0x1e1a470, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_load_asset_sync, 0, 104},
-    {0x1e1a530, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_load_asset_async, 0, 104},
-    {0x1e1c250, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_get_assets, 0, 104},
-    {0x1e1c190, 6,  {0x48,0x83,0xc7,0x20,0x31,0xf6}, hook_is_done, 0, 104},
-    {0x1e1c1a0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_progress, 0, 104},
-    {0x1e1a650, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_release_asset, 0, 104},
-    {0x1dcd5e0, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_text_asset_get_bytes, 0, 104},
-    {0x1dcd6f0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_ptr, 0, 104},
-    {0x1dcd740, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_size, 0, 104},
+    {0x0b57c40, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_music_table_convert, 0, 104, &original_music_convert},
+    {0x0b585b0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_music_table_get_difficulty_value_list, 0, 104, &original_music_get_diff_value_list},
+    {0x0b60660, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_series_table_convert, 0, 104, &original_series_convert},
+    {0x0b60ad0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_sound_labels, 0, 104, &original_sound_labels},
+    {0x0eb61b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_music_id_get_name, 0, 104, NULL},
+    {0x0eb6310, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_id_get_sort_name, 0, 104, NULL},
+    {0x0ebeca0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_series_id_get_name, 0, 104, NULL},
+    {0x0ebee00, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_id_get_name, 0, 104, NULL},
+    {0x2d5af80, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_language_translation, 0, 104, NULL},
+    {0x1718540, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_address, 0, 104, NULL},
+    {0x17188b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_filename, 0, 104, NULL},
+    {0x17201e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_address, 0, 104, NULL},
+    {0x17204a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_subasset, 0, 104, NULL},
+    {0x1e1a470, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_load_asset_sync, 0, 104, NULL},
+    {0x1e1a530, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_load_asset_async, 0, 104, NULL},
+    {0x1e1c250, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_get_assets, 0, 104, &original_get_assets},
+    {0x1e1c190, 6,  {0x48,0x83,0xc7,0x20,0x31,0xf6}, hook_is_done, 0, 104, NULL},
+    {0x1e1c1a0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_progress, 0, 104, NULL},
+    {0x1e1a650, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_release_asset, 0, 104, NULL},
+    {0x1dcd5e0, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_text_asset_get_bytes, 0, 104, NULL},
+    {0x1dcd6f0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_ptr, 0, 104, NULL},
+    {0x1dcd740, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_size, 0, 104, NULL},
 
     /* v1.0.4 Stage, Judgements, & Native Page 3 Results hooks */
-    {0x2719a30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_create_triggers_movenext, 0, 104},
-    {0x271f7e0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_visible, 0, 104},
-    {0x2724340, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_fade, 0, 104},
-    {0x2723d90, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_set_simple_type, 0, 104},
-    {0x2724090, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_simple_color, 0, 104},
-    {0x243df90, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_se, 0, 104},
-    {0x32d1800, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_runtime_update, 0, 104},
-    {0x32d3160, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_miss_judge, 0, 104},
-    {0x32febc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_bms_update_holding, 0, 104},
-    {0x2fec920, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_play_judge_effect, 0, 104},
-    {0x339d6a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_start, 0, 104},
-    {0x339cbe0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_init, 0, 104},
-    {0x338c400, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_finish, 0, 104},
-    {0x1f132b0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_input_damage, 0, 104},
-    {0x243bb40, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_play_setting_config, 0, 104},
-    {0x0aea4a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_fixed_trigger_judge, 0, 104},
-    {0x12c4750, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_need_update_best_score, 0, 104},
-    {0x12c48f0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_title_parts_init, 0, 104},
-    {0x12ca0c0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 104},
-    {0x12cacc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 104},
-    {0x1029290, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_init, 0, 104},
-    {0x102a930, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_action, 0, 104},
-    {0x1035110, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_move_next_scene, 0, 104},
-    {0x1e10040, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_gummi_anim_update, 0, 104},
+    {0x2719a30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_create_triggers_movenext, 0, 104, (void **)&original_create_triggers_movenext},
+    {0x271f7e0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_visible, 0, 104, NULL},
+    {0x2724340, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_fade, 0, 104, NULL},
+    {0x2723d90, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53},      hook_slidehold_trigger_set_simple_type, 0, 104, NULL},
+    {0x2724090, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_trigger_set_simple_color, 0, 104, NULL},
+    {0x243df90, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_se, 0, 104, NULL},
+    {0x32d1800, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_runtime_update, 0, 104, (void **)&original_runtime_context_update},
+    {0x32d3160, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_miss_judge, 0, 104, NULL},
+    {0x32febc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_bms_update_holding, 0, 104, NULL},
+    {0x2fec920, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_slidehold_play_judge_effect, 0, 104, (void **)&original_play_judge_effect},
+    {0x339d6a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_start, 0, 104, NULL},
+    {0x339cbe0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_init, 0, 104, &original_theater_begin_init},
+    {0x338c400, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_finish, 0, 104, NULL},
+    {0x1f132b0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_input_damage, 0, 104, NULL},
+    {0x243bb40, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_play_setting_config, 0, 104, (void **)&original_play_setting_config},
+    {0x0aea4a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_fixed_trigger_judge, 0, 104, NULL},
+    {0x12c4750, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_need_update_best_score, 0, 104, (void **)&original_need_update_best_score},
+    {0x12c48f0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_title_parts_init, 0, 104, NULL},
+    {0x12ca0c0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 104, NULL},
+    {0x12cacc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 104, NULL},
+    {0x1029290, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_init, 0, 104, NULL},
+    {0x102a930, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_action, 0, 104, NULL},
+    {0x1841a20, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_countup_on_end, 0, 104, NULL},
+    {0x12c0390, 9,  {0x48,0x8b,0xbf,0x90,0x00,0x00,0x00,0x31,0xd2}, hook_retry_window_open, 0, 104, NULL},
+    {0x1035110, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_move_next_scene, 0, 104, NULL},
+    {0x1e10040, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_gummi_anim_update, 0, 104, NULL},
 
     /* v1.0.4 Music Select, 6-Difficulty, Jacket, & Popup hooks */
-    {0x27297f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_change_to_view_difficulty, 0, 104},
-    {0x1025de0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_selecting_ms_ctor, 0, 104},
-    {0x10261e0, 16, {0x89,0x77,0x2c,0xc3,0x66,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00}, hook_selecting_ms_set_diff, 0, 104},
-    {0x1026350, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_selecting_get_diff_value, 0, 104},
-    {0x272e2e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_ctor, 0, 104},
-    {0x272e760, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_set_diff, 0, 104},
-    {0x16978e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_add_song, 0, 104},
-    {0x1698850, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_filter_panel, 0, 104},
-    {0x1697f70, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_menu_is_playable, 0, 104},
-    {0x1695550, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_list_change_view_diff, 0, 104},
-    {0x168e160, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_list_change_view_diff, 0, 104},
-    {0x168e7c0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_sort_refresh_badges, 0, 104},
-    {0x16857f0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_sort_refresh_badges, 0, 104},
-    {0x101e570, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_sort_refresh_badges, 0, 104},
-    {0x1688240, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_refresh_view, 0, 104},
-    {0x16892a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_change_play_data, 0, 104},
-    {0x1689ae0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_set_difficulty, 0, 104},
-    {0x168a1f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_execute, 0, 104},
-    {0x168a320, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_difficulty_reaction, 0, 104},
-    {0x1678de0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_view_on_set_view, 0, 104},
-    {0x13633f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_on_ready, 0, 104},
-    {0x135df60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_set_status, 0, 104},
-    {0x1363a00, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_submit, 0, 104},
-    {0x1364190, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_execute, 0, 104},
-    {0x1364300, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_window_setup_change_difficulty, 0, 104},
+    {0x27297f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_change_to_view_difficulty, 0, 104, NULL},
+    {0x2729ca0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_count_data_list_init, 0, 104, &original_count_data_list_init},
+    {0x272b800, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_set_sort_category_count, 0, 104, &original_set_sort_category_count},
+    {0x272cbb0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_edit_count, 0, 104, &original_edit_count},
+    {0x1693df0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_create_selectable_sort_data, 0, 104, NULL},
+    {0x1025de0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_selecting_ms_ctor, 0, 104, NULL},
+    {0x10261e0, 16, {0x89,0x77,0x2c,0xc3,0x66,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00}, hook_selecting_ms_set_diff, 0, 104, NULL},
+    {0x1026350, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_selecting_get_diff_value, 0, 104, NULL},
+    {0x272e2e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_ctor, 0, 104, NULL},
+    {0x272e760, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_set_diff, 0, 104, NULL},
+    {0x16978e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_add_song, 0, 104, &original_menu_add_song},
+    {0x1698850, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_filter_panel, 0, 104, NULL},
+    {0x1697f70, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_menu_is_playable, 0, 104, NULL},
+    {0x1695550, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_list_change_view_diff, 0, 104, NULL},
+    {0x168e160, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_list_change_view_diff, 0, 104, NULL},
+    {0x168e7c0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_sort_refresh_badges, 0, 104, NULL},
+    {0x16857f0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_sort_refresh_badges, 0, 104, NULL},
+    {0x101e570, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_sort_refresh_badges, 0, 104, NULL},
+    {0x1688240, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_refresh_view, 0, 104, &original_jacket_refresh_view},
+    {0x16892a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_change_play_data, 0, 104, NULL},
+    {0x1689ae0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_set_difficulty, 0, 104, NULL},
+    {0x168a1f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_execute, 0, 104, NULL},
+    {0x168a320, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_difficulty_reaction, 0, 104, NULL},
+    {0x1678de0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_view_on_set_view, 0, 104, &original_panel_view_on_set_view},
+    {0x13633f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_on_ready, 0, 104, &original_popup_on_ready},
+    {0x135df60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_set_status, 0, 104, &original_popup_set_status},
+    {0x1363a00, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_submit, 0, 104, NULL},
+    {0x1364190, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_execute, 0, 104, NULL},
+    {0x1364300, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_window_setup_change_difficulty, 0, 104, NULL},
 
     /* v1.0.4 Beginner (4) & Chaos (5) Artwork, UI, Stage, Results, & Retry hooks */
-    {0x1d95610, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_diff_list_set_difficulty, 0, 104},
-    {0x1d95e70, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_clamp_rdi_diff, 0, 104},
-    {0x1d96b80, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_active_edition_mark, 0, 104},
-    {0x1d96c60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_level_base_set_difficulty, 0, 104},
-    {0x1679e10, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_name_set_color, 0, 104},
-    {0x135ead0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_status_set_diff_color, 0, 104},
-    {0x1710c90, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104},
-    {0x1710fa0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104},
-    {0x1711160, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104},
-    {0x171bc60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104},
-    {0x171c0d0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104},
-    {0x12c7cc0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_load_title_plate_move_next, 0, 104},
-    {0x1f0d860, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_icon_sprite, 0, 104},
-    {0x1f0d900, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_semicircle_sprite, 0, 104},
-    {0x1f0d9a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_banner_sprite, 0, 104},
-    {0x3175e60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_stage_intro_setup, 0, 104},
-    {0x32ebe10, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_stage_music_info_setup, 0, 104},
-    {0x3174160, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_intro_setup, 0, 104},
-    {0x1f17aa0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_create_ms_parts, 0, 104},
-    {0x29f6000, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_live_info_setup_fixed_text, 0, 104},
-    {0x1d15980, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_support_manager_setup, 0, 104},
-    {0x1d16170, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_support_start, 0, 104},
-    {0x243a0e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_play_setting, 0, 104},
-    {0x1726610, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_trigger_data_loader_get_address, 0, 104},
-    {0x32d5870, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_runtime_context_setup, 0, 104},
-    {0x2fcad30, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_clamp_rdi_diff, 0, 104},
-    {0x2a046a0, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_clamp_rdi_diff, 0, 104},
-    {0x2cc2b00, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_ability_condition_setup, 0, 104},
-    {0x244ab30, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_summon_bar_util_setup, 0, 104},
-    {0x12bdaa0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_copy_ms_play_data, 0, 104},
-    {0x12c6610, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_title_display_setup, 0, 104},
-    {0x183a270, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_retry_window_on_update, 0, 104},
-    {0x2d00430, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_image_anim_props, 0, 104},
-    {0x2cd5560, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_image_set_sprite, 0, 104},
+    {0x1d95610, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_diff_list_set_difficulty, 0, 104, NULL},
+    {0x1d95e70, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_clamp_rdi_diff, 0, 104, NULL},
+    {0x1d96b80, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_active_edition_mark, 0, 104, &original_set_active_edition_mark},
+    {0x1d96c60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_level_base_set_difficulty, 0, 104, NULL},
+    {0x1679e10, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_name_set_color, 0, 104, NULL},
+    {0x135ead0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_status_set_diff_color, 0, 104, &original_music_status_set_diff_color},
+    {0x1710c90, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104, NULL},
+    {0x1710fa0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104, NULL},
+    {0x1711160, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104, NULL},
+    {0x171bc60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104, NULL},
+    {0x171c0d0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 104, NULL},
+    {0x12c7cc0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_load_title_plate_move_next, 0, 104, &original_load_title_plate_move_next},
+    {0x1f0d860, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_icon_sprite, 0, 104, NULL},
+    {0x1f0d900, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_semicircle_sprite, 0, 104, &original_get_diff_semicircle},
+    {0x1f0d9a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_banner_sprite, 0, 104, NULL},
+    {0x3175e60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_stage_intro_setup, 0, 104, &original_stage_intro_setup},
+    {0x32ebe10, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_stage_music_info_setup, 0, 104, NULL},
+    {0x3174160, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_intro_setup, 0, 104, NULL},
+    {0x1f17aa0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_create_ms_parts, 0, 104, NULL},
+    {0x29f6000, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_live_info_setup_fixed_text, 0, 104, &original_live_info_setup_fixed_text},
+    {0x1d15980, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_support_manager_setup, 0, 104, NULL},
+    {0x1d16170, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_support_start, 0, 104, NULL},
+    {0x243a0e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_play_setting, 0, 104, NULL},
+    {0x1726610, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_trigger_data_loader_get_address, 0, 104, NULL},
+    {0x32d5870, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_runtime_context_setup, 0, 104, NULL},
+    {0x2fcad30, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_clamp_rdi_diff, 0, 104, NULL},
+    {0x2a046a0, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_clamp_rdi_diff, 0, 104, NULL},
+    {0x2cc2b00, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_ability_condition_setup, 0, 104, NULL},
+    {0x244ab30, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_summon_bar_util_setup, 0, 104, NULL},
+    {0x12bdaa0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_copy_ms_play_data, 0, 104, NULL},
+    {0x12c6610, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_title_display_setup, 0, 104, NULL},
+    {0x183a270, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_retry_window_on_update, 0, 104, NULL},
+    {0x2d00430, 6,  {0x55,0x48,0x89,0xe5,0x53,0x50}, hook_image_anim_props, 0, 104, &original_image_anim_props},
+    {0x2cd5560, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_image_set_sprite, 0, 104, &original_image_set_sprite},
 
     /* v1.0.4 Records, Save Isolation, Profica, PlayStyleCache, & Rhythmia Protection hooks */
-    {0x45fd770, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_music_record, 0, 104},
-    {0x45f34c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_create_music_record, 0, 104},
-    {0x45f29c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_loaded_data_music_records, 0, 104},
-    {0x45f3830, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_setup_dlc_music_records, 0, 104},
-    {0x45fddc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_music_record_total_play_count, 0, 104},
-    {0x0acb760, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_profica_clear_ctor, 0, 104},
-    {0x0ac70c0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_profica_create_profile, 0, 104},
-    {0x0f640d0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_register_play_style_record, 0, 104},
-    {0x19da2e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_info_serialize, 0, 104},
-    {0x45bded0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 104},
-    {0x45c03b0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 104},
-    {0x45c0c50, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_rhythpo_get_table_bonus, 0, 104},
-    {0x45bca40, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_rhythpo_add_bonus, 0, 104},
-    {0x0ace990, 8,  {0x48,0x8b,0x47,0x20,0x48,0x8b,0x48,0x10}, hook_rhythpo_set_total, 0, 104},
+    {0x45fd770, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_music_record, 0, 104, &original_get_music_record},
+    {0x45f34c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_create_music_record, 0, 104, &original_create_music_record},
+    {0x45f29c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_loaded_data_music_records, 0, 104, &original_loaded_data_music_records},
+    {0x45f3830, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_setup_dlc_music_records, 0, 104, &original_setup_dlc_music_records},
+    {0x45fddc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_music_record_total_play_count, 0, 104, &original_music_record_total_play_count},
+    {0x0acb760, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_profica_clear_ctor, 0, 104, &original_profica_clear_ctor},
+    {0x0ac70c0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_profica_create_profile, 0, 104, &original_profica_create_profile},
+    {0x0f640d0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_register_play_style_record, 0, 104, NULL},
+    {0x19da2e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_info_serialize, 0, 104, &original_music_info_serialize},
+    {0x45bded0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 104, NULL},
+    {0x45c03b0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 104, NULL},
+    {0x45c0c50, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_rhythpo_get_table_bonus, 0, 104, NULL},
+    {0x45bca40, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_rhythpo_add_bonus, 0, 104, NULL},
+    {0x0ace990, 8,  {0x48,0x8b,0x47,0x20,0x48,0x8b,0x48,0x10}, hook_rhythpo_set_total, 0, 104, NULL},
 
-    /* v1.0.0 Stage & Results hooks */
-    {0x335b680, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_start, 0, 100},
-    {0x335abc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_init, 0, 100},
-    {0x334a3e0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_finish, 0, 100},
-    {0x1f20c50, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_input_damage, 0, 100},
-    {0x23ad8a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_play_setting_config, 0, 100},
-    {0x107c910, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_fixed_trigger_judge, 0, 100},
-    {0x1246de0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_need_update_best_score, 0, 100},
-    {0x1246f80, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_title_parts_init, 0, 100},
-    {0x124c750, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 100},
-    {0x124d350, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 100},
-    {0x0fe5f30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_init, 0, 100},
-    {0x0fe75d0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_action, 0, 100},
-    {0x0ff1db0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_move_next_scene, 0, 100},
-    {0x1e6f010, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_gummi_anim_update, 0, 100}
+    /* v1.0.0 Table, Localization, & Asset Loader hooks */
+    {0x0a8bdd0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, wrap_music_table_convert, 0, 100, &original_music_convert},
+    {0x0a8c740, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_music_table_get_difficulty_value_list, 0, 100, &original_music_get_diff_value_list},
+    {0x0a947f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, wrap_series_table_convert, 0, 100, &original_series_convert},
+    {0x0a94c60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, wrap_sound_labels, 0, 100, &original_sound_labels},
+    {0x0e87f30, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_music_id_get_name, 0, 100, NULL},
+    {0x0e88090, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_id_get_sort_name, 0, 100, NULL},
+    {0x0e90a20, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_series_id_get_name, 0, 100, NULL},
+    {0x0e90b80, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_id_get_name, 0, 100, NULL},
+    {0x2cfc820, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_language_translation, 0, 100, NULL},
+    {0x18ecb50, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_address, 0, 100, NULL},
+    {0x18ecec0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_loader_get_filename, 0, 100, NULL},
+    {0x18f47f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_address, 0, 100, NULL},
+    {0x18f4ab0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_series_logo_get_subasset, 0, 100, NULL},
+    {0x1e79440, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_load_asset_sync, 0, 100, NULL},
+    {0x1e79500, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_load_asset_async, 0, 100, NULL},
+    {0x1e7b220, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_get_assets, 0, 100, &original_get_assets},
+    {0x1e7b160, 6,  {0x48,0x83,0xc7,0x20,0x31,0xf6}, hook_is_done, 0, 100, NULL},
+    {0x1e7b170, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_progress, 0, 100, NULL},
+    {0x1e79620, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_release_asset, 0, 100, NULL},
+    {0x1e2c5b0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_bytes, 0, 100, NULL},
+    {0x1e2c6c0, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_ptr, 0, 100, NULL},
+    {0x1e2c710, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_text_asset_get_data_size, 0, 100, NULL},
+
+    /* v1.0.0 Stage, Judgements, & Native Page 3 Results hooks */
+    {0x2811300, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_create_triggers_movenext, 0, 100, (void **)&original_create_triggers_movenext},
+    {0x2816e30, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_trigger_set_visible, 0, 100, NULL},
+    {0x281b340, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_slidehold_trigger_fade, 0, 100, NULL},
+    {0x23afcf0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_se, 0, 100, NULL},
+    {0x29ac0a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_runtime_update, 0, 100, (void **)&original_runtime_context_update},
+    {0x29ad920, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_miss_judge, 0, 100, NULL},
+    {0x3344dc0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_bms_update_holding, 0, 100, NULL},
+    {0x31262b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_slidehold_play_judge_effect, 0, 100, (void **)&original_play_judge_effect},
+    {0x335b680, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_start, 0, 100, NULL},
+    {0x335abc0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_begin_init, 0, 100, &original_theater_begin_init},
+    {0x334a3e0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_theater_finish, 0, 100, NULL},
+    {0x1f20c50, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_input_damage, 0, 100, NULL},
+    {0x23ad8a0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_play_setting_config, 0, 100, (void **)&original_play_setting_config},
+    {0x107c910, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_fixed_trigger_judge, 0, 100, NULL},
+    {0x1246de0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_need_update_best_score, 0, 100, (void **)&original_need_update_best_score},
+    {0x1246f80, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_title_parts_init, 0, 100, NULL},
+    {0x124c750, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 100, NULL},
+    {0x124d350, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_best_play_setup, 0, 100, NULL},
+    {0x0fe5f30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_init, 0, 100, NULL},
+    {0x0fe75d0, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_result_detail_action, 0, 100, NULL},
+    {0x1819a60, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_countup_on_end, 0, 100, NULL},
+    {0x1242a20, 9,  {0x48,0x8b,0xbf,0x90,0x00,0x00,0x00,0x31,0xd2}, hook_retry_window_open, 0, 100, NULL},
+    {0x0ff1db0, 7,  {0x55,0x48,0x89,0xe5,0x41,0x56,0x53}, hook_move_next_scene, 0, 100, NULL},
+    {0x1e6f010, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_gummi_anim_update, 0, 100, NULL},
+
+    /* v1.0.0 Music Select, 6-Difficulty, Jacket, & Popup hooks */
+    {0x2820480, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_change_to_view_difficulty, 0, 100, NULL},
+    {0x2820930, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_count_data_list_init, 0, 100, &original_count_data_list_init},
+    {0x2822490, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_set_sort_category_count, 0, 100, &original_set_sort_category_count},
+    {0x2823840, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, wrap_edit_count, 0, 100, &original_edit_count},
+    {0x160b320, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_create_selectable_sort_data, 0, 100, NULL},
+    {0x0fe2a80, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_selecting_ms_ctor, 0, 100, NULL},
+    {0x0fe2e80, 16, {0x89,0x77,0x2c,0xc3,0x66,0x66,0x66,0x2e,0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00}, hook_selecting_ms_set_diff, 0, 100, NULL},
+    {0x0fe2ff0, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_selecting_get_diff_value, 0, 100, NULL},
+    {0x2824f70, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_ctor, 0, 100, NULL},
+    {0x28253f0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_set_diff, 0, 100, NULL},
+    {0x160edf0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_add_song, 0, 100, &original_menu_add_song},
+    {0x160fd60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_menu_filter_panel, 0, 100, NULL},
+    {0x160f480, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_menu_is_playable, 0, 100, NULL},
+    {0x160ca60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_list_change_view_diff, 0, 100, NULL},
+    {0x1605790, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_list_change_view_diff, 0, 100, NULL},
+    {0x1605df0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_sort_refresh_badges, 0, 100, NULL},
+    {0x15fce20, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_sort_refresh_badges, 0, 100, NULL},
+    {0x0fdb210, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_sort_refresh_badges, 0, 100, NULL},
+    {0x15ff870, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_refresh_view, 0, 100, &original_jacket_refresh_view},
+    {0x16008d0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_change_play_data, 0, 100, NULL},
+    {0x1601110, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_set_difficulty, 0, 100, NULL},
+    {0x1601820, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_execute, 0, 100, NULL},
+    {0x1601950, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_jacket_difficulty_reaction, 0, 100, NULL},
+    {0x15f0240, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_panel_view_on_set_view, 0, 100, &original_panel_view_on_set_view},
+    {0x1689cd0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_on_ready, 0, 100, &original_popup_on_ready},
+    {0x1684900, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_set_status, 0, 100, &original_popup_set_status},
+    {0x168a2e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_submit, 0, 100, NULL},
+    {0x168aa70, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_popup_execute, 0, 100, NULL},
+    {0x168abe0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_window_setup_change_difficulty, 0, 100, NULL},
+
+    /* v1.0.0 Beginner (4) & Chaos (5) Artwork, UI, Stage, Results, & Retry hooks */
+    {0x1dde2c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_diff_list_set_difficulty, 0, 100, NULL},
+    {0x1ddeb20, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_clamp_rdi_diff, 0, 100, NULL},
+    {0x1ddf830, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_active_edition_mark, 0, 100, &original_set_active_edition_mark},
+    {0x1ddf910, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_level_base_set_difficulty, 0, 100, NULL},
+    {0x15f12c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_name_set_color, 0, 100, NULL},
+    {0x1685410, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_status_set_diff_color, 0, 100, &original_music_status_set_diff_color},
+    {0x18e52a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 100, NULL},
+    {0x18e55b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 100, NULL},
+    {0x18e5770, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 100, NULL},
+    {0x18f0270, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 100, NULL},
+    {0x18f06e0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_title_plate_clamp_expert, 0, 100, NULL},
+    {0x124a350, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_load_title_plate_move_next, 0, 100, &original_load_title_plate_move_next},
+    {0x1f1b200, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_icon_sprite, 0, 100, NULL},
+    {0x1f1b2a0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_semicircle_sprite, 0, 100, &original_get_diff_semicircle},
+    {0x1f1b340, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_diff_banner_sprite, 0, 100, NULL},
+    {0x31b7260, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_stage_intro_setup, 0, 100, &original_stage_intro_setup},
+    {0x3332010, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_stage_music_info_setup, 0, 100, NULL},
+    {0x31b5560, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_intro_setup, 0, 100, NULL},
+    {0x1f25410, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_create_ms_parts, 0, 100, NULL},
+    {0x29d2ce0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_live_info_setup_fixed_text, 0, 100, &original_live_info_setup_fixed_text},
+    {0x1d60e40, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_support_manager_setup, 0, 100, NULL},
+    {0x1d61630, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_support_start, 0, 100, NULL},
+    {0x23abe40, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_set_play_setting, 0, 100, NULL},
+    {0x18fac20, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_trigger_data_loader_get_address, 0, 100, NULL},
+    {0x29afd80, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_runtime_context_setup, 0, 100, NULL},
+    {0x3104ec0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_clamp_rdi_diff, 0, 100, NULL},
+    {0x29e1380, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_clamp_rdi_diff, 0, 100, NULL},
+    {0x2c70c60, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_ability_condition_setup, 0, 100, NULL},
+    {0x23bc890, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_summon_bar_util_setup, 0, 100, NULL},
+    {0x1240130, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_copy_ms_play_data, 0, 100, NULL},
+    {0x1248ca0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_title_display_setup, 0, 100, NULL},
+    {0x18122b0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_retry_window_on_update, 0, 100, NULL},
+    {0x2cdb360, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_image_anim_props, 0, 100, &original_image_anim_props},
+    {0x2cb0490, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_image_set_sprite, 0, 100, &original_image_set_sprite},
+
+    /* v1.0.0 Records, Save Isolation, Profica, PlayStyleCache, & Rhythmia Protection hooks */
+    {0x45e9640, 6,  {0x55,0x48,0x89,0xe5,0x41,0x56}, hook_get_music_record, 0, 100, &original_get_music_record},
+    {0x45df320, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_create_music_record, 0, 100, &original_create_music_record},
+    {0x45de820, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_loaded_data_music_records, 0, 100, &original_loaded_data_music_records},
+    {0x45df690, 5,  {0x55,0x48,0x89,0xe5,0x53}, hook_setup_dlc_music_records, 0, 100, &original_setup_dlc_music_records},
+    {0x45e9c90, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_record_total_play_count, 0, 100, &original_music_record_total_play_count},
+    {0x1062a00, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_profica_clear_ctor, 0, 100, &original_profica_clear_ctor},
+    {0x105e370, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_profica_create_profile, 0, 100, &original_profica_create_profile},
+    {0x12d0e50, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_register_play_style_record, 0, 100, NULL},
+    {0x19c6280, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_music_info_serialize, 0, 100, &original_music_info_serialize},
+    {0x4586850, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 100, NULL},
+    {0x4588d30, 8,  {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56}, hook_rhythpo_calc_ms_bonus, 0, 100, NULL},
+    {0x45895d0, 7,  {0x48,0x8b,0x47,0x18,0x48,0x63,0xce}, hook_rhythpo_get_table_bonus, 0, 100, NULL},
+    {0x45853c0, 6,  {0x55,0x48,0x89,0xe5,0x41,0x57}, hook_rhythpo_add_bonus, 0, 100, NULL},
+    {0x1065c30, 8,  {0x48,0x8b,0x47,0x20,0x48,0x8b,0x48,0x10}, hook_rhythpo_set_total, 0, 100, NULL}
 };
 
 static unsigned char *emit(unsigned char *p, const void *bytes, size_t size) { memcpy(p, bytes, size); return p + size; }
@@ -8048,17 +8698,21 @@ static unsigned char *emit_hook_stub(unsigned char *p, const Hook *h, unsigned c
 int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, unsigned char *stubs, size_t size) {
     module = image + module_base;
 
-    /* Detect game version: 1.0.4+ has UIListItem::RefreshView at 0x28c8990 */
-    is_game_104 = (memcmp(module + 0x28c8990, "\x55\x48\x89\xe5\x41\x57\x41\x56", 8) == 0);
+    /* Detect game version cleanly across base v1.00 vs update v1.04+. */
+    is_game_104 = (memcmp(module + 0x0b57c40, "\x55\x48\x89\xe5\x41\x57\x41\x56\x41\x54\x53\x48", 12) == 0 &&
+                   memcmp(module + 0x2719a30, "\x55\x48\x89\xe5\x41\x57\x41\x56\x41\x55\x41\x54", 12) == 0);
     printf("CustomCharts: detected game version %s\n", is_game_104 ? "1.0.4+" : "1.0.0");
-    if (is_game_104) runtime_slidehold_init(module);
+    runtime_slidehold_init(module, is_game_104);
 
-    il2cpp_runtime_class_init_fn = (void (ABI *)(void *))GUEST_CALL(0x045b590, 0x045b590);
+    il2cpp_runtime_class_init_fn = (void (ABI *)(void *))GUEST_CALL(0x04577c0, 0x045b590);
 
     /* Expand CountDataList::InitializeList score loop (0..3 -> 0..5) so Beginner(4) & Chaos(5)
      * never throw ArgumentOutOfRangeException on CountDataList.ScoreList[difficulty]. */
-    if (is_game_104 && memcmp(module + 0x272a85c, "\x83\xf8\x04", 3) == 0) {
-        module[0x272a85e] = 0x06;
+    {
+        unsigned char *loop_patch = (unsigned char *)GUEST_CALL(0x28214ec, 0x272a85c);
+        if (memcmp(loop_patch, "\x83\xf8\x04", 3) == 0) {
+            loop_patch[2] = 0x06;
+        }
     }
 
     int target_ver = is_game_104 ? 104 : 100;
@@ -8083,46 +8737,14 @@ int runtime_custom_charts_install(unsigned char *image, uint64_t module_base, un
         }
         unsigned char *function = module + custom_hooks[i].offset;
         unsigned char *stub = p;
-        void **orig_ptr = NULL;
-        if (custom_hooks[i].offset == 0x0b57c40) orig_ptr = &original_music_convert;
-        else if (custom_hooks[i].offset == 0x0b60660) orig_ptr = &original_series_convert;
-        else if (custom_hooks[i].offset == 0x0b60ad0) orig_ptr = &original_sound_labels;
-        else if (custom_hooks[i].offset == 0x1e1c250) orig_ptr = &original_get_assets;
-        else if (custom_hooks[i].offset == 0x2719a30) orig_ptr = (void **)&original_create_triggers_movenext;
-        else if (custom_hooks[i].offset == 0x32d1800) orig_ptr = (void **)&original_runtime_context_update;
-        else if (custom_hooks[i].offset == 0x2fec920) orig_ptr = (void **)&original_play_judge_effect;
-        else if (custom_hooks[i].offset == 0x339cbe0 || custom_hooks[i].offset == 0x335abc0) orig_ptr = &original_theater_begin_init;
-        else if (custom_hooks[i].offset == 0x12c4750 || custom_hooks[i].offset == 0x1246de0) orig_ptr = (void **)&original_need_update_best_score;
-        else if (custom_hooks[i].offset == 0x16978e0) orig_ptr = &original_menu_add_song;
-        else if (custom_hooks[i].offset == 0x1688240) orig_ptr = &original_jacket_refresh_view;
-        else if (custom_hooks[i].offset == 0x1678de0) orig_ptr = &original_panel_view_on_set_view;
-        else if (custom_hooks[i].offset == 0x13633f0) orig_ptr = &original_popup_on_ready;
-        else if (custom_hooks[i].offset == 0x135df60) orig_ptr = &original_popup_set_status;
-        else if (custom_hooks[i].offset == 0x1d96b80) orig_ptr = &original_set_active_edition_mark;
-        else if (custom_hooks[i].offset == 0x135ead0) orig_ptr = &original_music_status_set_diff_color;
-        else if (custom_hooks[i].offset == 0x12c7cc0) orig_ptr = &original_load_title_plate_move_next;
-        else if (custom_hooks[i].offset == 0x1f0d900) orig_ptr = &original_get_diff_semicircle;
-        else if (custom_hooks[i].offset == 0x3175e60) orig_ptr = &original_stage_intro_setup;
-        else if (custom_hooks[i].offset == 0x29f6000) orig_ptr = &original_live_info_setup_fixed_text;
-        else if (custom_hooks[i].offset == 0x2d00430) orig_ptr = &original_image_anim_props;
-        else if (custom_hooks[i].offset == 0x2cd5560) orig_ptr = &original_image_set_sprite;
-        else if (custom_hooks[i].offset == 0x45fd770) orig_ptr = &original_get_music_record;
-        else if (custom_hooks[i].offset == 0x45f34c0) orig_ptr = &original_create_music_record;
-        else if (custom_hooks[i].offset == 0x45f29c0) orig_ptr = &original_loaded_data_music_records;
-        else if (custom_hooks[i].offset == 0x45f3830) orig_ptr = &original_setup_dlc_music_records;
-        else if (custom_hooks[i].offset == 0x45fddc0) orig_ptr = &original_music_record_total_play_count;
-        else if (custom_hooks[i].offset == 0x0acb760) orig_ptr = &original_profica_clear_ctor;
-        else if (custom_hooks[i].offset == 0x0ac70c0) orig_ptr = &original_profica_create_profile;
-        else if (custom_hooks[i].offset == 0x19da2e0) orig_ptr = &original_music_info_serialize;
-
-        p = emit_hook_stub(p, &custom_hooks[i], function, orig_ptr);
+        p = emit_hook_stub(p, &custom_hooks[i], function, custom_hooks[i].orig_ptr);
         const int32_t rel32 = (int32_t)(stub - (function + 5));
         function[0] = 0xe9; memcpy(function + 1, &rel32, 4);
         memset(function + 5, 0x90, custom_hooks[i].length - 5u);
         ++installed;
     }
 
-    printf("CustomCharts: Installed %zu/%zu native hooks for %s (%zu skipped, %zu custom songs scanned)\n",
-           installed, installed + skipped, is_game_104 ? "v1.0.4+" : "v1.0.0", skipped, song_count);
+    printf("CustomCharts: Installed %zu/%zu native hooks for %s (%zu skipped, %zu custom songs scanned, %zu stub bytes)\n",
+           installed, installed + skipped, is_game_104 ? "v1.0.4+" : "v1.0.0", skipped, song_count, (size_t)(p - stubs));
     return 0;
 }

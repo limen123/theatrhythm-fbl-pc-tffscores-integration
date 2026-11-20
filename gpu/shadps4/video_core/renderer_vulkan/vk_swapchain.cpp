@@ -319,9 +319,9 @@ bool Swapchain::SetSurfaceProperties() {
         return false;
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
-    // Request 6 images for Mailbox (4 otherwise) when allowed so DWM scanout + queued flip never stall vkAcquireNextImageKHR.
-    const u32 target_images = present_mode == vk::PresentModeKHR::eMailbox ? 6u : 4u;
+    // Select number of images in swap chain: minImageCount + 1 (3 for Fifo/Immediate, 4 for Mailbox
+    // so DWM scanout + queued flip do not stall vkAcquireNextImageKHR).
+    const u32 target_images = present_mode == vk::PresentModeKHR::eMailbox ? 4u : 0u;
     image_count = std::max<u32>(capabilities.minImageCount + 1, target_images);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);

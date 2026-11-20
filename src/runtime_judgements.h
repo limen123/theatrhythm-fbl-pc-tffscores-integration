@@ -12,12 +12,12 @@ extern "C" {
 /* Judgement rating matching game TriggerJudge enum */
 enum {
     JUDGE_NONE = 0,
-    JUDGE_CRITICAL_SP = 1, /* Rainbow / Shiny Critical */
-    JUDGE_CRITICAL = 2,    /* Gold Critical */
-    JUDGE_GREAT = 3,
-    JUDGE_GOOD = 4,
-    JUDGE_BAD = 5,
-    JUDGE_MISS = 6
+    JUDGE_CRITICAL = 1, /* Rainbow SP when JudgementNote.flags & 1, else Gold */
+    JUDGE_GREAT = 2,
+    JUDGE_GOOD = 3,
+    JUDGE_BAD = 4,
+    JUDGE_MISS = 5,
+    JUDGE_MISS_PASS = 6
 };
 
 #pragma pack(push, 1)
@@ -40,6 +40,10 @@ void runtime_judgements_begin_stage(uint32_t music_id, int difficulty);
 
 /* Record a single note judgement during stage play */
 void runtime_judgements_record(int target_ms, int offset_ms, int judge, int lane, int is_rainbow);
+
+/* Map TriggerJudge enum + flags to RGB24 color for hit dots (1..4) */
+void runtime_judgements_judge_color(uint8_t judge, uint16_t flags,
+                                    uint8_t *out_r, uint8_t *out_g, uint8_t *out_b);
 
 /* Render timeline judgement graph to RGBA32 bitmap */
 int runtime_judgements_render_graph(uint8_t *rgba_out, int width, int height, uint32_t duration_ms);

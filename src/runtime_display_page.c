@@ -198,7 +198,7 @@ enum { ROW_WINDOW, ROW_RESOLUTION, ROW_VSYNC, ROW_FPS, ROW_RENDER, ROWS };
 static const struct { const char *detail, *help; } rows[ROWS]={
     {"Common/DetailText/Config0018","Windowed, a borderless window covering the screen, or exclusive fullscreen."},
     {"Common/DetailText/Config0019","The window's size when windowed, the screen mode in fullscreen. Borderless always uses the desktop resolution."},
-    {"Common/DetailText/Config0024","Waits for the monitor: no tearing, caps FPS to refresh. Off allows tearing."},
+    {"Common/DetailText/Config0024","Waits for the monitor: no tearing, slightly more input delay. Off lowers latency (uses Mailbox when supported)."},
     {"Common/DetailText/Config0042","Caps how many frames are shown per second. Off follows the display; Unlimited removes the cap."},
     /* Timing display's row, an On/Off selector like VSync's */
     {"Common/DetailText/Config0026","4K as on PS4 Pro, filtered down to the window: sharper. 1080p as on PS4: lighter on the GPU. Applies after a restart."},
@@ -357,6 +357,7 @@ static unsigned char *skin_btn;        /* Note Skins UIObject */
 static unsigned char *skin_root;       /* Note Skins RectTransform */
 static unsigned char *logo_button;     /* Logo Usage's UIObject, which all stand in for */
 static int pending_page;               /* PAGE_* to open when the logo layer triggers */
+static void *pending_btn;              /* UIObject* pressed to trigger pending_page */
 static int describing;                 /* which added button's description is shown */
 static int monitor_icon;               /* the Config atlas holds the custom icons (install) */
 
@@ -567,7 +568,11 @@ static int button_target(uint64_t obj) {
 }
 
 /* ConfigTopPartsMain::OnExecutedScenePartsMain(this, source, data): a press of the button. */
-static ABI int top_executed(HookRegs *r) { pending_page=button_target(r->rsi); return 0; }
+static ABI int top_executed(HookRegs *r) {
+    pending_page=button_target(r->rsi);
+    pending_btn=pending_page ? (void *)r->rsi : NULL;
+    return 0;
+}
 /* ScenePartsMain.UIObjectGroup::GetUIObjectInfo(this, uiObject): the help bar (Back, Select) of a
  * focused button. The buttons have no entry of their own, so both get Logo Usage's. */
 static ABI int object_info(HookRegs *r) {
@@ -582,12 +587,17 @@ static ABI int top_select(HookRegs *r) { describing=button_target(r->rsi); retur
 static ABI int switch_layer(HookRegs *r) {
     const int layer=(int)r->rsi;
     if (layer==LOGO_LAYER && pending_page==PAGE_NOTE_SKIN) {
+        void *btn=pending_btn ? pending_btn : skin_btn;
         pending_page=PAGE_NONE;
+        pending_btn=NULL;
         theatrhythm_note_skin_open();
+        /* UIButton::Submit started an action on the cloned button before switchLayer ran; end it
+         * here since we abort the Unity layer switch, otherwise UILayerGroup blocks menu input. */
+        if (btn) ((void (ABI *)(void *, void *))CODE(C_END_ACTION))(btn,NULL);
         r->rax=0; r->rdx_out=0;
         return 1;
     }
-    if (layer==LOGO_LAYER && pending_page) { page_mode=pending_page; pending_page=PAGE_NONE; r->rsi=MUSIC_STAGE_LAYER; }
+    if (layer==LOGO_LAYER && pending_page) { page_mode=pending_page; pending_page=PAGE_NONE; pending_btn=NULL; r->rsi=MUSIC_STAGE_LAYER; }
     else if (layer!=MUSIC_STAGE_LAYER && page_mode) {
         page_mode=PAGE_NONE; /* the rows keep their texts until the page opens as MS Settings */
         if (display_dirty) { display_dirty=0; theatrhythm_display_save(); }
@@ -775,7 +785,6 @@ static int horizontal(HookRegs *r, size_t se) {
     if (page_mode==PAGE_DISPLAY) {
         if (row==ROW_VSYNC) {
             theatrhythm_display_set(THEATRHYTHM_DISPLAY_VSYNC,index==0);
-            if (index!=0) theatrhythm_display_set(THEATRHYTHM_DISPLAY_TEARING,1);
         }
         else if (row==ROW_RENDER) theatrhythm_display_set(THEATRHYTHM_DISPLAY_RENDER_4K,index==1);
         else if (index>=0 && index<6) theatrhythm_display_set(THEATRHYTHM_DISPLAY_FPS_LIMIT,fps_stops[index]);

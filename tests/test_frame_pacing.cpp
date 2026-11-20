@@ -46,13 +46,13 @@ static void TestPacingDecisions() {
         assert(p.follow_display);
         assert(p.frame_period.count() == 0);
     }
-    // - 143.99 Hz panel paces flips evenly to the exact display rate so Fifo does not
-    //   burst-queue and oscillate against async present.
+    // - 143.99 Hz / 280 Hz panel with VSync on lets hardware eFifo pace natively without a
+    //   competing software timer.
     {
         const auto p = ComputePacingDecision(0, true, 143.99, 60.0, false, 0, true);
         assert(p.immediate_flips);
         assert(!p.follow_display);
-        assert(std::llabs(p.frame_period.count() - 6'944'927LL) <= 2);
+        assert(p.frame_period.count() == 0);
     }
 
     // Follow display (0) + VSync off: software paces cleanly to exact fractional display refresh.
@@ -102,12 +102,12 @@ static void TestPacingDecisions() {
         assert(p240.follow_display);
         assert(p240.frame_period.count() == 0);
     }
-    // - Meeting/exceeding 144 Hz display with VSync on clamps flip cadence to display rate.
+    // - Meeting/exceeding 144 Hz display with VSync on lets hardware eFifo pace natively.
     {
         const auto p144 = ComputePacingDecision(144, true, 144.0, 60.0, false, 0, true);
         assert(p144.immediate_flips);
         assert(!p144.follow_display);
-        assert(std::llabs(p144.frame_period.count() - 6'944'444LL) <= 1);
+        assert(p144.frame_period.count() == 0);
     }
 
     // THEATRHYTHM_FPS_LIMIT measurement overrides bypass snapping.

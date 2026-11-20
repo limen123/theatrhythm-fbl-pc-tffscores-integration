@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <inttypes.h>
 #include <SDL3/SDL.h>
 #include "runtime.h"
@@ -26,7 +27,6 @@
 #include <sys/mman.h>
 #include <malloc.h>
 #include <unistd.h>
-#include <signal.h>
 #include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
@@ -192,9 +192,74 @@ static void note_fault_site(const CONTEXT *c, int write) {
         return;
     }
 }
+static unsigned char *probe_at[4];
+static uint64_t probe_offset[4];
+static volatile LONG64 probe_hits[4];
+static int probe_count;
+static ULONGLONG probe_start;
+static int probe_dirty_zmm;
+static void redzone_probe_arm(void) {
+    CONTEXT c;
+    memset(&c,0,sizeof c);
+    c.ContextFlags=CONTEXT_DEBUG_REGISTERS;
+    DWORD64 *dr[4]={&c.Dr0,&c.Dr1,&c.Dr2,&c.Dr3};
+    for (int i=0;i<probe_count;++i) { *dr[i]=(DWORD64)(uintptr_t)probe_at[i]; c.Dr7|=1ull<<(2*i); } /* local, execute, 1 byte */
+    if (!SetThreadContext(GetCurrentThread(),&c))
+        fprintf(stderr,"Red-zone probe: arming thread %lu failed (%lu)\n",GetCurrentThreadId(),GetLastError());
+}
+/* zmm31 = all ones in the state an exception returns with (zmm16-30 zeroed if they were not in use). */
+static void redzone_probe_dirty_zmm(CONTEXT *c) {
+    DWORD64 mask;
+    DWORD length=0;
+    if ((c->ContextFlags&CONTEXT_XSTATE)!=CONTEXT_XSTATE || !GetXStateFeaturesMask(c,&mask)) return;
+    unsigned char *hi16=LocateXStateFeature(c,XSTATE_AVX512_ZMM,&length);
+    if (!hi16 || length<1024) return;
+    if (!(mask&(1ull<<XSTATE_AVX512_ZMM))) memset(hi16,0,1024);
+    memset(hi16+960,0xff,64);
+    SetXStateFeaturesMask(c,mask|(1ull<<XSTATE_AVX512_ZMM));
+}
+static void redzone_probe_setup(void) {
+    const char *list=getenv("THEATRHYTHM_REDZONE_PROBE");
+    probe_start=GetTickCount64();
+    const char *dirty=getenv("THEATRHYTHM_DIRTY_ZMM");
+    probe_dirty_zmm=dirty && dirty[0]=='1' && __builtin_cpu_supports("avx512f");
+    for (const char *p=list; p && *p && probe_count<4;) {
+        char *end; uint64_t offset=strtoull(p,&end,16);
+        if (end==p) break;
+        unsigned char *copy=theatrhythm_redzone_copy(image+offset);
+        probe_offset[probe_count]=offset;
+        probe_at[probe_count]=copy ? copy : image+offset;
+        printf("Red-zone probe %d: guest 0x%" PRIx64 " runs %s\n",probe_count,offset,copy ? "in a trampoline (moved)" : "in place");
+        ++probe_count;
+        p=*end==',' ? end+1 : end;
+    }
+    if (probe_count) runtime_thread_start_hook=redzone_probe_arm;
+}
+static LONG redzone_probe_exception(EXCEPTION_POINTERS *info) {
+    CONTEXT *c=info->ContextRecord;
+    for (int i=0;i<probe_count;++i) {
+        if (!(c->Dr6&(1ull<<i)) || (unsigned char *)(uintptr_t)c->Rip!=probe_at[i]) continue;
+        LONG64 n=InterlockedIncrement64(&probe_hits[i]);
+        if (!(n&(n-1))) {
+            uint64_t back=*(const uint64_t *)(uintptr_t)c->Rsp-(uint64_t)(uintptr_t)image;
+            if (probe_at[i]==image+probe_offset[i] && back<0x20000000)
+                fprintf(stderr,"Red-zone probe %d: guest 0x%" PRIx64 " x%lld at %.1f s, thread %lu, returns to guest 0x%" PRIx64 "\n",
+                        i,probe_offset[i],(long long)n,(GetTickCount64()-probe_start)/1000.0,GetCurrentThreadId(),back);
+            else fprintf(stderr,"Red-zone probe %d: guest 0x%" PRIx64 " x%lld at %.1f s, thread %lu\n",
+                         i,probe_offset[i],(long long)n,(GetTickCount64()-probe_start)/1000.0,GetCurrentThreadId());
+        }
+        if (probe_dirty_zmm) redzone_probe_dirty_zmm(c);
+        c->Dr6=0;
+        c->EFlags|=0x10000; /* RF: run the instruction without breaking again */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
+    if (code==EXCEPTION_SINGLE_STEP && probe_count && redzone_probe_exception(info)==EXCEPTION_CONTINUE_EXECUTION)
+        return EXCEPTION_CONTINUE_EXECUTION;
     if (code==EXCEPTION_BREAKPOINT && isa_table) {
         /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
         IsaRegs regs;
@@ -241,6 +306,20 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+static void fatal_sigabrt(int sig) {
+    (void)sig;
+    if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
+    fprintf(stderr,"Fault: SIGABRT (abort called) on thread %lu\n",GetCurrentThreadId());
+    void *frames[24];
+    USHORT n=CaptureStackBackTrace(0,24,frames,NULL);
+    for (USHORT i=0; i<n; ++i) {
+        char where[MAX_PATH+64];
+        describe_address(where,sizeof(where),(uintptr_t)frames[i]);
+        fprintf(stderr,"  #%u %s\n",(unsigned)i,where);
+    }
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),3);
+}
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
@@ -480,46 +559,64 @@ static void hang_dump(unsigned seconds) {
     fprintf(stderr,"Hang: end of thread stacks\n");
 }
 #else
-/* Frames of a thread from its registers: host code unwinds through its .pdata (a function without
- * any is a leaf: the return address is at rsp), guest code through its rbp chain. Every step stays
- * on committed memory of the stack it started on, so a stack that changes under the walk ends it
- * instead of faulting. */
-enum { HANG_FRAMES = 24 };
-static int stack_readable(uintptr_t address, void *stack) {
+/* Frames of a thread from its registers on the stack copy [low, high): host code unwinds through
+ * its .pdata (a function without any is a leaf: the return address is at rsp), guest code through
+ * its rbp chain. Each step starts inside the copy; a read that faults anyway (a frame register
+ * that unwind data trusts but the stack does not hold) ends the walk (runtime_fault_recover), as
+ * does a step that leaves the copy. */
+enum { HANG_FRAMES = 24, STACK_COPY = 128 * 1024 };
+static unsigned char stack_copy[STACK_COPY];
+static SRWLOCK dump_lock = SRWLOCK_INIT;
+static size_t copy_stack(const CONTEXT *c, uintptr_t *from) {
     MEMORY_BASIC_INFORMATION info;
-    if (!VirtualQuery((void *)address,&info,sizeof(info)) || info.State!=MEM_COMMIT || info.AllocationBase!=stack) return 0;
-    return !(info.Protect&(PAGE_GUARD|PAGE_NOACCESS));
+    if (!VirtualQuery((const void *)(uintptr_t)c->Rsp,&info,sizeof(info)) || info.State!=MEM_COMMIT) return 0;
+    if (info.Protect&(PAGE_GUARD|PAGE_NOACCESS)) return 0;
+    const uintptr_t low=(uintptr_t)c->Rsp, end=(uintptr_t)info.BaseAddress+info.RegionSize;
+    size_t want=end>low ? (size_t)(end-low) : 0;
+    if (want>STACK_COPY) want=STACK_COPY;
+    memcpy(stack_copy,(const void *)low,want);
+    *from=low;
+    return want;
 }
-static int thread_frames(CONTEXT *c, uintptr_t *out) {
-    MEMORY_BASIC_INFORMATION info;
-    void *stack=VirtualQuery((void *)(uintptr_t)c->Rsp,&info,sizeof(info)) ? info.AllocationBase : NULL;
-    int n=0;
+static void rebase_stack_copy(CONTEXT *c, uintptr_t from, size_t size) {
+    const uintptr_t end=from+size, to=(uintptr_t)stack_copy;
+    DWORD64 *g[16]={&c->Rax,&c->Rcx,&c->Rdx,&c->Rbx,&c->Rsp,&c->Rbp,&c->Rsi,&c->Rdi,
+                    &c->R8,&c->R9,&c->R10,&c->R11,&c->R12,&c->R13,&c->R14,&c->R15};
+    for (int i=0;i<16;++i) if (*g[i]>=from && *g[i]<end) *g[i]=*g[i]-from+to;
+}
+static int thread_frames(CONTEXT *c, uintptr_t *out, uintptr_t low, uintptr_t high) {
+    volatile int n=0;
+    sigjmp_buf recover;
+    if (sigsetjmp(recover,0)) return n; /* the handler cleared runtime_fault_recover */
     while (n<HANG_FRAMES && c->Rip) {
-        out[n++]=(uintptr_t)c->Rip;
+        out[n]=(uintptr_t)c->Rip; n=n+1;
         const DWORD64 rsp=c->Rsp;
-        if (!stack || !stack_readable(rsp,stack) || !stack_readable(rsp+512,stack)) break;
+        if (rsp<low || rsp+8>high) break;
         DWORD64 base=0;
         const int guest=image && c->Rip-(uintptr_t)image<0x20000000;
         PRUNTIME_FUNCTION function=guest ? NULL : RtlLookupFunctionEntry(c->Rip,&base,NULL);
+        runtime_fault_recover=&recover;
         if (function) {
             void *handler_data; DWORD64 establisher;
             RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,c->Rip,function,c,&handler_data,&establisher,NULL);
         } else if (guest) {
-            if (c->Rbp<rsp || !stack_readable(c->Rbp,stack) || !stack_readable(c->Rbp+15,stack)) break;
+            if (c->Rbp<rsp || c->Rbp+16>high) { runtime_fault_recover=NULL; break; }
             const DWORD64 *frame=(const DWORD64 *)(uintptr_t)c->Rbp;
             c->Rip=frame[1]; c->Rsp=c->Rbp+16; c->Rbp=frame[0];
         } else {
             c->Rip=*(const DWORD64 *)(uintptr_t)rsp; c->Rsp=rsp+8;
         }
+        runtime_fault_recover=NULL;
         if (c->Rsp<=rsp) break;
     }
     return n;
 }
-/* Every other thread: name, tid, CPU time and frames, one line each. A thread is suspended only to
- * read its registers; its stack is read after it resumes (a hung thread's does not change). */
+/* Every other thread: name, tid, CPU time and frames, one line each. A thread is suspended while
+ * its registers and stack are copied (copy_stack), then walked on the copy. */
 static void dump_threads(void) {
     HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
     if (snap==INVALID_HANDLE_VALUE) return;
+    AcquireSRWLockExclusive(&dump_lock);
     THREADENTRY32 entry={.dwSize=sizeof(entry)};
     const DWORD pid=GetCurrentProcessId(), self=GetCurrentThreadId();
     for (BOOL ok=Thread32First(snap,&entry);ok;ok=Thread32Next(snap,&entry)) {
@@ -530,7 +627,14 @@ static void dump_threads(void) {
         memset(&c,0,sizeof(c));
         c.ContextFlags=CONTEXT_FULL;
         BOOL got=FALSE;
-        if (SuspendThread(h)!=(DWORD)-1) { got=GetThreadContext(h,&c); ResumeThread(h); }
+        uintptr_t from=0;
+        size_t copied=0;
+        if (SuspendThread(h)!=(DWORD)-1) {
+            got=GetThreadContext(h,&c);
+            if (got) copied=copy_stack(&c,&from);
+            ResumeThread(h);
+        }
+        if (copied) rebase_stack_copy(&c,from,copied);
         char name[64]="";
         PWSTR wide=NULL;
         if (SUCCEEDED(GetThreadDescription(h,&wide)) && wide) {
@@ -543,7 +647,9 @@ static void dump_threads(void) {
             ms=(double)((((uint64_t)kernel.dwHighDateTime<<32)|kernel.dwLowDateTime)+(((uint64_t)user.dwHighDateTime<<32)|user.dwLowDateTime))/1e4;
         CloseHandle(h);
         uintptr_t frames[HANG_FRAMES];
-        const int n=got ? thread_frames(&c,frames) : 0;
+        int n=0;
+        if (copied) n=thread_frames(&c,frames,(uintptr_t)stack_copy,(uintptr_t)stack_copy+copied);
+        else if (got) frames[n++]=(uintptr_t)c.Rip;
         char line[HANG_FRAMES*(MAX_PATH+8)+256], where[MAX_PATH+64];
         int used=snprintf(line,sizeof(line),"Hang:   '%s' (tid %lu, %.0f ms CPU):",name[0] ? name : "?",entry.th32ThreadID,ms);
         for (int i=0;i<n && used>0 && (size_t)used<sizeof(line);++i) {
@@ -553,6 +659,7 @@ static void dump_threads(void) {
         if (!n) snprintf(line+used,sizeof(line)-(size_t)used," (no registers)");
         fprintf(stderr,"%s\n",line);
     }
+    ReleaseSRWLockExclusive(&dump_lock);
     CloseHandle(snap);
 }
 static void hang_dump(unsigned seconds) {
@@ -856,15 +963,18 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE_ID",title_id,sizeof(title_id),NULL);
         sfo_value(sfo,"APP_VER",version,sizeof(version),NULL); /* the patch's version (VERSION stays the disc's) */
         runtime_game_identify(title_id,version,app0,argv[1]);
-        if (dlc_dir && dlc_dir[0]) runtime_content_extra_dir(dlc_dir, title_id[0] ? title_id : NULL);
+        if (dlc_dir && dlc_dir[0]) runtime_content_extra_dir(dlc_dir, title_id[0] ? title_id : NULL, app0);
         runtime_content_init_dlc(app0, user_dir ? user_dir : "user");
         runtime_custom_charts_configure(app0, user_dir ? user_dir : "user");
     }
     theatrhythm_gpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+    ULONG stack_guarantee = 65536;
+    SetThreadStackGuarantee(&stack_guarantee);
     AddVectoredExceptionHandler(1, vectored_fault);
     SetUnhandledExceptionFilter(unhandled_fault);
+    signal(SIGABRT, fatal_sigabrt);
     if (getenv("THEATRHYTHM_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;
@@ -1211,6 +1321,7 @@ int main(int argc, char **argv) {
     if (code_before) {
         unsigned char *trampolines = stubs + stub_area + 25 * page_size;
         redzone_protect(image, size, trampolines, code_before, segments, ns, modules, module_count, &main_module);
+        redzone_probe_setup();
         protect(trampolines, redzone_area, 5);
         free(code_before);
     }

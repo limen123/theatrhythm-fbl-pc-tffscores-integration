@@ -1329,6 +1329,79 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     read_unlock();
     return result;
 }
+#define HOST_READ_CACHE_SLOTS 32
+typedef struct { uint64_t generation; uintptr_t start, end; } ReadableRegionCache;
+static __thread ReadableRegionCache host_read_cache[HOST_READ_CACHE_SLOTS];
+static __thread unsigned host_read_cache_next;
+
+static int guest_vma_is_readable(uintptr_t start, uintptr_t end) {
+    if (!(runtime_disabled_optimizations & 1)) {
+        uint64_t g = __atomic_load_n(&table_generation, __ATOMIC_ACQUIRE);
+        if ((g & 1) == 0) {
+            for (int i = 0; i < HOST_READ_CACHE_SLOTS; ++i) {
+                const ReadableRegionCache *c = &host_read_cache[i];
+                if (c->generation == g && start >= c->start && end <= c->end) {
+                    if (i > 0) {
+                        ReadableRegionCache hit = *c;
+                        host_read_cache[i] = host_read_cache[0];
+                        host_read_cache[0] = hit;
+                    }
+                    return 1;
+                }
+            }
+        }
+    }
+    int ok = 0;
+    read_lock();
+    uint64_t g_locked = __atomic_load_n(&table_generation, __ATOMIC_RELAXED);
+    size_t idx = vma_index(start);
+    size_t first = idx, last = idx;
+    uintptr_t at = start;
+    while (at < end && idx < vma_count && vmas[idx].start <= at &&
+           vmas[idx].kind != KIND_RESERVED && (vmas[idx].prot & 0x37) != 0) {
+        at = vmas[idx].end;
+        last = idx;
+        ++idx;
+    }
+    if (at >= end) {
+        ok = 1;
+        if (!(runtime_disabled_optimizations & 1) && (g_locked & 1) == 0) {
+            unsigned slot = (host_read_cache_next++ % (HOST_READ_CACHE_SLOTS - 1u)) + 1u;
+            ReadableRegionCache entry = {g_locked, vmas[first].start, vmas[last].end};
+            host_read_cache[slot] = host_read_cache[0];
+            host_read_cache[0] = entry;
+        }
+    }
+    read_unlock();
+    return ok;
+}
+
+int runtime_host_is_readable(const void *address, size_t size) {
+    if (!address || size == 0) return 0;
+    uintptr_t start = (uintptr_t)address;
+    uintptr_t end = start + size;
+    if (start < 0x10000ULL || end < start || end > 0x00007fffffffffffULL) return 0;
+    if (start >= USER_MIN && end <= USER_MAX) {
+        return guest_vma_is_readable(start, end);
+    }
+#ifdef _WIN32
+    const DWORD readable_prot =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    uintptr_t cur = start;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((LPCVOID)cur, &m, sizeof(m))) return 0;
+        if (m.State != MEM_COMMIT) return 0;
+        if ((m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return 0;
+        if ((m.Protect & readable_prot) == 0) return 0;
+        uintptr_t region_end = (uintptr_t)m.BaseAddress + (uintptr_t)m.RegionSize;
+        if (region_end <= cur) return 0;
+        cur = region_end;
+    }
+#endif
+    return 1;
+}
 void runtime_memory_report(void) {
     printf("Runtime: direct memory allocations=%zu, maps=%zu, live=%" PRIu64 ", budget=%" PRIu64 "\n",
            allocations, maps, live_bytes, POOL_SIZE);

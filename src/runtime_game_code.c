@@ -17,7 +17,9 @@
 /* Builds of Il2CppUserAssemblies.prx the sites were made and checked with (tools/game_code.py). */
 static const struct { const char *sha256, *version; } known_builds[]={
     {"b8592928fb51f8061290fc23127ccd5199a9564ee4c3f1f5bff3e79e212a4be6","01.00"},
+    {"8abc6c834d4076c1c25257d997dfb0e366c1e1fb823f87d7105ca7a1a64238e1","01.00"},
     {"f603d21de5e890f675550bfbf318f3337174f99d1437ff5675a7a861f73734b5","01.04"},
+    {"75a1dc0b735f87ec25daab396419149300ed2a70ec07acf9e04f9f9613a50b16","01.04"},
 };
 static char game_version[96]="unknown";
 

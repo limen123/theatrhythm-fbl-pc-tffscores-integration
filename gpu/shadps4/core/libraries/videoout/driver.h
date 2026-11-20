@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <deque>
 #include <functional>
 
@@ -124,8 +123,6 @@ private:
     std::mutex swap_mutex;
     std::condition_variable_any swap_cv;
     std::deque<std::function<void()>> swap_queue;
-    std::atomic<size_t> swap_queue_depth{0};
-    std::atomic<bool> swap_in_flight{false};
     bool swap_busy = false;
     bool separate_swap = true;
     std::jthread swap_thread; ///< before present_thread: destroyed after it

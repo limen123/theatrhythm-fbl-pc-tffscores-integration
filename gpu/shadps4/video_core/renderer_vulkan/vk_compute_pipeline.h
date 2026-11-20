@@ -50,6 +50,11 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
     ~ComputePipeline();
 
+    // theatrhythm: switch from immutable template to live stage data on publication.
+    void PublishStage(const Shader::Info& info) {
+        stages[int(Shader::SwStage::Compute)] = &info;
+    }
+
 private:
     ComputePipelineKey compute_key;
 };

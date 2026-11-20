@@ -2,10 +2,10 @@
 // Each thread gets a guest TCB (GS base, TLS) from the C runtime before running.
 #pragma once
 #include <atomic>
-#include <chrono>
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stop_token>
 #include <system_error>
 #include <thread>
@@ -19,42 +19,58 @@ public:
     Thread() = default;
     ~Thread() { Stop(); }
     void Run(std::function<void(std::stop_token)>&& func) {
+        Join();
+        std::scoped_lock lk{mutex};
         finished = std::make_shared<std::atomic<bool>>(false);
         thread = std::jthread([func = std::move(func), done = finished](std::stop_token stop) {
             runtime_thread_attach_host("theatrhythm:hle");
             func(stop);
-            done->store(true);
+            done->store(true, std::memory_order_release);
         });
     }
-    // A thread may stop its own Thread object (AvPlayer does); it detaches instead of joining.
-    // theatrhythm: these are called from guest code, which a C++ exception cannot unwind: a failed
-    // join is logged and the thread detached instead.
+    // A thread may stop its own Thread object (AvPlayer does); serialize ownership transfer so
+    // EOF self-cleanup never races Stop() calling join().
     void Join() {
-        if (!thread.joinable()) return;
+        std::jthread local;
+        std::shared_ptr<std::atomic<bool>> done;
+        {
+            std::scoped_lock lk{mutex};
+            if (!thread.joinable()) return;
+            local = std::move(thread);
+            done = finished;
+        }
+        if (local.get_id() == std::this_thread::get_id()) {
+            local.detach();
+            return;
+        }
         try {
-            if (thread.get_id() == std::this_thread::get_id()) thread.detach();
-            else thread.join();
+            local.join();
         } catch (const std::system_error& error) {
-            // Windows (libc++ on Win32 threads): the join can fail although the thread is fine.
-            // Wait for its function to return, so nothing it uses is freed under it, then let go.
             std::fprintf(stderr, "HLE thread: join failed (%s); waiting for it to finish\n", error.what());
-            if (thread.get_id() != std::this_thread::get_id()) {
-                for (int waited = 0; finished && !finished->load() && waited < 5000; ++waited) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (done) {
+                while (!done->load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
                 }
             }
-            if (thread.joinable()) thread.detach();
+            if (local.joinable()) local.detach();
         }
     }
-    bool Joinable() const { return thread.joinable(); }
+    bool Joinable() const {
+        std::scoped_lock lk{mutex};
+        return thread.joinable();
+    }
     void Stop() {
-        if (thread.joinable()) {
-            thread.request_stop();
-            Join();
+        {
+            std::scoped_lock lk{mutex};
+            if (thread.joinable()) {
+                thread.request_stop();
+            }
         }
+        Join();
     }
 
 private:
+    mutable std::mutex mutex;
     std::jthread thread;
     std::shared_ptr<std::atomic<bool>> finished;
 };

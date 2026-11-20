@@ -287,29 +287,41 @@ static int watch_game(unsigned long *code) {
         _putenv_s("THEATRHYTHM_CRASH_WATCH", "");
         return 0;
     }
-    if (!AssignProcessToJobObject(job, child.hProcess)) {
-        TerminateProcess(child.hProcess, 0);
-        _putenv_s("THEATRHYTHM_CRASH_WATCH", "");
-        return 0;
+    int in_job = AssignProcessToJobObject(job, child.hProcess);
+    if (!in_job) {
+        CloseHandle(port);
+        CloseHandle(job);
     }
     AllowSetForegroundWindow(child.dwProcessId);
     ResumeThread(child.hThread);
     CloseHandle(child.hThread);
     HANDLE last = child.hProcess;
-    DWORD message;
-    ULONG_PTR key;
-    LPOVERLAPPED data;
-    while (GetQueuedCompletionStatus(port, &message, &key, &data, INFINITE)) {
-        DWORD pid = (DWORD)(ULONG_PTR)data;
-        if (message == JOB_OBJECT_MSG_NEW_PROCESS && pid != child.dwProcessId) {
-            HANDLE next = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (next) last = next;
-        } else if (message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO) break;
+    if (in_job) {
+        DWORD message;
+        ULONG_PTR key;
+        LPOVERLAPPED data;
+        while (GetQueuedCompletionStatus(port, &message, &key, &data, INFINITE)) {
+            DWORD pid = (DWORD)(ULONG_PTR)data;
+            if (message == JOB_OBJECT_MSG_NEW_PROCESS && pid != child.dwProcessId) {
+                HANDLE next = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (next) last = next;
+            } else if (message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO) break;
+        }
+        CloseHandle(port);
+        CloseHandle(job);
     }
-    WaitForSingleObject(last, INFINITE);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(last, &exit_code);
-    *code = exit_code;
+    WaitForSingleObject(child.hProcess, INFINITE);
+    DWORD primary_code = 0, last_code = 0;
+    GetExitCodeProcess(child.hProcess, &primary_code);
+    if (last != child.hProcess) {
+        WaitForSingleObject(last, INFINITE);
+        GetExitCodeProcess(last, &last_code);
+        CloseHandle(last);
+    } else {
+        last_code = primary_code;
+    }
+    CloseHandle(child.hProcess);
+    *code = primary_code ? primary_code : last_code;
     return 1;
 #else
     /* The child returns to run the game and ends with this process (a restart execs in place). */

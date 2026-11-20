@@ -25,8 +25,8 @@ typedef struct {
 
 #define SLIDEHOLD_PARAM_FLAG 1
 
-/* Module init (stores Il2CppUserAssemblies.prx base address). */
-void runtime_slidehold_init(unsigned char *module);
+/* Module init (stores Il2CppUserAssemblies.prx base address and game version flag). */
+void runtime_slidehold_init(unsigned char *module, int is_game_104);
 
 /* Trigger color preset (0 = Skin A / BMS Standard, 1 = Skin B; SlideHolds use Cyan on both). */
 void runtime_slidehold_set_color_type(int color_type);

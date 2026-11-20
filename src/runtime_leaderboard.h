@@ -17,12 +17,22 @@ typedef struct {
     uint32_t damage;
 } LeaderboardEntry;
 
+typedef enum {
+    LB_STATUS_IDLE = 0,
+    LB_STATUS_LOADING,
+    LB_STATUS_READY,
+    LB_STATUS_EMPTY,
+    LB_STATUS_ERROR,
+    LB_STATUS_LOCAL_ONLY
+} LeaderboardStatus;
+
 #define MAX_LEADERBOARD_ENTRIES 128
 #define LEADERBOARD_VISIBLE_ROWS 5
 
 void runtime_leaderboard_init(void);
 void runtime_leaderboard_fetch(uint32_t music_id, int difficulty, const char *style);
 size_t runtime_leaderboard_get_count(void);
+LeaderboardStatus runtime_leaderboard_get_status(void);
 const LeaderboardEntry *runtime_leaderboard_get_entry(size_t index);
 bool runtime_leaderboard_copy_entry(size_t index, LeaderboardEntry *out);
 uint32_t runtime_leaderboard_get_revision(void);

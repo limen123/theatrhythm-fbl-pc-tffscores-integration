@@ -304,11 +304,23 @@ void CaptureScreenshot(const Instance& instance, Scheduler& scheduler, vk::Comma
         void* png = tdefl_write_image_to_png_file_in_memory_ex(rgba.data(), int(width), int(height), 4,
                                                                &png_size, 6, MZ_FALSE);
         bool saved = false;
+        std::filesystem::path actual_path = path;
         if (png) {
 #ifdef _WIN32
-            FILE* f = _wfopen(path.wstring().c_str(), L"wb"); // the user folder may not be ASCII
+            FILE* f = _wfopen(actual_path.wstring().c_str(), L"wb"); // the user folder may not be ASCII
+            if (!f) {
+                const char* local_app = std::getenv("LOCALAPPDATA");
+                if (!local_app || !*local_app) local_app = std::getenv("APPDATA");
+                if (local_app && *local_app) {
+                    std::error_code ec;
+                    std::filesystem::path fb_dir = std::filesystem::path(local_app) / "TheatrhythmFBL" / "screenshots";
+                    std::filesystem::create_directories(fb_dir, ec);
+                    actual_path = fb_dir / path.filename();
+                    f = _wfopen(actual_path.wstring().c_str(), L"wb");
+                }
+            }
 #else
-            FILE* f = std::fopen(path.c_str(), "wb");
+            FILE* f = std::fopen(actual_path.c_str(), "wb");
 #endif
             if (f) {
                 saved = std::fwrite(png, 1, png_size, f) == png_size;
@@ -317,11 +329,11 @@ void CaptureScreenshot(const Instance& instance, Scheduler& scheduler, vk::Comma
             mz_free(png);
         }
         if (saved) {
-            std::printf("Screenshot: %s (%ux%u)\n", Common::FS::PathToUTF8String(path).c_str(), width, height);
-            RecordLastSavedScreenshot(Common::FS::PathToUTF8String(path));
-            TheatrhythmOverlay::ShowNotice("Screenshot saved: " + Common::FS::PathToUTF8String(path.filename()));
+            std::printf("Screenshot: %s (%ux%u)\n", Common::FS::PathToUTF8String(actual_path).c_str(), width, height);
+            RecordLastSavedScreenshot(Common::FS::PathToUTF8String(actual_path));
+            TheatrhythmOverlay::ShowNotice("Screenshot saved: " + Common::FS::PathToUTF8String(actual_path.filename()));
         } else {
-            LOG_ERROR(Render_Vulkan, "Screenshot: cannot write {}", Common::FS::PathToUTF8String(path));
+            LOG_ERROR(Render_Vulkan, "Screenshot: cannot write {}", Common::FS::PathToUTF8String(actual_path));
             TheatrhythmOverlay::ShowNotice("Screenshot failed: cannot write the file");
         }
     });
@@ -504,7 +516,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
                  vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
     };
 
-    const VmaAllocationCreateInfo alloc_info = {
+    VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -518,6 +530,11 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
 
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        alloc_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
+                                &unsafe_image, &frame->allocation, nullptr);
+    }
     if (result != VK_SUCCESS) [[unlikely]] {
         LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
                      vk::to_string(vk::Result{result}));
@@ -943,14 +960,6 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         return;
     }
 
-    // Wait for the frame's draw_scheduler work to finish before acquiring a swapchain image so
-    // an unrendered frame never pins a swapchain buffer and stalls vkAcquireNextImageKHR.
-    if (!is_reusing_frame && frame->ready_tick > 0 &&
-        frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
-        TheatrhythmStats::Timer ready_timer{TheatrhythmStats::present_ready_wait_ns};
-        draw_scheduler.Wait(frame->ready_tick);
-    }
-
     {
         TheatrhythmStats::Timer acquire_timer{TheatrhythmStats::present_acquire_ns};
 #ifdef _WIN32
@@ -1171,35 +1180,8 @@ Frame* Presenter::GetRenderFrame() {
     vk::Result result{};
 
     // Wait for the presentation to be finished so all frame resources are free.
-    // Poll briefly then use high-res sleep on Windows so NVIDIA waitForFences does not busy-spin CPU.
     {
         TheatrhythmStats::Timer fences_timer{TheatrhythmStats::present_wait_fences_ns};
-#ifdef _WIN32
-        ULONG64 f_c0 = 0;
-        if (TheatrhythmStats::enabled) {
-            QueryThreadCycleTime(GetCurrentThread(), &f_c0);
-        }
-        result = device.getFenceStatus(frame->present_done);
-        if (result != vk::Result::eSuccess) {
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(30);
-            while (result == vk::Result::eNotReady &&
-                   std::chrono::steady_clock::now() < spin_until) {
-                __builtin_ia32_pause();
-                result = device.getFenceStatus(frame->present_done);
-            }
-            while (result == vk::Result::eNotReady) {
-                Common::AccurateSleep(std::chrono::microseconds(250), nullptr, false);
-                result = device.getFenceStatus(frame->present_done);
-            }
-            ASSERT_MSG(result == vk::Result::eSuccess,
-                       "Device lost during waiting for a frame: {}", vk::to_string(result));
-        }
-        if (TheatrhythmStats::enabled) {
-            ULONG64 f_c1 = 0;
-            QueryThreadCycleTime(GetCurrentThread(), &f_c1);
-            TheatrhythmStats::fence_wait_cycles.fetch_add(f_c1 - f_c0, std::memory_order_relaxed);
-        }
-#else
         const auto wait = [&]() {
             result = device.waitForFences(frame->present_done, false, std::numeric_limits<u64>::max());
             return result;
@@ -1212,7 +1194,6 @@ Frame* Presenter::GetRenderFrame() {
                 continue;
             }
         }
-#endif
     }
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||

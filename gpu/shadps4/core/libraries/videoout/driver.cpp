@@ -99,7 +99,6 @@ void VideoOutDriver::RunPresenter(std::function<void()> work, bool if_idle) {
             return; // a redraw of the last frame is pointless while frames are queued
         }
         swap_queue.push_back(std::move(work));
-        swap_queue_depth.store(swap_queue.size(), std::memory_order_release);
     }
     swap_cv.notify_one();
 }
@@ -114,20 +113,11 @@ void VideoOutDriver::SwapThread(std::stop_token token) {
             if (!swap_cv.wait(lock, token, [this] { return !swap_queue.empty(); })) {
                 return;
             }
-            swap_in_flight.store(true, std::memory_order_release);
             work = std::move(swap_queue.front());
             swap_queue.pop_front();
-            swap_queue_depth.store(swap_queue.size(), std::memory_order_release);
             swap_busy = true;
         }
         work();
-        swap_in_flight.store(false, std::memory_order_release);
-        if (swap_queue_depth.load(std::memory_order_acquire) == 0) {
-            {
-                std::scoped_lock lk{mutex};
-            }
-            request_cv.notify_one();
-        }
     }
 }
 
@@ -804,14 +794,35 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         return {};
     };
-    const auto can_submit_swap = [this] {
-        return !separate_swap || (!swap_in_flight.load(std::memory_order_acquire) &&
-                                  swap_queue_depth.load(std::memory_order_acquire) == 0);
+
+    const auto emit_vblank_events = [&] {
+        auto& vblank_status = main_port.vblank_status;
+        // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
+        std::scoped_lock lock{main_port.vo_mutex};
+
+        // Trigger flip events for the port
+        for (auto event : main_port.vblank_events) {
+            auto equeue = Kernel::GetEqueue(event);
+            if (equeue != nullptr) {
+                equeue->TriggerEvent(
+                    static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
+                    Kernel::OrbisKernelEvent::Filter::VideoOut,
+                    reinterpret_cast<void*>(
+                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
+                        (vblank_status.count << 16)));
+            }
+        }
+
+        // Update vblank status
+        vblank_status.count++;
+        vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+        vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
+        main_port.vblank_cv.notify_all();
     };
 
     auto next_flip = std::chrono::steady_clock::now();
     auto last_tick = std::chrono::steady_clock::now();
-    auto next_vblank = last_tick;
+    auto next_vblank = last_tick + vblank_period;
     bool on_display = false;
 
     while (!token.stop_requested()) {
@@ -832,9 +843,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         const bool run_immediate = pacing.immediate_flips && main_port.flip_rate == 0;
-        bool display_tick = false;
         if (!run_immediate) {
-            display_tick = pacing.follow_display && vsync && TheatrhythmWaitForVblank();
+            bool display_tick = pacing.follow_display && vsync && TheatrhythmWaitForVblank();
             if (display_tick && std::chrono::steady_clock::now() - last_tick < vblank_period / 2) {
                 display_tick = false; // no refresh to wait for: the timer keeps the rate
             }
@@ -845,120 +855,106 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 timer.Start();
             }
             on_display = display_tick;
-            const auto now = std::chrono::steady_clock::now();
-            last_tick = now;
-            next_vblank = now + vblank_period;
-        } else {
-            if (on_display) {
-                on_display = false;
-                timer = Common::AccurateTimer{vblank_period};
-            }
-            const auto now = std::chrono::steady_clock::now();
-            last_tick = now;
-            next_vblank = AdvanceVblankDeadline(next_vblank, vblank_period, now);
-        }
-        const auto tick_deadline = next_vblank;
+            last_tick = std::chrono::steady_clock::now();
+            next_vblank = last_tick + vblank_period;
 
-        if (DebugState.IsGuestThreadsPaused()) {
-            DrawLastFrame();
-            if (!run_immediate) {
-                timer.End();
-            } else {
-                Common::AccurateWaitUntil(tick_deadline);
-            }
-            continue;
-        }
-
-        // Check if it's time to take a request at this vblank boundary.
-        auto& vblank_status = main_port.vblank_status;
-        const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = pacing.frame_period.count() == 0 || now >= next_flip;
-        if (flip_slot && can_submit_swap() && vblank_status.count % (main_port.flip_rate + 1) == 0) {
-            const auto request = receive_request();
-            if (request) {
-                if (pacing.frame_period.count() > 0) {
-                    next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period, now);
-                }
-                Flip(request);
-                FRAME_END;
-            } else if (!main_port.is_open &&
-                       (run_immediate || display_tick || timer.GetTotalWait().count() < 0)) {
-                DrawBlankFrame();
-            } else if (main_port.is_open && !run_immediate &&
-                       (display_tick || timer.GetTotalWait().count() < 0) &&
-                       ImGui::Core::MustKeepDrawing()) {
+            if (DebugState.IsGuestThreadsPaused()) {
                 DrawLastFrame();
+                timer.End();
+                continue;
             }
-        }
 
-        {
-            // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
-            std::scoped_lock lock{main_port.vo_mutex};
-
-            // Trigger flip events for the port
-            for (auto event : main_port.vblank_events) {
-                auto equeue = Kernel::GetEqueue(event);
-                if (equeue != nullptr) {
-                    equeue->TriggerEvent(
-                        static_cast<u64>(OrbisVideoOutInternalEventId::Vblank),
-                        Kernel::OrbisKernelEvent::Filter::VideoOut,
-                        reinterpret_cast<void*>(
-                            static_cast<u64>(OrbisVideoOutInternalEventId::Vblank) |
-                            (vblank_status.count << 16)));
+            // Check if it's time to take a request at this vblank boundary.
+            const auto& vblank_status = main_port.vblank_status;
+            const auto now = std::chrono::steady_clock::now();
+            const bool flip_slot = pacing.frame_period.count() == 0 || now >= next_flip;
+            if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
+                const auto request = receive_request();
+                if (request) {
+                    if (pacing.frame_period.count() > 0) {
+                        next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period, now);
+                    }
+                    Flip(request);
+                    FRAME_END;
+                } else if (display_tick || timer.GetTotalWait().count() < 0) {
+                    if (!main_port.is_open) {
+                        DrawBlankFrame();
+                    } else if (ImGui::Core::MustKeepDrawing()) {
+                        DrawLastFrame();
+                    }
                 }
             }
 
-            // Update vblank status
-            vblank_status.count++;
-            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
-            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
-            main_port.vblank_cv.notify_all();
-        }
-
-        if (!run_immediate) {
+            emit_vblank_events();
             timer.End();
             continue;
         }
-        while (!token.stop_requested()) {
-            Request request{};
+
+        if (on_display) {
+            on_display = false;
+            timer = Common::AccurateTimer{vblank_period};
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (DebugState.IsGuestThreadsPaused()) {
+            DrawLastFrame();
+            next_vblank = AdvanceVblankDeadline(next_vblank, vblank_period, now);
+            Common::AccurateWaitUntil(next_vblank);
+            continue;
+        }
+
+        // Keep guest 60 Hz vblank ticks independent of flip pacing so high-FPS flips never stall
+        // or double-sleep across vblank boundaries.
+        if (now >= next_vblank) {
+            bool has_queued = false;
             {
-                std::unique_lock lk{mutex};
-                if (!request_cv.wait_until(lk, tick_deadline, [&] {
-                        return token.stop_requested() || (!requests.empty() && can_submit_swap());
-                    })) {
-                    break; // next vblank
-                }
-                if (token.stop_requested()) {
-                    break;
-                }
-                if (pacing.frame_period.count() > 0) {
-                    const auto flip_at = next_flip;
-                    if (flip_at >= tick_deadline) {
-                        lk.unlock();
-                        Common::AccurateWaitUntil(tick_deadline);
-                        break; // keep 60 Hz vblank cadence aligned before taking this flip
-                    }
-                    if (std::chrono::steady_clock::now() < flip_at) {
-                        lk.unlock();
-                        Common::AccurateWaitUntil(flip_at);
-                        lk.lock();
-                        if (token.stop_requested() || requests.empty() || !can_submit_swap()) {
-                            continue;
-                        }
-                    }
-                }
-                request = requests.front();
-                requests.pop();
+                std::scoped_lock lk{mutex};
+                has_queued = !requests.empty();
             }
-            const auto flip_now = std::chrono::steady_clock::now();
+            if (!has_queued && !main_port.is_open) {
+                DrawBlankFrame();
+            }
+            emit_vblank_events();
+            last_tick = now;
+            next_vblank = AdvanceVblankDeadline(next_vblank, vblank_period, now);
+        }
+
+        Request request{};
+        bool wait_vblank_only = false;
+        std::chrono::steady_clock::time_point wait_flip_until{};
+        {
+            std::unique_lock lk{mutex};
+            if (requests.empty()) {
+                request_cv.wait_until(lk, next_vblank, [&] {
+                    return token.stop_requested() || !requests.empty();
+                });
+            }
+            if (token.stop_requested()) {
+                break;
+            }
+            if (!requests.empty()) {
+                const auto qnow = std::chrono::steady_clock::now();
+                if (pacing.frame_period.count() > 0 && qnow < next_flip) {
+                    wait_flip_until = next_flip;
+                } else {
+                    request = requests.front();
+                    requests.pop();
+                }
+            } else {
+                wait_vblank_only = true;
+            }
+        }
+
+        if (request) {
             if (pacing.frame_period.count() > 0) {
-                next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period, flip_now);
+                next_flip = AdvanceFlipDeadline(next_flip, pacing.frame_period,
+                                                std::chrono::steady_clock::now());
             }
             Flip(request);
             FRAME_END;
-        }
-        if (!token.stop_requested()) {
-            Common::AccurateWaitUntil(tick_deadline);
+        } else if (!wait_vblank_only) {
+            const auto target = std::min(wait_flip_until, next_vblank);
+            Common::AccurateWaitUntil(target);
         }
     }
 }
